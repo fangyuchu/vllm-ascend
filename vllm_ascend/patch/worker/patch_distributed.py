@@ -17,15 +17,21 @@
 
 from typing import List, Optional, Union
 
+import os
 import torch
 import vllm
+from datetime import timedelta
 from torch.distributed import Backend
+from vllm.logger import logger
 from vllm.distributed.parallel_state import (GroupCoordinator,
                                              _get_unique_name, _register_group)
 
 from vllm_ascend.distributed.communicator import NPUCommunicator
-from vllm_ascend.utils import create_hccl_pg_options
-
+from vllm_ascend.utils import create_hccl_pg_options, create_stateless_process_group
+from torch.distributed.distributed_c10d import ProcessGroup, PrefixStore
+from torch._C._distributed_c10d import _register_process_group
+from vllm.config import get_current_vllm_config
+from torch_npu._C._distributed_c10d import ProcessGroupHCCL
 
 class GroupCoordinatorPatch(GroupCoordinator):
 
@@ -48,12 +54,21 @@ class GroupCoordinatorPatch(GroupCoordinator):
         self_device_group = None
         self_cpu_group = None
         hccl_pg_options = create_hccl_pg_options(group_name)
+        config = get_current_vllm_config()
 
         for ranks in group_ranks:
-            device_group = torch.distributed.new_group(
-                ranks,
-                backend=torch_distributed_backend,
-                pg_options=hccl_pg_options)
+            if config.parallel_config.enable_stateless_pg and len(ranks) > 1:
+                self.stateless_backend = "hccl"
+                ip = config.parallel_config.data_parallel_master_ip
+                device_group = create_stateless_process_group(
+                    ranks=ranks, rank=self.rank, backend=self.stateless_backend,
+                    host=ip, hccl_pg_options=hccl_pg_options, group_name=self.unique_name
+                )
+            else:
+                device_group = torch.distributed.new_group(
+                    ranks,
+                    backend=torch_distributed_backend,
+                    pg_options=hccl_pg_options)
 
             # a group with `gloo` backend, to allow direct coordination between
             # processes through the CPU.
