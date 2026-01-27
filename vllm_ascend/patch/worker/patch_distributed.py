@@ -33,6 +33,7 @@ from torch._C._distributed_c10d import _register_process_group
 from vllm.config import get_current_vllm_config
 from torch_npu._C._distributed_c10d import ProcessGroupHCCL
 
+
 class GroupCoordinatorPatch(GroupCoordinator):
 
     def __init__(
@@ -125,6 +126,11 @@ class GroupCoordinatorPatch(GroupCoordinator):
         return self.device_communicator.all_to_all(input_, scatter_dim,
                                                    gather_dim, scatter_sizes,
                                                    gather_sizes)
+
+    def all_reduce(self, input_):
+        if self.world_size == 1:
+            return input_
+        return torch.ops.vllm.all_reduce(input_, group_name=self.unique_name)
 
 
 vllm.distributed.parallel_state.GroupCoordinator = GroupCoordinatorPatch
