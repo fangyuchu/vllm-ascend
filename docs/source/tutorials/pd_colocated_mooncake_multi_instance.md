@@ -44,7 +44,7 @@ such as IP addresses according to your actual environment.
    for i in {0..7}; do hccn_tool -i $i -gateway -g ; done
    ```
 
-2. Check NPU Network Configuration:
+2. Check NPU HCCN Configuration:
 
    Ensure that the hccn.conf file exists in the environment. If using Docker,
    mount it into the container.
@@ -65,6 +65,13 @@ such as IP addresses according to your actual environment.
    # Execute the following command on each node, replacing x.x.x.x
    # with the target node's NPU card address.
    for i in {0..7}; do hccn_tool -i $i -ping -g address x.x.x.x; done
+   ```
+
+5. Check NPU TLS Configuration
+
+   ```bash
+   # The tls settings should be consistent across all nodes
+   for i in {0..7}; do hccn_tool -i $i -tls -g ; done | grep switch
    ```
 
 ## Run with Docker
@@ -114,7 +121,7 @@ Moonshot AI. Installation and compilation guide:
 First, obtain the Mooncake project using the following command:
 
 ```bash
-git clone -b v0.3.7.post2 --depth 1 https://github.com/kvcache-ai/Mooncake.git
+git clone -b v0.3.8.post1 --depth 1 https://github.com/kvcache-ai/Mooncake.git
 cd Mooncake
 git submodule update --init --recursive
 ```
