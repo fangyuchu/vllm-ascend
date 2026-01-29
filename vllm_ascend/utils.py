@@ -18,10 +18,13 @@
 #
 
 import atexit
+import errno
 import functools
+import hashlib
+import ipaddress
 import math
 import os
-import ipaddress
+
 from datetime import timedelta
 from contextlib import contextmanager, nullcontext
 from enum import Enum
@@ -1260,7 +1263,6 @@ def _calculate_group_position(rank: int, ranks: list[int]) -> tuple[int, int]:
 
 def _generate_deterministic_port(ranks: list[int], base_port: int, port_range: int) -> int:
     """Generate a deterministic port based on the sorted ranks"""
-    import hashlib
     ranks_tuple = tuple(sorted(ranks))
     ranks_hash = hashlib.md5(str(ranks_tuple).encode()).hexdigest()
     port_offset = int(ranks_hash, 16) % port_range
@@ -1310,7 +1312,6 @@ def _should_retry(exception: Exception, attempt: int, max_retries: int) -> bool:
         return False  # Last attempt, no retry
     is_port_in_use = False
     # Retry only for port conflict errors
-    import errno
     if isinstance(exception, OSError) and hasattr(exception, 'errno'):
         is_port_in_use =  (exception.errno == errno.EADDRINUSE)
     elif isinstance(exception, torch.distributed.DistNetworkError):
