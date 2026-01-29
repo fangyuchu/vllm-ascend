@@ -1236,13 +1236,13 @@ def create_stateless_process_group(
     Args:
         ranks: List of global ranks that should be included in the process group
         rank: The rank of the current process
-        backend: The distributed backend to use (e.g., 'nccl', 'gloo')
+        backend: The distributed backend to use
         host: The host address for the TCP store (default: '127.0.0.1')
         base_port: The base port number to start from (default: 29500)
         port_range: The range of ports to try if the initial port is busy (default: 1500)
 
     Returns:
-        A ProcessGroup object if successful, None if the local_rank is not in the ranks list
+        A ProcessGroup object if successful, None if the rank is not in the ranks list
     """
     if not _is_rank_in_group(rank, ranks):
         return None
