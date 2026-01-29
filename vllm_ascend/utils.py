@@ -20,10 +20,14 @@
 from __future__ import annotations
 
 import atexit
+import errno
 import functools
+import hashlib
+import ipaddress
 import math
 import os
 from contextlib import contextmanager, nullcontext
+from datetime import timedelta
 from enum import Enum
 from functools import lru_cache
 from threading import Lock
@@ -32,6 +36,9 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch_npu  # noqa: F401
 from packaging.version import InvalidVersion, Version
+from torch.distributed.distributed_c10d import PrefixStore, ProcessGroup, _get_default_timeout
+from torch.distributed.rendezvous import rendezvous
+from torch_npu._C._distributed_c10d import ProcessGroupHCCL
 from torch_npu.npu.streams import Event
 from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
@@ -1208,3 +1215,157 @@ def enable_dsa_cp_with_layer_shard() -> bool:
     vllm_config = get_current_vllm_config()
     is_prefill_instance = vllm_config.kv_transfer_config is not None and vllm_config.kv_transfer_config.is_kv_producer
     return is_prefill_instance
+
+
+def create_stateless_process_group(
+    ranks: list[int],
+    rank: int,
+    backend: str,
+    host: str = "127.0.0.1",
+    hccl_pg_options: ProcessGroupHCCL = None,
+    group_name: str = "default",
+    base_port: int = 29500,
+    port_range: int = 1500,
+) -> ProcessGroup:
+    """
+    Create a stateless process group for distributed communication.
+
+    This function initializes a TCP store and creates a process group using the specified backend.
+    It handles port conflicts by retrying with different ports if the initial port is unavailable.
+
+    Args:
+        ranks: List of global ranks that should be included in the process group
+        rank: The rank of the current process
+        backend: The distributed backend to use (e.g., 'nccl', 'gloo')
+        host: The host address for the TCP store (default: '127.0.0.1')
+        base_port: The base port number to start from (default: 29500)
+        port_range: The range of ports to try if the initial port is busy (default: 1500)
+
+    Returns:
+        A ProcessGroup object if successful, None if the local_rank is not in the ranks list
+    """
+    if not _is_rank_in_group(rank, ranks):
+        return None
+
+    group_rank, group_size = _calculate_group_position(rank, ranks)
+
+    port = _generate_deterministic_port(ranks, base_port, port_range)
+
+    # Attempt to create TCP store with retry mechanism for port conflicts
+    timeout = _get_default_timeout(backend)
+    prefix_store = _create_tcp_store_with_retry(host, port, group_rank, group_size, timeout, ranks)
+
+    # Initialize the process group using the current platform's implementation
+    pg = _initialize_process_group(group_name, prefix_store, group_rank, group_size, hccl_pg_options)
+    logger.info(
+        f"Successfully created HCCL process group for ranks {ranks},rank {rank} "
+        f"group_rank={group_rank} at {host}:{port}"
+    )
+    return pg
+
+
+def _is_rank_in_group(rank: int, ranks: list[int]) -> bool:
+    """Checks if the given rank is present in the list of ranks."""
+    return rank in ranks
+
+
+def _calculate_group_position(rank: int, ranks: list[int]) -> tuple[int, int]:
+    """Calculate group position and size"""
+    group_rank = ranks.index(rank)
+    group_size = len(ranks)
+    return group_rank, group_size
+
+
+def _generate_deterministic_port(ranks: list[int], base_port: int, port_range: int) -> int:
+    """Generate a deterministic port based on the sorted ranks"""
+    ranks_tuple = tuple(sorted(ranks))
+    ranks_hash = hashlib.md5(str(ranks_tuple).encode()).hexdigest()
+    port_offset = int(ranks_hash, 16) % port_range
+    return base_port + port_offset
+
+
+def _create_tcp_store_with_retry(
+    host: str, port: int, group_rank: int, group_size: int, timeout: timedelta, ranks: list[int]
+) -> PrefixStore:
+    """
+    This function initializes a TCP store and creates a process group using the specified backend.
+    It handles port conflicts by retrying with different ports if the initial port is unavailable.
+    """
+    max_retries = 100
+
+    for attempt in range(max_retries):
+        try:
+            current_port = port + attempt
+            if current_port > 65535:
+                raise RuntimeError("The number of port exceeds the maximum limit.")
+
+            prefix_store = get_stateless_prefix_store(host, current_port, group_rank, group_size, timeout)
+            logger.info("Success for group %s Create TCP store %s:%s", ranks, host, current_port)
+            return prefix_store
+
+        except Exception as e:
+            if _should_retry(e, attempt, max_retries):
+                logger.warning("port %s is using,Try next...", current_port)
+                continue
+            else:
+                logger.error("Create TCP store fail: %s", e)
+                raise
+
+
+def _should_retry(exception: Exception, attempt: int, max_retries: int) -> bool:
+    """Determine whether retry should be performed."""
+    if attempt >= max_retries - 1:
+        return False  # Last attempt, no retry
+    is_port_in_use = False
+    # Retry only for port conflict errors
+    if isinstance(exception, OSError) and hasattr(exception, "errno"):
+        is_port_in_use = exception.errno == errno.EADDRINUSE
+    elif isinstance(exception, torch.distributed.DistNetworkError):
+        is_port_in_use = "Address already in use" in str(exception)
+
+    return is_port_in_use
+
+
+def _initialize_process_group(
+    group_name: str,
+    prefix_store: PrefixStore,
+    group_rank: int,
+    group_size: int,
+    hccl_pg_options: ProcessGroupHCCL = None,
+) -> ProcessGroup:
+    pg = ProcessGroup(prefix_store, group_rank, group_size)
+    device = torch.device("npu")
+    if hasattr(hccl_pg_options, "_device"):
+        hccl_pg_options._device = device
+
+    backend_class = ProcessGroupHCCL(prefix_store, group_rank, group_size, hccl_pg_options)
+
+    backend_class._set_sequence_number_for_group()
+    backend_class._set_hccl_comm_name(group_name)
+    backend_type = ProcessGroup.BackendType.CUSTOM
+    pg._register_backend(device, backend_type, backend_class)
+
+    return pg
+
+
+def get_stateless_prefix_store(host, port, rank, world_size, timeout):
+    init_method = get_tcp_uri(host, port)
+    store, rank, world_size = next(rendezvous(init_method, rank, world_size, timeout=timeout))
+    store.set_timeout(timeout)
+    prefix_store = PrefixStore(init_method, store)
+    return prefix_store
+
+
+def get_tcp_uri(ip: str, port: int) -> str:
+    if is_valid_ipv6_address(ip):
+        return f"tcp://[{ip}]:{port}"
+    else:
+        return f"tcp://{ip}:{port}"
+
+
+def is_valid_ipv6_address(address: str) -> bool:
+    try:
+        ipaddress.IPv6Address(address)
+        return True
+    except ValueError:
+        return False
