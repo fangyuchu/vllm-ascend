@@ -1333,7 +1333,7 @@ def _should_retry(exception: Exception, attempt: int, max_retries: int) -> bool:
     if isinstance(exception, OSError) and hasattr(exception, 'errno'):
         is_port_in_use =  (exception.errno == errno.EADDRINUSE)
     elif isinstance(exception, torch.distributed.DistNetworkError):
-        is_port_in_use = "Address already in use" in str(e)
+        is_port_in_use = "Address already in use" in str(exception)
 
     return is_port_in_use
 
