@@ -49,7 +49,8 @@ class GroupCoordinatorPatch(GroupCoordinator):
         self_device_group = None
         self_cpu_group = None
         hccl_pg_options = create_hccl_pg_options(group_name)
-
+        config = get_current_vllm_config()
+        
         for ranks in group_ranks:
             if config.parallel_config.enable_stateless_pg and len(ranks) > 1:
                 self.stateless_backend = "hccl"
