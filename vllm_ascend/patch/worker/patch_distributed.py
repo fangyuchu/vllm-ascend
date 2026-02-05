@@ -26,7 +26,10 @@ from vllm.distributed.parallel_state import (GroupCoordinator,
 from vllm_ascend.distributed.device_communicators.npu_communicator import \
     NPUCommunicator
 from vllm_ascend.utils import create_hccl_pg_options
-
+from vllm.config import get_current_vllm_config
+from vllm.distributed.utils import (
+            stateless_init_torch_distributed_process_group, _generate_deterministic_port
+        )
 
 class GroupCoordinatorPatch(GroupCoordinator):
 
@@ -49,12 +52,26 @@ class GroupCoordinatorPatch(GroupCoordinator):
         self_device_group = None
         self_cpu_group = None
         hccl_pg_options = create_hccl_pg_options(group_name)
+        config = get_current_vllm_config()
 
         for ranks in group_ranks:
-            device_group = torch.distributed.new_group(
-                ranks,
-                backend=torch_distributed_backend,
-                pg_options=hccl_pg_options)
+            if config.parallel_config.enable_stateless_pg and len(ranks) > 1 and self.rank in ranks:
+                self.stateless_backend = "hccl"
+                ip = config.parallel_config.data_parallel_master_ip
+                port = _generate_deterministic_port(ranks, host=ip)
+                device_group = stateless_init_torch_distributed_process_group(
+                    host=ip,
+                    port=port,
+                    rank=ranks.index(self.rank),
+                    world_size=len(ranks),
+                    backend=self.stateless_backend,
+                    group_name=group_name
+                )
+            else:
+                device_group = torch.distributed.new_group(
+                    ranks,
+                    backend=torch_distributed_backend,
+                    pg_options=hccl_pg_options)
 
             # a group with `gloo` backend, to allow direct coordination between
             # processes through the CPU.

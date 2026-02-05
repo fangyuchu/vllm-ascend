@@ -103,7 +103,9 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
         super().__init__(**kwargs)
         device_group = get_mc2_group().device_group
         # TODO: Try local_rank = ep_group.rank_in_group
-        local_rank = torch.distributed.get_rank(group=device_group)
+        parallel_config = get_current_vllm_config().parallel_config
+        local_rank = get_mc2_group().rank_in_group if parallel_config.enable_stateless_pg else torch.distributed.get_rank(
+            group=device_group)
         backend = device_group._get_backend(torch.device("npu"))
         self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
         self.ep_rank_id = get_mc2_group().rank_in_group
@@ -412,7 +414,9 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
                     1), "local_expert_indices must be continuous"
 
         # TODO: Try local_rank = ep_group.rank_in_group
-        local_rank = torch.distributed.get_rank(group=self.ep_group)
+        parallel_config = get_current_vllm_config().parallel_config
+        local_rank = self.ep_rank if parallel_config.enable_stateless_pg else torch.distributed.get_rank(
+            group=self.ep_group)
         backend = self.ep_group._get_backend(torch.device("npu"))
         self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
 
