@@ -789,19 +789,19 @@ class NPUPlatform(Platform):
         **kwargs,
     ) -> ProcessGroup:
         """
-        Initialize a stateless NCCL process group for CUDA devices.
+        Initialize a stateless HCCL process group for CUDA devices.
         This method creates a ProcessGroup with the specified backend configuration,
         typically used for GPU communication. It sets up the necessary backend
         options and registers the backend with the process group.
         Args:
-            backend: The distributed backend to use (e.g., 'nccl')
+            backend: The distributed backend to use (e.g., 'hccl')
             prefix_store: The prefix store for distributed coordination
             group_rank: The rank of the current process within the group
             group_size: The total number of processes in the group
             timeout: Maximum time to wait for the operation to complete
             **kwargs: Additional backend-specific options
         warning:
-        Uses internal PyTorch API (torch._C._distributed_c10d.ProcessGroupNCCL)
+        Uses internal PyTorch API (torch._C._distributed_c10d.ProcessGroupHCCL)
         which may change in future PyTorch versions. Compatibility should be
         verified with each PyTorch upgrade.
         Compatibility Risk:

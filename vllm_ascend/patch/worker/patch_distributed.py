@@ -58,7 +58,7 @@ class GroupCoordinatorPatch(GroupCoordinator):
             if config.parallel_config.enable_stateless_pg and len(ranks) > 1 and self.rank in ranks:
                 self.stateless_backend = "hccl"
                 ip = config.parallel_config.data_parallel_master_ip
-                port = _generate_deterministic_port(ranks, host=ip)
+                port = _generate_deterministic_port(ranks, ranks.index(self.rank), len(ranks), host=ip)
                 device_group = stateless_init_torch_distributed_process_group(
                     host=ip,
                     port=port,
