@@ -34,7 +34,7 @@ def init_ascend_model_parallel(parallel_config: ParallelConfig, ):
         return
     assert torch.distributed.is_initialized()
     world_size = torch.distributed.get_world_size()
-    backend = torch.distributed.get_backend(get_world_group().device_group)
+    backend = "hccl" if parallel_config.enable_stateless_pg else torch.distributed.get_backend(get_world_group().device_group)
     global_tp_size = parallel_config.tensor_parallel_size
     global_dp_size = parallel_config.data_parallel_size
     global_pp_size = parallel_config.pipeline_parallel_size

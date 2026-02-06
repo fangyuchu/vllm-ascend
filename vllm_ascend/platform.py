@@ -19,11 +19,13 @@ from __future__ import annotations
 
 import math
 import os
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 import torch
 import vllm.envs as envs_vllm
+from torch.distributed.distributed_c10d import PrefixStore, ProcessGroup
 from vllm.logger import logger
 from vllm.platforms import Platform, PlatformEnum
 
@@ -775,3 +777,62 @@ class NPUPlatform(Platform):
                     "ignored on Ascend. Resetting to default (32)."
                 )
                 att_config.flash_attn_max_num_splits_for_cuda_graph = 32
+
+    @classmethod
+    def stateless_init_device_torch_dist_pg(
+        cls,
+        backend: str,
+        prefix_store: PrefixStore,
+        group_rank: int,
+        group_size: int,
+        timeout: timedelta,
+        **kwargs,
+    ) -> ProcessGroup:
+        """
+        Initialize a stateless HCCL process group for CUDA devices.
+        This method creates a ProcessGroup with the specified backend configuration,
+        typically used for GPU communication. It sets up the necessary backend
+        options and registers the backend with the process group.
+        Args:
+            backend: The distributed backend to use (e.g., 'hccl')
+            prefix_store: The prefix store for distributed coordination
+            group_rank: The rank of the current process within the group
+            group_size: The total number of processes in the group
+            timeout: Maximum time to wait for the operation to complete
+            **kwargs: Additional backend-specific options
+        warning:
+        Uses internal PyTorch API (torch._C._distributed_c10d.ProcessGroupHCCL)
+        which may change in future PyTorch versions. Compatibility should be
+        verified with each PyTorch upgrade.
+        Compatibility Risk:
+        - High risk of breakage in PyTorch 2.4+
+        - No semantic versioning guarantees
+        - Requires testing with new PyTorch releases
+        Returns:
+            A ProcessGroup object configured with the specified backend
+        """
+
+        # INTERNAL API USAGE - COMPATIBILITY RISK
+        # This internal import is necessary for stateless process group functionality
+        # but carries compatibility risks. Monitor PyTorch release notes for changes.
+        # TODO: Migrate to public API when available in future PyTorch versions
+        from torch_npu._C._distributed_c10d import ProcessGroupHCCL
+
+        pg = ProcessGroup(prefix_store, group_rank, group_size)
+
+        backend_options = ProcessGroupHCCL.Options()
+        backend_options._timeout = timeout
+
+        device = torch.device("npu")
+        if hasattr(backend_options, "_device"):
+            backend_options._device = device
+
+        backend_class = ProcessGroupHCCL(prefix_store, group_rank, group_size, backend_options)
+
+        backend_class._set_sequence_number_for_group()
+        if "group_name" in kwargs:
+            backend_class._set_hccl_comm_name(kwargs["group_name"])
+        backend_type = ProcessGroup.BackendType.CUSTOM
+        pg._register_backend(device, backend_type, backend_class)
+
+        return pg
