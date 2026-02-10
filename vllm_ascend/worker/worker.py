@@ -174,35 +174,42 @@ class NPUWorker(WorkerBase):
 
             signal.signal(signal.SIGTERM, signal_handler)
             signal.signal(signal.SIGINT, signal_handler)
-        self.ep2dp_map = init_ep2dp_map(
-            self.vllm_config.parallel_config.data_parallel_size, self.vllm_config.parallel_config.tensor_parallel_size
-        )
-        self.experts_saved_ids = []
-        self.experts_saved_weights = {}
-        self.quant = self.model_config.quantization is not None
-        if hasattr(self.vllm_config.model_config.hf_config, "num_experts"):
-            self.num_logical_expert = self.vllm_config.model_config.hf_config.num_experts
-        elif hasattr(self.vllm_config.model_config.hf_config, "n_routed_experts"):
-            self.num_logical_expert = self.vllm_config.model_config.hf_config.n_routed_experts
-        else:
-            raise ValueError("unknown number of experts")
-
-        self.use_mask_mc2 = False
-        redundant_expert_list = []
-        ep_size = (
-            self.vllm_config.parallel_config.data_parallel_size * self.vllm_config.parallel_config.tensor_parallel_size
-        )
-        num_redundancy_expert = self.vllm_config.additional_config.get("eplb_config").get("num_redundancy_expert")
-        if num_redundancy_expert and get_ascend_device_type() in AscendDeviceType.A3:
-            self.use_mask_mc2 = True
-            redundant_expert_list = generate_redundant_expert_ids(
-                self.num_logical_expert, ep_size, num_redundancy_expert
+        if self.vllm_config.fault_tolerance.enable_fault_tolerance:
+            self.ep2dp_map = init_ep2dp_map(
+                self.vllm_config.parallel_config.data_parallel_size,
+                self.vllm_config.parallel_config.tensor_parallel_size,
             )
-        self.global_log2phy_map = gen_global_log2phy_map(self.num_logical_expert, ep_size, redundant_expert_list)
-        self.global_experts_distribution = init_global_expert_distribution(self.global_log2phy_map, ep_size)
-        self.log2phy = gen_local_log2phy_map(self.global_log2phy_map)
+            self.experts_saved_ids = []
+            self.experts_saved_weights = {}
+            self.quant = self.model_config.quantization is not None
+            if hasattr(self.vllm_config.model_config.hf_config, "num_experts"):
+                self.num_logical_expert = self.vllm_config.model_config.hf_config.num_experts
+            elif hasattr(self.vllm_config.model_config.hf_config, "n_routed_experts"):
+                self.num_logical_expert = self.vllm_config.model_config.hf_config.n_routed_experts
+            else:
+                raise ValueError("unknown number of experts")
+
+            self.use_mask_mc2 = False
+            redundant_expert_list = []
+            ep_size = (
+                self.vllm_config.parallel_config.data_parallel_size
+                * self.vllm_config.parallel_config.tensor_parallel_size
+            )
+            additional_config = self.vllm_config.additional_config or {}
+            eplb_cfg = additional_config.get("eplb_config", {})
+            num_redundancy_expert = eplb_cfg.get("num_redundancy_expert")
+            if num_redundancy_expert and get_ascend_device_type() in {AscendDeviceType.A3}:
+                self.use_mask_mc2 = True
+                redundant_expert_list = generate_redundant_expert_ids(
+                    self.num_logical_expert, ep_size, num_redundancy_expert
+                )
+            self.global_log2phy_map = gen_global_log2phy_map(self.num_logical_expert, ep_size, redundant_expert_list)
+            self.global_experts_distribution = init_global_expert_distribution(self.global_log2phy_map, ep_size)
+            self.log2phy = gen_local_log2phy_map(self.global_log2phy_map)
 
     def dp_descale(self, exclude_dp_ranks, vllm_update_config):
+        assert self.vllm_config.fault_tolerance.enable_fault_tolerance is True
+        # todo  self.cache_config.gpu_memory_utilization = 0.95 need to revise later
         self.cache_config.gpu_memory_utilization = 0.95
         rank = self.vllm_config.parallel_config.data_parallel_rank
         if hasattr(self.vllm_config.model_config.hf_config, "num_experts"):
@@ -215,13 +222,13 @@ class NPUWorker(WorkerBase):
         self.global_log2phy_map, redistributed_experts, added_experts, replaced_redundant_experts, self.use_mask_mc2 = (
             get_expert_distribution_after_descale(
                 exclude_dp_ranks,
-                self.experts_distribution,
+                self.global_experts_distribution,
                 self.global_log2phy_map,
                 self.backup_expert_rank_mapping,
                 self.use_mask_mc2,
             )
         )
-        expert_ids_to_save.extend(added_experts.get(rank))
+        expert_ids_to_save.extend(added_experts.get(rank, []))
         for redundant_expert_id, (redundant_expert_pos, routed_expert_id) in replaced_redundant_experts.get(
             rank, {}
         ).items():
@@ -252,6 +259,10 @@ class NPUWorker(WorkerBase):
                 replaced_redundant_experts,
                 self.quant,
             )
+            old_ep_size = (
+                self.vllm_config.parallel_config.data_parallel_size
+                * self.vllm_config.parallel_config.tensor_parallel_size
+            )
             update_parallel_config(get_current_vllm_config(), vllm_update_config)
             update_parallel_config(self.vllm_config, vllm_update_config)
             self.model_runner.dp_size = self.vllm_config.parallel_config.data_parallel_size
@@ -260,7 +271,7 @@ class NPUWorker(WorkerBase):
             self.ep2dp_map = update_ep2dp_map(self.ep2dp_map, exclude_dp_ranks, rank_mapping)
             elastic_info = get_elastic_info()
             num_new_phy_experts = sum(map(len, redistributed_experts.values()))
-            update_elastic_info(self.use_mask_mc2, elastic_info, num_new_phy_experts, self.ep2dp_map)
+            update_elastic_info(self.use_mask_mc2, elastic_info, num_new_phy_experts, old_ep_size, self.ep2dp_map)
             self.log2phy.copy_(gen_local_log2phy_map(self.global_log2phy_map))
             with set_current_vllm_config(self.vllm_config):
                 reinit_comm_group(self.use_mask_mc2, self.vllm_config, self)
@@ -522,21 +533,21 @@ class NPUWorker(WorkerBase):
 
         with context, set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()
-
-        dp_size = self.vllm_config.parallel_config.data_parallel_size
-        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-        is_a3 = get_ascend_device_type() in {AscendDeviceType.A3}
-        expert_backup_map = gen_expert_backup_map(
-            num_experts=self.num_logical_expert,
-            ep_size=dp_size * tp_size,
-            num_die_per_npu=2 if is_a3 else 1,
-            global_expert_distribution=self.global_experts_distribution,
-        )
-        self.backup_expert_rank_mapping = {}
-        for rank, expert_ids in enumerate(expert_backup_map):
-            for expert in expert_ids:
-                self.backup_expert_rank_mapping[expert] = rank
-        # todo热备代码暂时不搬
+        if self.vllm_config.fault_tolerance.enable_fault_tolerance:
+            dp_size = self.vllm_config.parallel_config.data_parallel_size
+            tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+            is_a3 = get_ascend_device_type() in {AscendDeviceType.A3}
+            expert_backup_map = gen_expert_backup_map(
+                num_experts=self.num_logical_expert,
+                ep_size=dp_size * tp_size,
+                num_die_per_npu=2 if is_a3 else 1,
+                global_expert_distribution=self.global_experts_distribution,
+            )
+            self.backup_expert_rank_mapping = {}
+            for rank, expert_ids in enumerate(expert_backup_map):
+                for expert in expert_ids:
+                    self.backup_expert_rank_mapping[expert] = rank
+            # todo热备代码暂时不搬
 
     def compile_or_warm_up_model(self) -> None:
         # Note: need to adapt for graph mode.

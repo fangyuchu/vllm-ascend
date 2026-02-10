@@ -2,6 +2,7 @@ import copy
 import gc
 import math
 from collections import defaultdict
+from typing import TYPE_CHECKING
 
 import torch
 from vllm.compilation.wrapper import reset_compile_wrapper
@@ -22,8 +23,10 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.parallel_state import destroy_ascend_model_parallel, get_mc2_group, set_elastic_info
 from vllm_ascend.eplb.core.eplb_utils import init_eplb_config
 from vllm_ascend.ops.fused_moe.fused_moe import setup_moe_comm_method
-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
-from vllm_ascend.worker.worker import NPUWorker
+
+if TYPE_CHECKING:
+    from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+    from vllm_ascend.worker.worker import NPUWorker
 
 
 def gen_expert_backup_map(
@@ -128,7 +131,7 @@ def gen_global_log2phy_map(
 
 
 def init_global_expert_distribution(global_log2phy_map: dict[int, list[int]], ep_size: int) -> dict[int, list[int]]:
-    num_phy_experts = sum(map(lambda x: len(x), global_log2phy_map.values()))
+    num_phy_experts = sum(map(len, global_log2phy_map.values()))
     num_phy_exp_per_npu = num_phy_experts // ep_size
     global_expert_distribution = {i: [-1 for _ in range(num_phy_exp_per_npu)] for i in range(ep_size)}
     for log_eid, phy_expert_pos in global_log2phy_map.items():
@@ -169,7 +172,7 @@ def get_expert_distribution_after_descale(
         expert_distribution.pop(rank)
 
     added_experts: dict[int, list[int]] = {r: [] for r in health_ranks}
-    replaced_redundant_experts: dict[int : dict[int, tuple[int, int]]] = defaultdict(dict)
+    replaced_redundant_experts: dict[int, dict[int, tuple[int, int]]] = defaultdict(dict)
     rank_load: dict[int, float] = {r: 0.0 for r in health_ranks}
 
     # ======= 1: Remove failed physical experts & identify lost logical experts
@@ -209,11 +212,13 @@ def get_expert_distribution_after_descale(
         use_mask_mc2 = False
         extra_needed = len(failed_logical_experts) - total_redundant_slots
         slots_per_rank = math.ceil(extra_needed / len(health_ranks))
-
         for rank in health_ranks:
             backup_experts = [eid for eid, r in backup_expert_rank_mapping.items() if r == rank]
             slot_gap = slots_per_rank
+            assert backup_experts, "backup_experts is empty, will cause infinite loop!"
             while slot_gap > 0:
+                assert slot_gap > 0, "slot_gap should be positive in loop!"
+                assert backup_experts, "backup_experts became empty during loop!"
                 for eid in backup_experts[:slot_gap]:
                     expert_distribution[rank].append(eid)
                     added_experts[rank].append(eid)
@@ -248,15 +253,15 @@ def get_expert_distribution_after_descale(
 
     # ======== 5: rebuild global logical to physical mapping
 
-    old_expert_distribution = defaultdict(list)
+    new_global_log2phy_map = defaultdict(list)
     flat_distribution = []
     for rank in sorted(expert_distribution):
         flat_distribution.extend(expert_distribution[rank])
 
     for phy_idx, expert_id in enumerate(flat_distribution):
-        global_log2phy_map[expert_id].append(phy_idx)
+        new_global_log2phy_map[expert_id].append(phy_idx)
 
-    return global_log2phy_map, expert_distribution, added_experts, replaced_redundant_experts, use_mask_mc2
+    return new_global_log2phy_map, expert_distribution, added_experts, replaced_redundant_experts, use_mask_mc2
 
 
 def destory_acl_graph(use_mask_mc2: bool, vllm_config: VllmConfig, model: NPUModelRunner) -> VllmConfig:
@@ -272,7 +277,7 @@ def destory_acl_graph(use_mask_mc2: bool, vllm_config: VllmConfig, model: NPUMod
         gc.collect()
         torch.npu.empty_cache()
         print(f"rank{vllm_config.parallel_config.data_parallel_rank} aclgraph reset success!")
-        return vllm_config
+    return vllm_config
 
 
 def rebuild_acl_graph(use_mask_mc2: bool, worker: NPUWorker) -> None:
@@ -317,18 +322,18 @@ def save_expert_weights_to_ram(
     quant: bool | str = False,
 ) -> tuple[list[int], dict[str, torch.Tensor]]:
     """
-    将指定未保存的专家权重加载并保存到内存中（RAM）
+    Load the specified unsaved expert weights and save them to memory (RAM)
 
     Args:
-        experts_id_to_save: 需要保存的专家ID列表
-        experts_saved_ids: 已保存的专家ID列表（会在函数内更新）
-        experts_saved_weights: 存储已保存专家权重的字典（会在函数内更新）
-        vllm_config: VLLM配置对象
-        model_runner: NPU模型运行器
-        quant: 是否为量化模型（影响权重名称后缀）
+        experts_id_to_save: List of expert IDs that need to be saved
+        experts_saved_ids: List of already saved expert IDs (will be updated within the function)
+        experts_saved_weights: Dictionary storing the weights of saved experts (will be updated within the function)
+        vllm_config: VLLM configuration object
+        model_runner: NPU model runner
+        quant: Whether it is a quantized model (affects the suffix of weight names)
 
     Returns:
-        tuple: (更新后的已保存专家ID列表, 更新后的已保存权重字典)
+        tuple: (Updated list of saved expert IDs, Updated dictionary of saved expert weights)
     """
     # 转换为集合加速查找（O(1) vs 列表O(n)）
     saved_ids_set = set(experts_saved_ids)
@@ -447,7 +452,7 @@ def reload_fault_expert_weights(
     vllm_config: VllmConfig,
     redistributed_experts: dict[int, list[int]],
     added_experts: dict[int, list[int]],
-    replaced_redundant_experts: dict[int : dict[int, tuple[int, int]]],
+    replaced_redundant_experts: dict[int, dict[int, tuple[int, int]]],
     quant: bool | str = False,
 ) -> None:
     def _load_single_expert(expert_id: int, target_index: int, quant: bool | str = False):
@@ -524,15 +529,13 @@ def reload_fault_expert_weights(
         global_experts_distribution[i] = redistributed_experts[rank]
 
 
-def update_parallel_config(original_config: VllmConfig, update_config: dict[str, int]) -> VllmConfig:  # , worker_guard)
+def update_parallel_config(original_config: VllmConfig, update_config: dict[str, int]) -> None:  # , worker_guard)
     original_config.parallel_config.data_parallel_size = update_config["data_parallel_size"]
     original_config.parallel_config.data_parallel_size_local = update_config["data_parallel_size_local"]
     original_config.parallel_config.data_parallel_rank = update_config["data_parallel_rank"]
     original_config.parallel_config.data_parallel_rank_local = update_config["data_parallel_rank_local"]
     original_config.parallel_config.expert_parallel_size = update_config["expert_parallel_size"]
     original_config.parallel_config.data_parallel_master_port = update_config["data_parallel_master_port"]
-    # if original_config.fault_tolerance.config.enabel_fault_tolerance:
-    #     worker_guard.update(original_config)
 
 
 def init_ep2dp_map(dp_size: int, tp_size: int) -> dict[int, int]:
@@ -545,13 +548,18 @@ def init_ep2dp_map(dp_size: int, tp_size: int) -> dict[int, int]:
     return ep2dp_map
 
 
-def update_ep2dp_map(ep2dp_map: dict[int, int], exclude_dp_ranks: list[int], rank_mapping: dict[str, int]) -> None:
+def update_ep2dp_map(
+    ep2dp_map: dict[int, int],
+    exclude_dp_ranks: list[int],
+    rank_mapping: dict[str, int],
+) -> dict[int, int]:
     for old_ep_rank, dp_rank in ep2dp_map.items():
         if dp_rank != -1:
             if dp_rank in exclude_dp_ranks:
                 ep2dp_map[old_ep_rank] = -1
             else:
                 ep2dp_map[old_ep_rank] = rank_mapping[str(dp_rank)]
+    return ep2dp_map
 
 
 def update_elastic_info(
@@ -672,7 +680,7 @@ def reconfigure_moe(
                 eplb_config, module.moe_counter, module.moe_config
             )
             with set_current_vllm_config(vllm_config):
-                setup_moe_comm_method()
+                setup_moe_comm_method(module.moe_config)
             changed_moe_load_shape = module.local_num_experts - module.moe_load.shape[0]
             if modelrunner.dynamic_eplb and changed_moe_load_shape:
                 module.moe_load = expand_parameter(module.moe_load, 0, changed_moe_load_shape)
