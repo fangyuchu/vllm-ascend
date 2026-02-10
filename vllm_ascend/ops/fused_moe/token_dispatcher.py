@@ -28,7 +28,7 @@ import torch_npu
 from vllm.config import get_current_vllm_config
 from vllm.distributed.parallel_state import get_ep_group
 
-from vllm_ascend.distributed.parallel_state import get_mc2_group
+from vllm_ascend.distributed.parallel_state import get_elastic_info, get_mc2_group
 from vllm_ascend.ops.fused_moe.comm_utils import async_all_to_all, gather_from_sequence_parallel_region
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type, is_hierarchical_communication_enabled
 
@@ -127,6 +127,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
             max_num_tokens = min(max_num_reqs * uniform_decode_query_len, 512)
         num_tokens_per_tp_rank = (max_num_tokens + tp_size - 1) // tp_size
         self.global_bs = num_tokens_per_tp_rank * self.ep_world_size
+        self.elastic_info = None
 
     def get_dispatch_mc2_kwargs(
         self,
@@ -147,6 +148,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
             "moe_expert_num": self.moe_expert_num,
             "global_bs": self.global_bs,
             "expert_token_nums_type": 0,
+            "elastic_info": self.elastic_info,
         }
 
         stage1_kwargs = {
@@ -187,6 +189,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
         dynamic_eplb: bool = False,
         pertoken_scale: torch.Tensor | None = None,
     ):
+        self.elastic_info = get_elastic_info()
         self.with_quant = with_quant
 
         kwargs_mc2 = self.get_dispatch_mc2_kwargs(
@@ -246,6 +249,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
             "shared_expert_rank_num": 0,
             "moe_expert_num": self.moe_expert_num,
             "global_bs": self.global_bs,
+            "elastic_info": self.elastic_info,
         }
 
         if self.with_quant:

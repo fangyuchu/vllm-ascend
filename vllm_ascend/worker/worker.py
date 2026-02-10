@@ -27,7 +27,7 @@ import torch_npu
 import vllm.envs as envs_vllm
 from torch_npu.op_plugin.atb._atb_ops import _register_atb_extensions
 from torch_npu.profiler import dynamic_profile as dp
-from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
+from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config, set_current_vllm_config
 from vllm.distributed import ensure_model_parallel_initialized, init_distributed_environment
 from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
 from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized, get_kv_transfer_group, has_kv_transfer_group
@@ -49,7 +49,7 @@ from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
-from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
+from vllm_ascend.distributed.parallel_state import get_elastic_info, init_ascend_model_parallel
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.utils import (
     AscendDeviceType,
@@ -57,6 +57,26 @@ from vllm_ascend.utils import (
     enable_sp,
     get_ascend_device_type,
     register_ascend_customop,
+)
+from vllm_ascend.worker.descale import (
+    destory_acl_graph,
+    destory_comm_group,
+    expand_expert_weights,
+    gen_expert_backup_map,
+    gen_global_log2phy_map,
+    gen_local_log2phy_map,
+    generate_redundant_expert_ids,
+    get_expert_distribution_after_descale,
+    init_ep2dp_map,
+    init_global_expert_distribution,
+    rebuild_acl_graph,
+    reconfigure_moe,
+    reinit_comm_group,
+    reload_fault_expert_weights,
+    save_expert_weights_to_ram,
+    update_elastic_info,
+    update_ep2dp_map,
+    update_parallel_config,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
@@ -154,6 +174,104 @@ class NPUWorker(WorkerBase):
 
             signal.signal(signal.SIGTERM, signal_handler)
             signal.signal(signal.SIGINT, signal_handler)
+        self.ep2dp_map = init_ep2dp_map(
+            self.vllm_config.parallel_config.data_parallel_size, self.vllm_config.parallel_config.tensor_parallel_size
+        )
+        self.experts_saved_ids = []
+        self.experts_saved_weights = {}
+        self.quant = self.model_config.quantization is not None
+        if hasattr(self.vllm_config.model_config.hf_config, "num_experts"):
+            self.num_logical_expert = self.vllm_config.model_config.hf_config.num_experts
+        elif hasattr(self.vllm_config.model_config.hf_config, "n_routed_experts"):
+            self.num_logical_expert = self.vllm_config.model_config.hf_config.n_routed_experts
+        else:
+            raise ValueError("unknown number of experts")
+
+        self.use_mask_mc2 = False
+        redundant_expert_list = []
+        ep_size = (
+            self.vllm_config.parallel_config.data_parallel_size * self.vllm_config.parallel_config.tensor_parallel_size
+        )
+        num_redundancy_expert = self.vllm_config.additional_config.get("eplb_config").get("num_redundancy_expert")
+        if num_redundancy_expert and get_ascend_device_type() in AscendDeviceType.A3:
+            self.use_mask_mc2 = True
+            redundant_expert_list = generate_redundant_expert_ids(
+                self.num_logical_expert, ep_size, num_redundancy_expert
+            )
+        self.global_log2phy_map = gen_global_log2phy_map(self.num_logical_expert, ep_size, redundant_expert_list)
+        self.global_experts_distribution = init_global_expert_distribution(self.global_log2phy_map, ep_size)
+        self.log2phy = gen_local_log2phy_map(self.global_log2phy_map)
+
+    def dp_descale(self, exclude_dp_ranks, vllm_update_config):
+        self.cache_config.gpu_memory_utilization = 0.95
+        rank = self.vllm_config.parallel_config.data_parallel_rank
+        if hasattr(self.vllm_config.model_config.hf_config, "num_experts"):
+            num_logical_expert = self.vllm_config.model_config.hf_config.num_experts
+        elif hasattr(self.vllm_config.model_config.hf_config, "n_routed_experts"):
+            num_logical_expert = self.vllm_config.model_config.hf_config.n_routed_experts
+        else:
+            raise ValueError("unknown number of experts")
+        expert_ids_to_save = list()
+        self.global_log2phy_map, redistributed_experts, added_experts, replaced_redundant_experts, self.use_mask_mc2 = (
+            get_expert_distribution_after_descale(
+                exclude_dp_ranks,
+                self.experts_distribution,
+                self.global_log2phy_map,
+                self.backup_expert_rank_mapping,
+                self.use_mask_mc2,
+            )
+        )
+        expert_ids_to_save.extend(added_experts.get(rank))
+        for redundant_expert_id, (redundant_expert_pos, routed_expert_id) in replaced_redundant_experts.get(rank):
+            expert_ids_to_save.append(routed_expert_id)
+
+        if not self.model_config.enforce_eager and not self.use_mask_mc2:
+            self.vllm_config = destory_acl_graph(self.use_mask_mc2, self.vllm_config, self.model_runner)
+
+        destory_comm_group(self.use_mask_mc2)
+
+        if rank not in exclude_dp_ranks:
+            self.experts_saved_ids, self.experts_saved_weights = save_expert_weights_to_ram(
+                expert_ids_to_save,
+                self.experts_saved_ids,
+                self.experts_saved_weights,
+                self.vllm_config,
+                self.model_runner,
+                self.quant,
+            )
+            expand_expert_weights(self.model_runner, added_experts, self.quant)
+            reload_fault_expert_weights(
+                self.model_runner,
+                self.global_experts_distribution,
+                self.experts_saved_weights,
+                self.vllm_config,
+                redistributed_experts,
+                added_experts,
+                replaced_redundant_experts,
+                self.quant,
+            )
+            update_parallel_config(get_current_vllm_config(), vllm_update_config)
+            update_parallel_config(self.vllm_config, vllm_update_config)
+            self.model_runner.dp_size = self.vllm_config.parallel_config.data_parallel_size
+            self.model_runner.dp_rank = self.vllm_config.parallel_config.data_parallel_rank
+            rank_mapping = vllm_update_config.get("rank_mapping")
+            self.ep2dp_map = update_ep2dp_map(self.ep2dp_map, exclude_dp_ranks, rank_mapping)
+            elastic_info = get_elastic_info()
+            num_new_phy_experts = sum(map(len, redistributed_experts.values()))
+            update_elastic_info(self.use_mask_mc2, elastic_info, num_new_phy_experts, self.ep2dp_map)
+            self.log2phy.copy_(gen_local_log2phy_map(self.global_log2phy_map))
+            with set_current_vllm_config(self.vllm_config):
+                reinit_comm_group(self.use_mask_mc2, self.vllm_config, self)
+            reconfigure_moe(
+                self.use_mask_mc2,
+                self.model_runner,
+                self.vllm_config,
+                num_logical_expert,
+                num_new_phy_experts,
+                self.log2phy,
+            )
+            if not self.model_config.enforce_eager:
+                rebuild_acl_graph(self.use_mask_mc2, self)
 
     def uninstall_static_kernel(self):
         import fcntl
@@ -402,6 +520,21 @@ class NPUWorker(WorkerBase):
 
         with context, set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()
+
+        dp_size = self.vllm_config.parallel_config.data_parallel_size
+        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+        is_a3 = get_ascend_device_type() in {AscendDeviceType.A3}
+        expert_backup_map = gen_expert_backup_map(
+            num_experts=self.num_logical_expert,
+            ep_size=dp_size * tp_size,
+            num_die_per_npu=2 if is_a3 else 1,
+            global_expert_distribution=self.global_experts_distribution,
+        )
+        self.backup_expert_rank_mapping = {}
+        for rank, expert_ids in enumerate(expert_backup_map):
+            for expert in expert_ids:
+                self.backup_expert_rank_mapping[expert] = rank
+        # todo热备代码暂时不搬
 
     def compile_or_warm_up_model(self) -> None:
         # Note: need to adapt for graph mode.

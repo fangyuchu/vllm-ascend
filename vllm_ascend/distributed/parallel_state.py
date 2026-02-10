@@ -24,6 +24,21 @@ _SHARD_WEIGHT: GroupCoordinator | None = None
 
 _P_TP: GroupCoordinator | None = None
 
+_ELASTIC_INFO: torch.Tensor | None = None
+
+
+def get_elastic_info():
+    return _ELASTIC_INFO
+
+
+def set_elastic_info(elastic_info):
+    global _ELASTIC_INFO
+    if _ELASTIC_INFO is None or elastic_info is None:
+        _ELASTIC_INFO = elastic_info
+    else:
+        assert _ELASTIC_INFO.shape == elastic_info.shape
+        _ELASTIC_INFO.copy_(elastic_info)
+
 
 def init_ascend_model_parallel(
     parallel_config: ParallelConfig,
