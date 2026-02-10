@@ -222,7 +222,9 @@ class NPUWorker(WorkerBase):
             )
         )
         expert_ids_to_save.extend(added_experts.get(rank))
-        for redundant_expert_id, (redundant_expert_pos, routed_expert_id) in replaced_redundant_experts.get(rank):
+        for redundant_expert_id, (redundant_expert_pos, routed_expert_id) in replaced_redundant_experts.get(
+            rank, {}
+        ).items():
             expert_ids_to_save.append(routed_expert_id)
 
         if not self.model_config.enforce_eager and not self.use_mask_mc2:
