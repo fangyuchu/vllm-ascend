@@ -227,7 +227,7 @@ def get_expert_distribution_after_descale(
     # restore on backup rank(RAM load)
     for expert_id in failed_logical_experts:
         backup_rank = backup_expert_rank_mapping.get(expert_id)
-        if backup_rank is None and backup_rank in health_ranks and redundant_slots[backup_rank]:
+        if backup_rank is not None and backup_rank in health_ranks and redundant_slots[backup_rank]:
             redundant_id, slot_idx = redundant_slots[backup_rank].pop()
             expert_distribution[backup_rank][slot_idx] = expert_id
             replaced_redundant_experts[backup_rank][redundant_id] = (slot_idx, expert_id)
@@ -472,8 +472,8 @@ def reload_fault_expert_weights(
             )
             module._load_w13(
                 expert_data=module.w13_weight_list[target_index],
-                shard_id=1,
-                shard_dim="w3",
+                shard_dim=1,
+                shard_id="w3",
                 loaded_weight=w3_weight.to(device),
                 tp_rank=module.tp_rank,
             )
@@ -495,8 +495,8 @@ def reload_fault_expert_weights(
             )
             module._load_w13(
                 expert_data=module.w13_weight[target_index],
-                shard_id=1,
-                shard_dim="w3",
+                shard_dim=1,
+                shard_id="w3",
                 loaded_weight=w3_weight.to(device),
                 tp_rank=module.tp_rank,
             )
