@@ -28,7 +28,7 @@ import torch_npu
 from vllm.config import get_current_vllm_config
 from vllm.distributed.parallel_state import get_ep_group
 
-from vllm_ascend.distributed.parallel_state import get_mc2_group, get_elastic_info
+from vllm_ascend.distributed.parallel_state import get_elastic_info, get_mc2_group
 from vllm_ascend.ops.fused_moe.comm_utils import async_all_to_all, gather_from_sequence_parallel_region
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type, is_hierarchical_communication_enabled
 
