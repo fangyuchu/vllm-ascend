@@ -40,7 +40,7 @@ def gen_expert_backup_map(
         global_expert_distribution = distribute_experts(num_experts, ep_size)
 
     def get_least_load_backup_rank(exclude_ranks: list[int]) -> int:
-        assert len(exclude_ranks) != ep_size, "必须保留至少一个可用的备份rank"
+        assert len(exclude_ranks) != ep_size, "At least one backup rank must remain available."
         min_backup_count = float("inf")
         optimal_backup_rank = -1
         for rank in range(ep_size):
@@ -96,7 +96,7 @@ def gen_global_log2phy_map(
         num_routed_experts_list.append(len(exp_distribution_without_redundancy[rank]))
         num_redundant_experts_list.append(num_phy_exp_per_npu - len(exp_distribution_without_redundancy[rank]))
 
-    # Mapping: logcial expert -> list of physical expert IDs assigned
+    # Mapping: logical expert -> list of physical expert IDs assigned
     global_log2phy_map: dict[int, list[int]] = {log_expert_id: [] for log_expert_id in range(num_logical_experts)}
     log_experts_iter = iter(range(num_logical_experts))
 
@@ -127,8 +127,8 @@ def gen_global_log2phy_map(
                 break
             if not success:
                 raise RuntimeError(
-                    "expert placement aborted. the distribution of redundant expert cannot"
-                    "satisfy the requirement that physical replicas of each logical expert"
+                    "expert placement aborted. The distribution of redundant experts cannot"
+                    "satisfy the requirement that physical replicas of each logical expert are properly replicated."
                 )
     return global_log2phy_map
 
@@ -222,6 +222,9 @@ def get_expert_distribution_after_descale(
             while slot_gap > 0:
                 assert slot_gap > 0, "slot_gap should be positive in loop!"
                 assert backup_experts, "backup_experts became empty during loop!"
+                assert len(backup_experts) >= slot_gap, (
+                    f"Insufficient backup experts! Need {slot_gap}, but only {len(backup_experts)} left (rank={rank})"
+                )
                 for eid in backup_experts[:slot_gap]:
                     expert_distribution[rank].append(eid)
                     added_experts[rank].append(eid)
@@ -267,7 +270,7 @@ def get_expert_distribution_after_descale(
     return new_global_log2phy_map, expert_distribution, added_experts, replaced_redundant_experts, use_mask_mc2
 
 
-def destory_acl_graph(use_mask_mc2: bool, vllm_config: VllmConfig, model: NPUModelRunner) -> VllmConfig:
+def destroy_acl_graph(use_mask_mc2: bool, vllm_config: VllmConfig, model: NPUModelRunner) -> VllmConfig:
     if not use_mask_mc2:
         for entries in vllm_config.compilation_config.concrete_aclgraph_entry_list:
             for name, entry in entries.items():
@@ -289,7 +292,7 @@ def rebuild_acl_graph(use_mask_mc2: bool, worker: NPUWorker) -> None:
         worker.compile_or_warm_up_model()
 
 
-def destory_comm_group(use_mask_mc2: bool) -> None:
+def destroy_comm_group(use_mask_mc2: bool) -> None:
     if use_mask_mc2:
         get_dp_group().destroy_cpu_group()
     else:
@@ -338,16 +341,12 @@ def save_expert_weights_to_ram(
     Returns:
         tuple: (Updated list of saved expert IDs, Updated dictionary of saved expert weights)
     """
-    # 转换为集合加速查找（O(1) vs 列表O(n)）
     saved_ids_set = set(experts_saved_ids)
-    # 去重并筛选未保存的专家ID
     unsaved_expert_ids = list({eid for eid in experts_id_to_save if eid not in saved_ids_set})
 
-    # 无需要保存的专家时直接返回原数据
     if not unsaved_expert_ids:
         return experts_saved_ids, experts_saved_weights
 
-    # 定义权重名称后缀常量
     BASE_WEIGHT_SUFFIXES = {"down_proj.weight", "up_proj.weight", "gate_proj.weight"}
     QUANT_WEIGHT_SUFFIXES = {
         "down_proj.weight_offset",
@@ -358,13 +357,11 @@ def save_expert_weights_to_ram(
         "gate_proj.weight_scale",
     }
 
-    # 根据量化状态确定需要保存的权重后缀
     weight_suffixes = BASE_WEIGHT_SUFFIXES.union(QUANT_WEIGHT_SUFFIXES) if quant else BASE_WEIGHT_SUFFIXES
     num_hidden_layers = vllm_config.model_config.hf_config.num_hidden_layers
 
-    # 生成需要保存的权重名称集合
     def _generate_expert_weight_name(layer_id: int, expert_id: int, suffix: str) -> str:
-        """生成单个专家权重的完整名称"""
+        """Generate the full parameter name for a single expert weight."""
         return f"model.layers.{layer_id}.mlp.experts.{expert_id}.{suffix}"
 
     weights_to_save = set()
@@ -373,7 +370,6 @@ def save_expert_weights_to_ram(
             for suffix in weight_suffixes:
                 weights_to_save.add(_generate_expert_weight_name(layer_id, expert_id, suffix))
 
-    # 加载并保存权重
     model_loader = get_model_loader(vllm_config.load_config)
     all_weight_iter = model_loader.get_all_weights(vllm_config.model_config, model_runner.model)
 
@@ -384,10 +380,8 @@ def save_expert_weights_to_ram(
                 weight_tensor = torch.squeeze(weight_tensor)
             experts_saved_weights[weight_name] = weight_tensor
 
-    # 更新已保存的专家ID列表
     experts_saved_ids.extend(unsaved_expert_ids)
 
-    # 返回更新后的两个核心数据
     return experts_saved_ids, experts_saved_weights
 
 
@@ -417,13 +411,15 @@ def expand_expert_weights(model_runner: NPUModelRunner, added_experts: dict[int,
         for module in model_runner.model.modules():
             if isinstance(module, FusedMoE) and expand_lines:
                 if quant:
-                    # todo 待验证
+                    # TODO: needs verification
                     module.w2_weight_list = expand_parameter(module.w2_weight_list, 0, expand_lines)
                     module.w13_weight_list = expand_parameter(module.w13_weight_list, 0, expand_lines)
                     module.w2_weight_scale_list = expand_parameter(module.w2_weight_scale_list, 0, expand_lines)
                     module.w13_weight_scale_fp32_list = expand_parameter(
                         module.w13_weight_scale_fp32_list, 0, expand_lines
                     )
+                    module.w2_weight_offset.data = expand_parameter(module.w2_weight_offset.data, 0, expand_lines)
+                    module.w13_weight_offset.data = expand_parameter(module.w13_weight_offset.data, 0, expand_lines)
                 else:
                     module.w2_weight = expand_parameter(module.w2_weight, 0, expand_lines)
                     module.w13_weight = expand_parameter(module.w13_weight, 0, expand_lines)
@@ -439,9 +435,9 @@ def dynamic_merge_view(
     non_dim_shapes = [s for i, s in enumerate(tensor1.shape) if i != dim]
     for i, s in enumerate(tensor2.shape):
         if i != dim and s != non_dim_shapes[i if i < dim else i - 1]:
-            raise ValueError(f"非合并维度{i}大小不匹配：tensor1={s} vs tensor2 = {non_dim_shapes[i]}")
+            raise ValueError(f"size mismatch on non merged dimension {i}：tensor1={s} vs tensor2 = {non_dim_shapes[i]}")
     if target_tensor.shape[dim] != total_dim_size:
-        raise ValueError(f"目标张量在维度{dim}大小必须为{dim_size1}+{dim_size2}={total_dim_size}")
+        raise ValueError(f"target tensor on dim {dim} must be {dim_size1}+{dim_size2}={total_dim_size}")
 
     top_view = target_tensor.narrow(dim, 0, dim_size1)
     bottom_view = target_tensor.narrow(dim, dim_size1, dim_size2)
@@ -489,7 +485,7 @@ def reload_fault_expert_weights(
                 loaded_weight=w3_weight.to(device),
                 tp_rank=module.tp_rank,
             )
-            # todo 加载量化权重待验证
+            # TODO: load quantization weights need verification
             w1_weight_scale = experts_saved_weights[f"{prefix}.gate_proj.weight_scale"].to(device)
             w2_weight_scale = experts_saved_weights[f"{prefix}.down_proj.weight_scale"].to(device)
             w3_weight_scale = experts_saved_weights[f"{prefix}.up_proj.weight_scale"].to(device)
@@ -532,11 +528,9 @@ def reload_fault_expert_weights(
 
     for module in model_runner.model.modules():
         if isinstance(module, FusedMoE):
-            # 加载新增专家
             if experts_to_expand:
                 for idx, eid in enumerate(experts_to_expand):
                     _load_single_expert(eid, init_local_experts_count + idx, quant=quant)
-            # 故障专家替换冗余专家
             if slot_to_routed_expert_map:
                 for slot_pos, expert_id in slot_to_routed_expert_map.items():
                     _load_single_expert(expert_id, slot_pos, quant=quant)
@@ -607,12 +601,12 @@ def update_elastic_info(
         descale_ep_size = len(valid_ep_ranks)
         is_descale = 1 if descale_ep_size < raw_ep_size else 0
 
-        # Table1: epRankID -> localEpRankId(-1表示失效）
+        # Table1: epRankID -> localEpRankId(-1 indicates invalid）
         table1 = torch.full((raw_ep_size,), -1, dtype=torch.int32, device="cpu")
         for local_ep_rank, ep_rank in enumerate(valid_ep_ranks):
             table1[ep_rank] = local_ep_rank
 
-        # Table2: localEpRankId -> epRankID(-1表示填充）
+        # Table2: localEpRankId -> epRankID(-1 indicates padding）
         table2 = torch.full((raw_ep_size,), -1, dtype=torch.int32, device="cpu")
         for local_ep_rank, ep_rank in enumerate(valid_ep_ranks):
             if local_ep_rank < descale_ep_size:
@@ -623,7 +617,7 @@ def update_elastic_info(
         elastic_info[1] = descale_ep_size
         elastic_info[2] = share_expert_num
         elastic_info[3] = expert_num
-        # update Tabel1
+        # update Table1
         table1_start = 4
         elastic_info[table1_start : table1_start + raw_ep_size] = table1
         # update Table2
@@ -641,7 +635,8 @@ def gen_local_log2phy_map(global_log2phy_map: dict[int, list[int]]) -> torch.Ten
         replica_list = global_log2phy_map[log_expert_id]
         # num_replicas = len(replica_list)
         # phy_id = replica_list[global_rank % num_replicas]
-        # todo：暂时只能使用每个逻辑专家的0号物理专家，使用上两行的写法进行负载均衡会有精度问题
+        # TODO: For now we can only use the 0-th physical expert of each logical expert;
+        # using the two lines above for load balancing causes accuracy issues.
         phy_id = replica_list[0]
         log2phy[log_expert_id] = phy_id
     return log2phy.npu()
@@ -672,9 +667,9 @@ def reconfigure_moe(
         module.global_num_experts = num_global_logical_experts
         module.global_redundant_experts_num = num_global_new_phy_experts - num_global_logical_experts
         module.moe_parallel_config = FusedMoEParallelConfig.make(
-            tp_size=get_tp_group.world_size,
-            pcp_size=get_pcp_group.world_size,
-            dp_size=get_dp_group.world_size,
+            tp_size=get_tp_group().world_size,
+            pcp_size=get_pcp_group().world_size,
+            dp_size=get_dp_group().world_size,
             vllm_parallel_config=parallel_config,
         )
         module.moe_config = FusedMoEConfig(
