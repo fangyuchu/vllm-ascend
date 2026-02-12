@@ -183,11 +183,11 @@ def get_expert_distribution_after_descale(
     for rank in excluded_dp_ranks:
         global_offset = rank * num_experts_per_rank
         for local_idx, expert_id in enumerate(old_expert_distribution[rank]):
-            golbal_pos = global_offset + local_idx
-            assert golbal_pos in global_log2phy_map[expert_id], (
-                f"physical position {golbal_pos} missing from global_log2phy_map[{expert_id}]"
+            global_pos = global_offset + local_idx
+            assert global_pos in global_log2phy_map[expert_id], (
+                f"physical position {global_pos} missing from global_log2phy_map[{expert_id}]"
             )
-            global_log2phy_map[expert_id].remove(golbal_pos)
+            global_log2phy_map[expert_id].remove(global_pos)
             if not global_log2phy_map[expert_id]:
                 failed_logical_experts.add(expert_id)
     failed_logical_experts = sorted(failed_logical_experts)
@@ -547,6 +547,18 @@ def reload_fault_expert_weights(
 
 
 def update_parallel_config(original_config: VllmConfig, update_config: dict[str, int]) -> None:  # , worker_guard)
+    required_keys = {
+        "data_parallel_size",
+        "data_parallel_size_local",
+        "data_parallel_rank",
+        "data_parallel_rank_local",
+        "expert_parallel_size",
+        "data_parallel_master_port",
+    }
+    missing_keys = required_keys - set(update_config.keys())
+    if missing_keys:
+        raise ValueError(f"update parallel config failed missing keys: {missing_keys}")
+
     original_config.parallel_config.data_parallel_size = update_config["data_parallel_size"]
     original_config.parallel_config.data_parallel_size_local = update_config["data_parallel_size_local"]
     original_config.parallel_config.data_parallel_rank = update_config["data_parallel_rank"]

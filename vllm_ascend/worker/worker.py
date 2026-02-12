@@ -206,9 +206,51 @@ class NPUWorker(WorkerBase):
             self.global_log2phy_map = gen_global_log2phy_map(self.num_logical_expert, ep_size, redundant_expert_list)
             self.global_experts_distribution = init_global_expert_distribution(self.global_log2phy_map, ep_size)
             self.log2phy = gen_local_log2phy_map(self.global_log2phy_map)
+            self.backup_expert_rank_mapping = {}
 
     def dp_descale(self, exclude_dp_ranks, vllm_update_config):
-        assert self.vllm_config.fault_tolerance.enable_fault_tolerance is True
+        """
+        Reconfigure data-parallel (DP) layout and MoE expert placement after
+        excluding one or more DP ranks (e.g., due to failure).
+        This method is part of the fault-tolerance flow. Given a set of DP
+        ranks to remove from the active data-parallel group, it recomputes
+        and applies a new expert-to-device mapping, updates global and local
+        expert distribution metadata, and adjusts internal flags related to
+        redundant experts and mask-based routing. It may also trigger saving
+        and reloading of expert weights so that remaining devices can take
+        over experts previously hosted on failed or excluded ranks.
+        Parameters
+        ----------
+        exclude_dp_ranks:
+            A collection (e.g., list) of data-parallel ranks that should be
+            excluded from service. These ranks are treated as failed or
+            removed, and their experts are redistributed to remaining ranks.
+        vllm_update_config:
+            Configuration and/or callback handle used to propagate updates to
+            the global vLLM configuration after descaling. This object is
+            expected to be provided by the caller and is used to keep the
+            runtime configuration consistent with the new DP/expert layout.
+        Side Effects
+        ------------
+        - Updates ``self.global_log2phy_map`` and related expert-distribution
+          structures to reflect the new mapping.
+        - May update ``self.use_mask_mc2`` depending on redundant expert
+          usage and hardware support.
+        - Adjusts cache and memory utilization configuration (e.g.,
+          ``self.cache_config.gpu_memory_utilization``).
+        Preconditions
+        -------------
+        - ``self.vllm_config.fault_tolerance.enable_fault_tolerance`` must be
+          ``True`` (enforced by assertion).
+        - The worker must have completed its normal initialization flow,
+          including model loading (e.g., via ``load_model``) and initial
+          expert distribution setup so that expert mappings and backup
+          metadata are valid.
+        """
+        # 前置校验与基础配置
+        assert self.vllm_config.fault_tolerance.enable_fault_tolerance is True, "enable_fault_tolerance is False"
+        if not self.backup_expert_rank_mapping:
+            raise RuntimeError("not load model yet")
         # todo  self.cache_config.gpu_memory_utilization = 0.95 need to revise later
         self.cache_config.gpu_memory_utilization = 0.95
         rank = self.vllm_config.parallel_config.data_parallel_rank
@@ -218,6 +260,7 @@ class NPUWorker(WorkerBase):
             num_logical_expert = self.vllm_config.model_config.hf_config.n_routed_experts
         else:
             raise ValueError("unknown number of experts")
+        # 专家分布重计算
         expert_ids_to_save = list()
         self.global_log2phy_map, redistributed_experts, added_experts, replaced_redundant_experts, self.use_mask_mc2 = (
             get_expert_distribution_after_descale(
@@ -234,12 +277,14 @@ class NPUWorker(WorkerBase):
         ).items():
             expert_ids_to_save.append(routed_expert_id)
 
+        # clean acl_graph and comm_group
         if not self.model_config.enforce_eager and not self.use_mask_mc2:
             self.vllm_config = destory_acl_graph(self.use_mask_mc2, self.vllm_config, self.model_runner)
 
         destory_comm_group(self.use_mask_mc2)
 
         if rank not in exclude_dp_ranks:
+            # reload fault expert weights
             self.experts_saved_ids, self.experts_saved_weights = save_expert_weights_to_ram(
                 expert_ids_to_save,
                 self.experts_saved_ids,
@@ -263,6 +308,7 @@ class NPUWorker(WorkerBase):
                 self.vllm_config.parallel_config.data_parallel_size
                 * self.vllm_config.parallel_config.tensor_parallel_size
             )
+            # update parallel config
             # todo when get_current_vllm_config is not None,should update it.
             # if get_current_vllm_config():
             #     update_parallel_config(get_current_vllm_config(), vllm_update_config)
@@ -275,8 +321,10 @@ class NPUWorker(WorkerBase):
             num_new_phy_experts = sum(map(len, redistributed_experts.values()))
             update_elastic_info(self.use_mask_mc2, elastic_info, num_new_phy_experts, old_ep_size, self.ep2dp_map)
             self.log2phy.copy_(gen_local_log2phy_map(self.global_log2phy_map))
+            # reinit comm_group
             with set_current_vllm_config(self.vllm_config):
                 reinit_comm_group(self.use_mask_mc2, self.vllm_config, self)
+            # update AscendFusedMoE
             reconfigure_moe(
                 self.use_mask_mc2,
                 self.model_runner,
@@ -285,6 +333,7 @@ class NPUWorker(WorkerBase):
                 num_new_phy_experts,
                 self.log2phy,
             )
+            # rebuild acl_graph
             if not self.model_config.enforce_eager:
                 rebuild_acl_graph(self.use_mask_mc2, self)
 
