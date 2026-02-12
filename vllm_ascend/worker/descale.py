@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 import torch
 from vllm.compilation.wrapper import reset_compile_wrapper
 from vllm.config import VllmConfig, set_current_vllm_config
-from vllm.distributed.parallel_state import (
+from vllm.distributed import (
     cleanup_dist_env_and_memory,
     get_dp_group,
     get_ep_group,
@@ -27,6 +27,9 @@ from vllm_ascend.ops.fused_moe.fused_moe import setup_moe_comm_method
 if TYPE_CHECKING:
     from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
     from vllm_ascend.worker.worker import NPUWorker
+else:
+    NPUModelRunner = None
+    NPUWorker = None
 
 
 def gen_expert_backup_map(
@@ -287,27 +290,27 @@ def rebuild_acl_graph(use_mask_mc2: bool, worker: NPUWorker) -> None:
 
 
 def destory_comm_group(use_mask_mc2: bool) -> None:
-    if not use_mask_mc2:
-        get_dp_group().destory_cpu_group()
+    if use_mask_mc2:
+        get_dp_group().destroy_cpu_group()
     else:
         destroy_ascend_model_parallel()
         cleanup_dist_env_and_memory()
 
 
 def init_dp_device_group(vllm_config: VllmConfig) -> None:
-    get_dp_group.cpu_group = stateless_init_torch_distributed_process_group(
+    get_dp_group().cpu_group = stateless_init_torch_distributed_process_group(
         vllm_config.parallel_config.data_parallel_master_ip,
         vllm_config.parallel_config.data_parallel_master_port + 100,
         vllm_config.parallel_config.data_parallel_rank,
         vllm_config.parallel_config.data_parallel_size,
-        backend="hccl",
+        backend="gloo",
         gloo_comm_timeout=60,
         enable_fault_tolerance=True,
     )
 
 
 def reinit_comm_group(use_mask_mc2: bool, vllm_config: VllmConfig, worker: NPUWorker) -> None:
-    if not use_mask_mc2:
+    if use_mask_mc2:
         init_dp_device_group(vllm_config)
     else:
         worker._init_worker_distributed_environment()
@@ -372,12 +375,13 @@ def save_expert_weights_to_ram(
 
     # 加载并保存权重
     model_loader = get_model_loader(vllm_config.load_config)
-    all_weight_iter = model_loader.get_all_weight(vllm_config.model_config, model_runner.model)
+    all_weight_iter = model_loader.get_all_weights(vllm_config.model_config, model_runner.model)
 
     for weight_name, weight_tensor in all_weight_iter:
         if weight_name in weights_to_save:
-            if weight_name.rsplit(".", 1)[-1] in BASE_WEIGHT_SUFFIXES:
-                weight_tensor = weight_tensor.transpose(0, 1).contiguous()
+            weight_tensor = weight_tensor.transpose(0, 1).contiguous()
+            if any(weight_name.endswith(suffix) for suffix in QUANT_WEIGHT_SUFFIXES):
+                weight_tensor = torch.squeeze(weight_tensor)
             experts_saved_weights[weight_name] = weight_tensor
 
     # 更新已保存的专家ID列表
@@ -409,17 +413,20 @@ def expand_expert_weights(model_runner: NPUModelRunner, added_experts: dict[int,
     rank = model_runner.vllm_config.parallel_config.data_parallel_rank
     current_rank_expand_experts = added_experts[rank]
     expand_lines = len(current_rank_expand_experts)
-    for module in model_runner.model.modules():
-        if isinstance(module, FusedMoE) and expand_lines:
-            if quant:
-                # todo 待验证
-                module.w2_weight_list = expand_parameter(module.w2_weight_list, 0, expand_lines)
-                module.w13_weight_list = expand_parameter(module.w13_weight_list, 0, expand_lines)
-                module.w2_weight_scale_list = expand_parameter(module.w2_weight_scale_list, 0, expand_lines)
-                module.w13_weight_scale_fp32_list = expand_parameter(module.w13_weight_scale_fp32_list, 0, expand_lines)
-            else:
-                module.w2_weight = expand_parameter(module.w2_weight, 0, expand_lines)
-                module.w13_weight = expand_parameter(module.w13_weight, 0, expand_lines)
+    if expand_lines:
+        for module in model_runner.model.modules():
+            if isinstance(module, FusedMoE) and expand_lines:
+                if quant:
+                    # todo 待验证
+                    module.w2_weight_list = expand_parameter(module.w2_weight_list, 0, expand_lines)
+                    module.w13_weight_list = expand_parameter(module.w13_weight_list, 0, expand_lines)
+                    module.w2_weight_scale_list = expand_parameter(module.w2_weight_scale_list, 0, expand_lines)
+                    module.w13_weight_scale_fp32_list = expand_parameter(
+                        module.w13_weight_scale_fp32_list, 0, expand_lines
+                    )
+                else:
+                    module.w2_weight = expand_parameter(module.w2_weight, 0, expand_lines)
+                    module.w13_weight = expand_parameter(module.w13_weight, 0, expand_lines)
 
 
 def dynamic_merge_view(
@@ -461,7 +468,7 @@ def reload_fault_expert_weights(
         w2_weight = experts_saved_weights[f"{prefix}.down_proj.weight"]
         w3_weight = experts_saved_weights[f"{prefix}.up_proj.weight"]
         if quant:
-            device = module.w2_weight_list.device
+            device = module.w2_weight_list[target_index].device
             module._load_w2(
                 expert_data=module.w2_weight_list[target_index],
                 shard_dim=1,
@@ -482,7 +489,17 @@ def reload_fault_expert_weights(
                 loaded_weight=w3_weight.to(device),
                 tp_rank=module.tp_rank,
             )
-            # todo 加载量化权重 module.w2_weight_scale_list module.w13_weight_scale_fp32_list
+            # todo 加载量化权重待验证
+            w1_weight_scale = experts_saved_weights[f"{prefix}.gate_proj.weight_scale"].to(device)
+            w2_weight_scale = experts_saved_weights[f"{prefix}.down_proj.weight_scale"].to(device)
+            w3_weight_scale = experts_saved_weights[f"{prefix}.up_proj.weight_scale"].to(device)
+            w1_weight_offset = experts_saved_weights[f"{prefix}.gate_proj.weight_offset"].to(device)
+            w2_weight_offset = experts_saved_weights[f"{prefix}.down_proj.weight_offset"].to(device)
+            w3_weight_offset = experts_saved_weights[f"{prefix}.up_proj.weight_offset"].to(device)
+            module.w2_weight_scale_list[target_index].copy_(w2_weight_scale)
+            module.w2_weight_offset.data[target_index].copy_(w2_weight_offset)
+            dynamic_merge_view(module.w13_weight_scale_fp32_list[target_index], w1_weight_scale, w3_weight_scale)
+            dynamic_merge_view(module.w13_weight_offset.data[target_index], w1_weight_offset, w3_weight_offset)
         else:
             device = module.w2_weight.device
             module._load_w2(

@@ -27,7 +27,7 @@ import torch_npu
 import vllm.envs as envs_vllm
 from torch_npu.op_plugin.atb._atb_ops import _register_atb_extensions
 from torch_npu.profiler import dynamic_profile as dp
-from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config, set_current_vllm_config
+from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.distributed import ensure_model_parallel_initialized, init_distributed_environment
 from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
 from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized, get_kv_transfer_group, has_kv_transfer_group
@@ -197,7 +197,7 @@ class NPUWorker(WorkerBase):
             )
             additional_config = self.vllm_config.additional_config or {}
             eplb_cfg = additional_config.get("eplb_config", {})
-            num_redundancy_expert = eplb_cfg.get("num_redundancy_expert")
+            num_redundancy_expert = eplb_cfg.get("num_redundant_experts")
             if num_redundancy_expert and get_ascend_device_type() in {AscendDeviceType.A3}:
                 self.use_mask_mc2 = True
                 redundant_expert_list = generate_redundant_expert_ids(
@@ -263,7 +263,9 @@ class NPUWorker(WorkerBase):
                 self.vllm_config.parallel_config.data_parallel_size
                 * self.vllm_config.parallel_config.tensor_parallel_size
             )
-            update_parallel_config(get_current_vllm_config(), vllm_update_config)
+            # todo when get_current_vllm_config is not None,should update it.
+            # if get_current_vllm_config():
+            #     update_parallel_config(get_current_vllm_config(), vllm_update_config)
             update_parallel_config(self.vllm_config, vllm_update_config)
             self.model_runner.dp_size = self.vllm_config.parallel_config.data_parallel_size
             self.model_runner.dp_rank = self.vllm_config.parallel_config.data_parallel_rank
