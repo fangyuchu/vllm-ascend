@@ -247,7 +247,7 @@ class NPUWorker(WorkerBase):
           expert distribution setup so that expert mappings and backup
           metadata are valid.
         """
-        # 前置校验与基础配置
+        # pre-verification and basic configuration
         assert self.vllm_config.fault_tolerance.enable_fault_tolerance is True, "enable_fault_tolerance is False"
         if not self.backup_expert_rank_mapping:
             raise RuntimeError("not load model yet")
@@ -261,7 +261,7 @@ class NPUWorker(WorkerBase):
             num_logical_expert = self.vllm_config.model_config.hf_config.n_routed_experts
         else:
             raise ValueError("unknown number of experts")
-        # 专家分布重计算
+        # recalculation of erpert distribution
         expert_ids_to_save = list()
         self.global_log2phy_map, redistributed_experts, added_experts, replaced_redundant_experts, self.use_mask_mc2 = (
             get_expert_distribution_after_descale(
