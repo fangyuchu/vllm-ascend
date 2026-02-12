@@ -59,8 +59,8 @@ from vllm_ascend.utils import (
     register_ascend_customop,
 )
 from vllm_ascend.worker.descale import (
-    destory_acl_graph,
-    destory_comm_group,
+    destroy_acl_graph,
+    destroy_comm_group,
     expand_expert_weights,
     gen_expert_backup_map,
     gen_global_log2phy_map,
@@ -208,7 +208,7 @@ class NPUWorker(WorkerBase):
             self.log2phy = gen_local_log2phy_map(self.global_log2phy_map)
             self.backup_expert_rank_mapping = {}
 
-    def dp_descale(self, exclude_dp_ranks, vllm_update_config):
+    def dp_descale(self, exclude_dp_ranks: list[int], vllm_update_config):
         """
         Reconfigure data-parallel (DP) layout and MoE expert placement after
         excluding one or more DP ranks (e.g., due to failure).
@@ -252,6 +252,7 @@ class NPUWorker(WorkerBase):
         if not self.backup_expert_rank_mapping:
             raise RuntimeError("not load model yet")
         # todo  self.cache_config.gpu_memory_utilization = 0.95 need to revise later
+        # This value will be adjusted automatically in future revisions.
         self.cache_config.gpu_memory_utilization = 0.95
         rank = self.vllm_config.parallel_config.data_parallel_rank
         if hasattr(self.vllm_config.model_config.hf_config, "num_experts"):
@@ -279,9 +280,9 @@ class NPUWorker(WorkerBase):
 
         # clean acl_graph and comm_group
         if not self.model_config.enforce_eager and not self.use_mask_mc2:
-            self.vllm_config = destory_acl_graph(self.use_mask_mc2, self.vllm_config, self.model_runner)
+            self.vllm_config = destroy_acl_graph(self.use_mask_mc2, self.vllm_config, self.model_runner)
 
-        destory_comm_group(self.use_mask_mc2)
+        destroy_comm_group(self.use_mask_mc2)
 
         if rank not in exclude_dp_ranks:
             # reload fault expert weights
@@ -316,6 +317,7 @@ class NPUWorker(WorkerBase):
             self.model_runner.dp_size = self.vllm_config.parallel_config.data_parallel_size
             self.model_runner.dp_rank = self.vllm_config.parallel_config.data_parallel_rank
             rank_mapping = vllm_update_config.get("rank_mapping")
+            assert rank_mapping is dict
             self.ep2dp_map = update_ep2dp_map(self.ep2dp_map, exclude_dp_ranks, rank_mapping)
             elastic_info = get_elastic_info()
             num_new_phy_experts = sum(map(len, redistributed_experts.values()))
@@ -598,7 +600,7 @@ class NPUWorker(WorkerBase):
             for rank, expert_ids in enumerate(expert_backup_map):
                 for expert in expert_ids:
                     self.backup_expert_rank_mapping[expert] = rank
-            # todo热备代码暂时不搬
+            # todo Hot backup-related code has not yet been ported here.
 
     def compile_or_warm_up_model(self) -> None:
         # Note: need to adapt for graph mode.
