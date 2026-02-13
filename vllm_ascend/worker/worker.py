@@ -90,6 +90,7 @@ torch_non_c_binding_in_graph_functions_npu = dict.fromkeys(
 )  # noqa: E402
 torch_non_c_binding_in_graph_functions_npu["torch.npu.stream"] = TorchInGraphFunctionVariable  # noqa: E402
 torch._dynamo.trace_rules.torch_name_rule_map.append(torch_non_c_binding_in_graph_functions_npu)  # noqa: E402
+FAULT_TOLERANCE_MEM_UTILIZATION = 0.95
 
 
 class NPUWorker(WorkerBase):
@@ -251,9 +252,9 @@ class NPUWorker(WorkerBase):
         assert self.vllm_config.fault_tolerance.enable_fault_tolerance is True, "enable_fault_tolerance is False"
         if not self.backup_expert_rank_mapping:
             raise RuntimeError("not load model yet")
-        # todo  self.cache_config.gpu_memory_utilization = 0.95 need to revise later
+        # todo  self.cache_config.gpu_memory_utilization = FAULT_TOLERANCE_MEM_UTILIZATION need to revise later
         # This value will be adjusted automatically in future revisions.
-        self.cache_config.gpu_memory_utilization = 0.95
+        self.cache_config.gpu_memory_utilization = FAULT_TOLERANCE_MEM_UTILIZATION
         rank = self.vllm_config.parallel_config.data_parallel_rank
         if hasattr(self.vllm_config.model_config.hf_config, "num_experts"):
             num_logical_expert = self.vllm_config.model_config.hf_config.num_experts
