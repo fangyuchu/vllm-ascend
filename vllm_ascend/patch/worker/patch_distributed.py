@@ -19,6 +19,7 @@
 import torch
 import vllm
 from torch.distributed import Backend
+from vllm.config import FaultToleranceConfig
 from vllm.distributed.parallel_state import GroupCoordinator, _get_unique_name, _register_group
 
 from vllm_ascend.distributed.device_communicators.npu_communicator import NPUCommunicator
@@ -34,6 +35,7 @@ class GroupCoordinatorPatch(GroupCoordinator):
         use_device_communicator: bool,  # whether to use device communicator
         use_message_queue_broadcaster: bool = False,
         group_name: str | None = None,
+        fault_tolerance_config: FaultToleranceConfig | None = None,
     ):
         group_name = group_name or "anonymous"
         self.unique_name = _get_unique_name(group_name)
