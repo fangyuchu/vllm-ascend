@@ -285,7 +285,6 @@ def destroy_acl_graph(use_mask_mc2: bool, vllm_config: VllmConfig, model: NPUMod
             reset_compile_wrapper(model.get_model())
         gc.collect()
         torch.npu.empty_cache()
-        print(f"rank{vllm_config.parallel_config.data_parallel_rank} aclgraph reset success!")
     return vllm_config
 
 
