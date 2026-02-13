@@ -32,6 +32,9 @@ else:
     NPUWorker = None
 
 
+# TODO: Refactor descale.py - use descaler object instead of NpuWorker attrs to streamline code
+
+
 def gen_expert_backup_map(
     num_experts: int, ep_size: int, num_die_per_npu: int, global_expert_distribution: dict[int, list[int]]
 ) -> list[list[int]]:
