@@ -317,7 +317,8 @@ class NPUWorker(WorkerBase):
             self.model_runner.dp_size = self.vllm_config.parallel_config.data_parallel_size
             self.model_runner.dp_rank = self.vllm_config.parallel_config.data_parallel_rank
             rank_mapping = vllm_update_config.get("rank_mapping")
-            assert rank_mapping is dict
+            assert rank_mapping is not None
+            assert type(rank_mapping) is dict
             self.ep2dp_map = update_ep2dp_map(self.ep2dp_map, exclude_dp_ranks, rank_mapping)
             elastic_info = get_elastic_info()
             num_new_phy_experts = sum(map(len, redistributed_experts.values()))
