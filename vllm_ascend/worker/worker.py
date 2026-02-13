@@ -19,28 +19,23 @@
 
 import copy
 import gc
-from types import NoneType
-from functools import partial
-import torch
-import torch.nn as nn
-import math
 import threading
-import time
 from collections.abc import Callable
 from functools import partial
-import zmq
-from vllm.v1.engine.base_sentinel import BaseSentinel
-from vllm.distributed.parallel_state import get_all_model_groups, get_pp_group, get_tp_group
-from vllm.utils.network_utils import make_zmq_socket
+from types import NoneType
+
+import torch
+import torch.nn as nn
 import torch_npu
 import vllm.envs as envs_vllm
+import zmq
 from torch_npu.op_plugin.atb._atb_ops import _register_atb_extensions
 from torch_npu.profiler import dynamic_profile as dp
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
-from vllm.distributed import ensure_model_parallel_initialized, init_distributed_environment, get_dp_group
+from vllm.distributed import ensure_model_parallel_initialized, get_dp_group, init_distributed_environment
 from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
 from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized, get_kv_transfer_group, has_kv_transfer_group
-from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+from vllm.distributed.parallel_state import get_all_model_groups, get_pp_group, get_tp_group
 from vllm.logger import logger
 from vllm.lora.request import LoRARequest
 from vllm.sequence import IntermediateTensors
@@ -48,6 +43,7 @@ from vllm.tasks import SupportedTask
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+from vllm.v1.engine.base_sentinel import BaseSentinel
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerBase
@@ -60,6 +56,7 @@ from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
+from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.utils import (
     AscendDeviceType,
     check_ascend_device_type,
@@ -72,13 +69,14 @@ from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
 from torch._dynamo.variables import TorchInGraphFunctionVariable  # noqa: E402
 from vllm.utils.torch_utils import set_random_seed  # noqa: E402
-from vllm_ascend.platform import NPUPlatform
+
 torch_non_c_binding_in_graph_functions_npu = dict.fromkeys(
     ["torch.npu.current_stream"],
     TorchInGraphFunctionVariable,
 )  # noqa: E402
 torch_non_c_binding_in_graph_functions_npu["torch.npu.stream"] = TorchInGraphFunctionVariable  # noqa: E402
 torch._dynamo.trace_rules.torch_name_rule_map.append(torch_non_c_binding_in_graph_functions_npu)  # noqa: E402
+
 
 class WorkerSentinel(BaseSentinel):
     def __init__(
@@ -124,7 +122,7 @@ class WorkerSentinel(BaseSentinel):
                 success, method_uuid, reason = self._execute_cmd(cmd_str)
                 self._send_execution_result(success, method_uuid, reason)
 
-    def pause_by_signale(self):
+    def pause_by_signal(self):
         self.pause_event.set()
         return True
 
@@ -133,10 +131,10 @@ class WorkerSentinel(BaseSentinel):
         NPUPlatform.set_device(self.device)
         result = torch_npu.npu.stop_device(self.device.index)
         if result == 0:
-            logger.info(f"npu stop device {self.device.index} succeeded")
+            logger.info("npu stop device %s succeeded", {self.device.index})
             return True
         elif result == 1:
-            logger.info(f"npu stop device {self.device.index} failed")
+            logger.info("npu stop device %s failed", {self.device.index})
         else:
             raise ValueError(f"Unexpected return value from stop_device: {result}")
 
@@ -152,157 +150,12 @@ class WorkerSentinel(BaseSentinel):
         self.pause_event.clear()
         return True
 
-
-    def descale(self, **kwargs):
+    def descale(self, timeout: int = 60, **kwargs) -> bool:
+        NPUPlatform.set_device(self.device)
+        torch_npu.npu.restart_device(self.device.index)
+        self.clear_input_batch_callback()
+        self.pause_event.clear()
         return True
-
-
-def generate_redundant_expert_ids(num_exports: int, ep_size: int, redundant_exports: int):
-    if redundant_exports % ep_size != 0:
-        raise ValueError("redundant_exports 必须能被 ep_size 整除")
-
-    redundant_experts_per_ep_group = redundant_exports // ep_size
-
-    redundant_ids = []
-    for rank in range(ep_size):
-        start_id = rank * redundant_experts_per_ep_group
-        for i in range(redundant_experts_per_ep_group):
-            redundant_ids.append(start_id + i)
-    return redundant_ids
-
-
-def gen_phy_expert_map(
-    num_log_experts: int,
-    num_npus: int,
-    redundant_expert_list: list[int],
-) -> dict[int, list[int]]:
-    num_redundant_experts = len(redundant_expert_list)
-    assert (num_log_experts + num_redundant_experts) % num_npus == 0, (
-        "The physical expert count must evenly divide across NPUs."
-    )
-
-    num_pyh_exp_per_npu = (num_log_experts + num_redundant_experts) // num_npus
-
-    exp_distribution_without_redundancy = NPUWorker.distribute_experts(num_log_experts, num_npus)
-    num_routed_experts_list = []
-    num_redundant_exports_list = []
-    for rank in range(num_npus):
-        num_routed_experts_list.append(len(exp_distribution_without_redundancy[rank]))
-        num_redundant_exports_list.append(num_pyh_exp_per_npu - len(exp_distribution_without_redundancy[rank]))
-
-    global_log_to_phy_map: dict[int, list[int]] = {log_expert_id: [] for log_expert_id in range(num_log_experts)}
-
-    log_expert_iter = iter(range(num_log_experts))
-
-    global_pos = 0
-    re_exp_assign_map = [[exp_id, False] for exp_id in redundant_expert_list]
-
-    for rank in range(num_npus):
-        local_expert_map = []
-        for _ in range(num_routed_experts_list[rank]):
-            expert_id = next(log_expert_iter)
-            global_log_to_phy_map[expert_id].insert(0, global_pos)
-            global_pos += 1
-            local_expert_map.append(expert_id)
-
-        for _ in range(num_redundant_exports_list[rank]):
-            success = False
-            for i in range(len(re_exp_assign_map)):
-                eid, assigned = re_exp_assign_map[i]
-                if assigned:
-                    continue
-
-                if eid in local_expert_map:
-                    continue
-
-                global_log_to_phy_map[eid].append(global_pos)
-                global_pos += 1
-                local_expert_map.append(eid)
-                re_exp_assign_map[i][1] = True
-                success = True
-                break
-            if not success:
-                raise RuntimeError(
-                    "Expert placement aborted. The distribution of redundant experts cannot "
-                    "satisfy the requirement that physical replicas of each logical expert "
-                    "be mapped onto different NPUs. Consider increasing the variety of logical"
-                    "experts in 'redundant_experts_list' or reducing redundancy count"
-                )
-    return global_log_to_phy_map
-
-
-def gen_local_log_to_phy_expert_map(
-    global_rank: int,
-    global_log_to_phy_map: dict[int, list[int]],
-) -> torch.Tensor:
-    num_logical_exp = len(global_log_to_phy_map)
-    log2phy = torch.zeros(num_logical_exp, dtype=torch.int32)
-
-    for log_expert_id in sorted(global_log_to_phy_map.keys()):
-        replica_list = global_log_to_phy_map[log_expert_id]
-
-        phy_id = replica_list[0]
-        log2phy[log_expert_id] = phy_id
-    return log2phy
-
-
-def gen_expert_backup_map(
-    num_experts: int, ep_size: int, num_die_per_npu: int = 2, expert_distribution: list[list[int]] = None
-) -> list[list[int]]:
-    backup_experts = [[] for _ in range(ep_size)]
-
-    if expert_distribution is None:
-        logger.info("Use default expert map to determine backup expert map")
-        expert_distribution = NPUWorker.distribute_experts(
-            global_num_experts=num_experts,
-            ep_size=ep_size,
-        )
-
-    def get_least_load_backup_rank(exclude_ranks: list[int]) -> int:
-        assert len(exclude_ranks) != ep_size
-
-        min_backup_count = float("inf")
-        optimal_backup_rank = -1
-
-        for rank in range(ep_size):
-            if rank in exclude_ranks:
-                continue
-
-            current_backup_count = len(backup_experts[rank])
-            if current_backup_count <= min_backup_count:
-                min_backup_count = current_backup_count
-                optimal_backup_rank = rank
-
-            return optimal_backup_rank
-
-    for rank_group_start in range(0, ep_size, num_die_per_npu):
-        rank_group_end = min(rank_group_start + num_die_per_npu, ep_size)
-        current_rank_group = list(range(rank_group_start, rank_group_end))
-
-        current_group_experts = []
-        for rank in current_rank_group:
-            current_group_experts.extend(expert_distribution[rank])
-
-        for expert_id in current_group_experts:
-            backup_rank = get_least_load_backup_rank(exclude_ranks=current_rank_group)
-            backup_experts[backup_rank].append(expert_id)
-
-        return backup_experts
-
-
-def init_global_expert_distribution(
-    global_log_to_phy_map: dict[int, list[int]],
-    ep_size: int,
-) -> dict[int, list[int]]:
-    num_phy_experts = sum(map(lambda x: len(x), global_log_to_phy_map.values()))
-    num_phy_exp_per_npu = num_phy_experts // ep_size
-    global_experts_distribution = {i: [-1 for _ in range(num_phy_exp_per_npu)] for i in range(ep_size)}
-    for log_eid, phy_expert_pos in global_log_to_phy_map.items():
-        for pos in phy_expert_pos:
-            rank = pos // num_phy_exp_per_npu
-            local_pos = pos - rank * num_phy_exp_per_npu
-            global_experts_distribution[rank][local_pos] = log_eid
-    return global_experts_distribution
 
 
 class NPUWorker(WorkerBase):
@@ -343,7 +196,7 @@ class NPUWorker(WorkerBase):
         # init ascend config and soc version
         init_ascend_config(vllm_config)
         check_ascend_device_type()
-
+        self.worker_sentinel: WorkerSentinel | None = None
         super().__init__(
             vllm_config=vllm_config,
             local_rank=local_rank,
@@ -783,10 +636,12 @@ class NPUWorker(WorkerBase):
         ensure_ec_transfer_initialized(self.vllm_config)
         if self.vllm_config.fault_tolerance_config.enable_fault_tolerance:
             from datetime import timedelta
+
             from torch.distributed.distributed_c10d import _set_pg_timeout
+
             timeout = timedelta(seconds=self.vllm_config.fault_tolerance_config.gloo_comm_timeout)
             dp_cpu_group = get_dp_group()
-            _set_pg_timeout(timeout=timeout,group=dp_cpu_group.cpu_group)
+            _set_pg_timeout(timeout=timeout, group=dp_cpu_group.cpu_group)
 
     def _init_profiler(self):
         # Torch profiler. Enabled through profiler_config:
