@@ -262,7 +262,7 @@ class NPUWorker(WorkerBase):
             num_logical_expert = self.vllm_config.model_config.hf_config.n_routed_experts
         else:
             raise ValueError("unknown number of experts")
-        # recalculation of erpert distribution
+        # recalculation of expert distribution
         expert_ids_to_save = list()
         self.global_log2phy_map, redistributed_experts, added_experts, replaced_redundant_experts, self.use_mask_mc2 = (
             get_expert_distribution_after_descale(
@@ -311,9 +311,8 @@ class NPUWorker(WorkerBase):
                 * self.vllm_config.parallel_config.tensor_parallel_size
             )
             # update parallel config
-            # todo when get_current_vllm_config is not None,should update it.
-            # if get_current_vllm_config():
-            #     update_parallel_config(get_current_vllm_config(), vllm_update_config)
+            # TODO: When a current vLLM config instance is available (via get_current_vllm_config),
+            #       its parallel configuration should also be updated using vllm_update_config.
             update_parallel_config(self.vllm_config, vllm_update_config)
             self.model_runner.dp_size = self.vllm_config.parallel_config.data_parallel_size
             self.model_runner.dp_rank = self.vllm_config.parallel_config.data_parallel_rank
