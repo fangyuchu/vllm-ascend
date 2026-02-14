@@ -32,7 +32,19 @@ class VllmEplbAdaptor:
         self.num_dense_layers = getattr(self.model.config, "first_k_dense_replace", 0)
         self.num_moe_layers = self.model.config.num_hidden_layers - self.num_dense_layers
 
-        self.expert_map_per_layer_cpu = dict()  # copy of expert map on CPU to avoid device synchronize frequently
+        self.expert_map_per_layer = dict(
+        )  # reference to expert map on device for expert map update
+        self.expert_map_per_layer_cpu = dict(
+        )  # copy of expert map on CPU to avoid device synchronize frequently
+
+        for layer_idx in range(self.num_moe_layers):
+            self.expert_map_per_layer[self.num_dense_layers + layer_idx] = self.model.get_expert_map(
+                self.num_dense_layers + layer_idx
+            )
+            self.expert_map_per_layer[self.num_dense_layers + layer_idx] = self.model.get_expert_map(
+                self.num_dense_layers + layer_idx
+            ).cpu()
+
 
         self.num_local_experts = self.model.model.layers[-1].mlp.experts.local_num_experts
         self.expert_param_per_layer = dict()
@@ -41,12 +53,6 @@ class VllmEplbAdaptor:
         num_buffer_tensor = self.num_local_experts
         self.buffer_tensor_list: list[list[Any]] = [[] for _ in range(num_buffer_tensor)]
         self.init_buffer_tensor(num_buffer_tensor)
-
-        self.log2phy_map_per_layer = dict()
-        for layer_idx in range(self.num_moe_layers):
-            self.log2phy_map_per_layer[self.num_dense_layers + layer_idx] = self.model.get_log2phy_map(
-                self.num_dense_layers + layer_idx
-            )
 
     def init_buffer_tensor(self, num_buffer_tensor):
         for buffer_id in range(num_buffer_tensor):
@@ -111,7 +117,11 @@ class VllmEplbAdaptor:
                 json.dump(record, f, indent=4)
 
     def do_update_expert_map(self, layer_id, updated_expert_map):
+        self.expert_map_per_layer[layer_id].copy_(updated_expert_map)
         self.expert_map_per_layer_cpu[layer_id].copy_(updated_expert_map)
+
+    def do_update_global_expert_map(self, layer_id, updated_global_expert_map):
+        self.model.model.layers[layer_id].mlp.experts.global_expert_map = updated_global_expert_map
 
     def do_update_expert_weight(self, layer_id, local_expert_to_replace, buffer_tensor_id):
         for expert_tensor, buffer_tensor in zip(
@@ -121,8 +131,7 @@ class VllmEplbAdaptor:
             logger.debug(f"Expert tensor shape is :{expert_tensor.shape}")
 
     def do_update_log2phy_map(self, layer_id, updated_log2phy_map):
-        if self.log2phy_map_per_layer[layer_id] is not None:
-            self.log2phy_map_per_layer[layer_id].copy_(updated_log2phy_map)
+        self.model.model.layers[layer_id].mlp.experts.log2phy = updated_log2phy_map
 
     def get_global_expert_map(self):
         all_layer_global_expert_map = []

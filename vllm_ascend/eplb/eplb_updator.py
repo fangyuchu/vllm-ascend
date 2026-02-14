@@ -37,11 +37,6 @@ class EplbUpdator:
     def set_adaptor(self, adaptor: VllmEplbAdaptor):
         self.adaptor = adaptor
         self.num_moe_layers = self.adaptor.num_moe_layers
-        local_load = self.adaptor.get_rank_expert_workload()
-        self.world_size = dist.get_world_size()
-        self.device = local_load.device
-        shape = (self.world_size, *local_load.shape)
-        self._gather_buffer = torch.empty(shape, dtype=local_load.dtype, device=self.device)
 
     def init_eplb(self, expert_map_path, process):
         self.rank_id = dist.get_rank()
@@ -132,6 +127,11 @@ class EplbUpdator:
         self.update_iteration()
 
     def compute_and_set_moe_load(self):
+        local_load = self.adaptor.get_rank_expert_workload()
+        self.world_size = dist.get_world_size()
+        self.device = local_load.device
+        shape = (self.world_size, *local_load.shape)
+        self._gather_buffer = torch.empty(shape, dtype=local_load.dtype, device=self.device)
         local_load = self.adaptor.get_rank_expert_workload()
         dist.all_gather_into_tensor(self._gather_buffer, local_load)
 
