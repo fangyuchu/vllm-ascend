@@ -53,10 +53,13 @@ class DefaultEplb(EplbPolicy):
         for i in range(num_redundancy_expert):
             sorted_indices = np.argsort([t[1] for t in origin_weights], kind="stable")[::-1]
             weights = [origin_weights[idx] for idx in sorted_indices]
-            tmp_raw_weight = weights[0][1] * (len(route_expert_redundancy[weights[0][0]]) + 1)
-            route_expert_redundancy[weights[0][0]].append(route_expert_num + i)
-            avg_weight = tmp_raw_weight / (len(route_expert_redundancy[weights[0][0]]) + 1)
-            weights[0] = (weights[0][0], avg_weight)
+            index = 0
+            while (len(route_expert_redundancy[weights[index][0]])) == card_num - 1:
+                index += 1
+            tmp_raw_weight = weights[index][1] * (len(route_expert_redundancy[weights[index][0]]) + 1)
+            route_expert_redundancy[weights[index][0]].append(route_expert_num + i)
+            avg_weight = tmp_raw_weight / (len(route_expert_redundancy[weights[index][0]]) + 1)
+            weights[index] = (weights[index][0], avg_weight)
             origin_weights = weights
 
         # Step 2: Calculate the number of items per box
@@ -83,6 +86,7 @@ class DefaultEplb(EplbPolicy):
                 box_weights[index] += cur_weight
                 box_counts[index] += 1
                 index += 1
+                index = index % card_num
 
         sorted_indices = np.argsort([t[1] for t in origin_weights], kind="stable")[::-1]
         origin_weights = [origin_weights[idx] for idx in sorted_indices]
@@ -98,6 +102,17 @@ class DefaultEplb(EplbPolicy):
                     if min_box_index == -1 or box_weights[i] < box_weights[min_box_index]:
                         min_box_index = i
 
+            if min_box_index == -1:
+                # Try to place in the last box first
+                if box_counts[-1] < items_per_box or (box_counts[-1] == items_per_box and remaining_items > 0):
+                    min_box_index = -1
+                else:
+                    # Find any box with capacity
+                    for i in range(card_num):
+                        if box_counts[i] < items_per_box or (box_counts[i] == items_per_box and remaining_items > 0):
+                            min_box_index = i
+                            break
+
             # Place the item (id) into the selected box
             boxes[min_box_index].append(item_id)
             boxes_weights[min_box_index].append(weight)
@@ -108,7 +123,41 @@ class DefaultEplb(EplbPolicy):
             if box_counts[min_box_index] == (items_per_box + 1) and remaining_items > 0:
                 remaining_items -= 1
 
-        # Step 5: Output each box's contents and total weight
+        # Step 5: Remove duplicate experts inside the same NPU by locally swapping
+        #         with the least-weight-difference candidate from another NPU
+        for i in range(card_num):
+            arr = np.asarray(boxes[i])
+            unique, inv, cnt = np.unique(arr, return_inverse=True, return_counts=True)
+            mask = cnt > 1
+            dup_vals = unique[mask]
+            dup_cnts = cnt[mask]
+            for item_id, counts in zip(dup_vals, dup_cnts):
+                for _ in range(counts - 1):
+                    cur_position = boxes[i].index(item_id)
+                    cur_weight = boxes_weights[i][cur_position]
+                    candidates = []
+                    for j in range(card_num):
+                        if i != j and item_id not in boxes[j]:
+                            diff_set = set(boxes[j]) - set(boxes[i])
+                            if diff_set:
+                                exchange_expert_id = sorted(list(diff_set))[0]
+                                exchange_position = boxes[j].index(exchange_expert_id)
+                                exchange_weight = boxes_weights[j][exchange_position]
+                                candidates.append((j, exchange_expert_id, exchange_position, exchange_weight))
+                    if candidates:
+                        weight_diff = [abs(cur_weight - candidate_weight) for _, _, _, candidate_weight in candidates]
+                        candidate_index = np.argmin(weight_diff)
+                        exchange_box_id, exchange_expert_id, exchange_position, exchange_weight = candidates[
+                            candidate_index
+                        ]
+                        boxes[i][cur_position] = exchange_expert_id
+                        boxes_weights[i][cur_position] = exchange_weight
+                        boxes[exchange_box_id][exchange_position] = item_id
+                        boxes_weights[exchange_box_id][exchange_position] = cur_weight
+
+        box_weights = [sum(boxes_weights[i]) for i in range(card_num)]
+
+        # Step 6: Output each box's contents and total weight
         result = []
         for i in range(card_num):
             result.append(
@@ -311,11 +360,9 @@ class DefaultEplb(EplbPolicy):
         if num_npus <= 0:
             raise ValueError("the number of NPUs must be greater than 0")
 
-        if num_npus < num_redundancy_expert:
+        if experts_per_npu > expert_num:
             raise ValueError(
-                "the number of NPUs "
-                f"{num_npus} must be greater than or equal to the number of redundant experts "
-                f"{num_redundancy_expert}"
+                f"the number of experts per NPU {experts_per_npu} must be less than the number of experts {expert_num}"
             )
 
         # Number of experts deployed on each card includes one redundant expert

@@ -19,9 +19,12 @@
 
 import copy
 import gc
+import threading
 from types import NoneType
 
+import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch_npu
 import vllm.envs as envs_vllm
@@ -31,7 +34,7 @@ from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.distributed import ensure_model_parallel_initialized, init_distributed_environment
 from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
 from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized, get_kv_transfer_group, has_kv_transfer_group
-from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+from vllm.distributed.parallel_state import get_dp_group, get_ep_group, get_pcp_group, get_pp_group, get_tp_group
 from vllm.logger import logger
 from vllm.lora.request import LoRARequest
 from vllm.sequence import IntermediateTensors
@@ -39,6 +42,7 @@ from vllm.tasks import SupportedTask
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+from vllm.v1.engines import ReconfigureDistributedRequest, ReconfigureRankType
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerBase
@@ -49,7 +53,11 @@ from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
-from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
+from vllm_ascend.distributed.parallel_state import (
+    get_mc2_group,
+    init_ascend_model_parallel,
+)
+from vllm_ascend.ops.fused_moe.moe_comm_method import setup_moe_comm_method
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.utils import (
     AscendDeviceType,
@@ -286,6 +294,10 @@ class NPUWorker(WorkerBase):
         # in ray scenario. see https://github.com/vllm-project/vllm/pull/26845
         # for more details
         self.device = self._init_device()
+        # Broadcast the number of redundant experts from rank0.
+        # At NPUWorker initialization rank0 sends -1 to avoid any update;
+        # during Elastic EP Scale Up it sends the true count so the new ranks update their ascend config.
+        broadcast_num_redundant_experts()
         # Initialize workspace manager
         num_ubatches = 1
         init_workspace_manager(self.device, num_ubatches)
@@ -596,6 +608,183 @@ class NPUWorker(WorkerBase):
         except Exception as e:
             logger.info(f"query NPU card {self.local_rank} fail: {e}")
         return
+
+    def _reshard_experts(self, old_ep_size: int, new_ep_size: int):
+        eplb_loader = self.model_runner.eplb_loader
+        eplb_adaptor = self.model_runner.eplb_adaptor
+        eplb_updator = self.model_runner.eplb_updator
+
+        eplb_updator.wakeup_eplb_worker()
+        eplb_updator.update_info_all = eplb_updator.eplb_process.block_update_q.get()
+        while eplb_updator.update_info_all:
+            (expert_send_info, expert_recv_info, updated_expert_map, log2phy_map, layer_id) = (
+                eplb_updator.update_info_all.pop(0)
+            )
+            log2phy_map_this_rank = torch.from_numpy(np.array(log2phy_map))
+            eplb_loader.set_log2phy_map(log2phy_map_this_rank)
+            updated_expert_map_this_rank = torch.from_numpy(np.array(updated_expert_map))
+            updated_global_expert_map_this_rank = self.model_runner.shared_dict["expert_maps"][layer_id]
+            eplb_loader.generate_expert_d2d_transfer_task(
+                expert_send_info,
+                expert_recv_info,
+                updated_expert_map_this_rank,
+                updated_global_expert_map_this_rank,
+                layer_id + eplb_adaptor.num_dense_layers,
+            )
+            reqs = []
+            eplb_loader.asyn_expert_weight_transfer(reqs)
+            eplb_loader.update_expert_map_and_weight(reqs)
+
+        eplb_adaptor.model.clear_all_moe_loads()
+        eplb_updator.cur_iterations = 0
+        if old_ep_size < new_ep_size:
+            eplb_updator.broadcast_global_placement()
+        torch_npu.npu.synchronize()
+
+    def _eplb_before_scale_down(self, old_ep_size: int, new_ep_size: int) -> None:
+        if get_ep_group().rank == 0:
+            logger.info("[Elastic EP] Starting expert resharding before scaling down...")
+
+        self._reshard_experts(old_ep_size, new_ep_size)
+
+        if get_ep_group().rank == 0:
+            logger.info("[Elastic EP] Expert resharding completed!")
+
+    def _eplb_after_scale_up(self, old_ep_size: int, new_ep_size: int) -> None:
+        if get_ep_group().rank == 0:
+            logger.info("[Elastic EP] Starting expert resharding after scaling up...")
+
+        self._reshard_experts(old_ep_size, new_ep_size)
+
+        if get_ep_group().rank == 0:
+            logger.info("[Elastic EP] Expert resharding completed!")
+
+    def _reconfigure_parallel_config(self, reconfig_request: ReconfigureDistributedRequest) -> None:
+        """
+        Update parallel config with provided reconfig_request
+        """
+        parallel_config = self.vllm_config.parallel_config
+        parallel_config.data_parallel_size = reconfig_request.new_data_parallel_size
+        parallel_config.data_parallel_size_local = reconfig_request.new_data_parallel_size
+        if reconfig_request.new_data_parallel_rank != ReconfigureRankType.KEEP_CURRENT_RANK:
+            parallel_config.data_parallel_rank = reconfig_request.new_data_parallel_rank
+        if reconfig_request.new_data_parallel_rank_local != ReconfigureRankType.KEEP_CURRENT_RANK:
+            parallel_config.data_parallel_rank_local = reconfig_request.new_data_parallel_rank_local
+        parallel_config.data_parallel_master_ip = reconfig_request.new_data_parallel_master_ip
+        parallel_config.data_parallel_master_port = reconfig_request.new_data_parallel_master_port
+
+    def reconfigure_moe(
+        self, old_ep_size: int, new_ep_size: int, num_global_logical_experts: int, num_new_phy_experts: int
+    ) -> None:
+        from vllm.model_executor.layers.fused_moe import FusedMoEConfig
+        from vllm.model_executor.layers.fused_moe.layer import FusedMoEParallelConfig
+
+        parallel_config = self.vllm_config.parallel_config
+        moe_modules = [
+            module
+            for module in self.model_runner.model.modules()
+            if (module.__class__.__name__ == "AscendFusedMoE" or module.__class__.__name__ == "AscendSharedFusedMoE")
+        ]
+
+        num_local_experts = moe_modules[0].moe_config.num_local_experts
+        assert all(module.moe_config.num_local_experts == num_local_experts for module in moe_modules), (
+            "All MoE modules must have the same number of experts"
+        )
+        get_ascend_config().eplb_config.num_redundant_experts = num_new_phy_experts - num_global_logical_experts
+        for module in moe_modules:
+            module.local_num_experts = module.w2_weight.shape[0]
+            module.global_redundant_expert_num = num_new_phy_experts - num_global_logical_experts
+            module.global_num_experts = num_new_phy_experts
+
+            module.moe_parallel_config = FusedMoEParallelConfig.make(
+                tp_size_=get_tp_group().world_size,
+                pcp_size_=get_pcp_group().world_size,
+                dp_size_=get_dp_group().world_size,
+                vllm_parallel_config=parallel_config,
+            )
+            module.moe_config = FusedMoEConfig(
+                num_experts=num_global_logical_experts,
+                experts_per_token=module.top_k,
+                hidden_dim=module.hidden_size,
+                num_local_experts=module.num_local_experts,
+                moe_parallel_config=module.moe_parallel_config,
+                in_dtype=module.params_dtype,
+            )
+            module.moe_config.tp_group = get_tp_group()
+            module.moe_config.dp_group = get_dp_group()
+            module.moe_config.ep_group = get_ep_group()
+            module.moe_config.mc2_group = get_mc2_group()
+            module.cur_iterations = 0
+            module.update_log2phy_map_step = (
+                get_ascend_config().eplb_config.expert_hear_collection_interval // get_ep_group().world_size
+            )
+            with set_current_vllm_config(self.vllm_config):
+                setup_moe_comm_method(module.moe_config)
+            if self.model_config.quantization is not None:
+                from vllm_ascend.quantization.w8a8_dynamic import AscendW8A8DynamicFusedMoEMethod
+
+                module.quant_method = AscendW8A8DynamicFusedMoEMethod()
+
+    def reinitialize_distributed(self, reconfig_request: ReconfigureDistributedRequest) -> None:
+        from vllm.config import set_current_vllm_config
+        from vllm.distributed.parallel_state import (
+            cleanup_dist_env_and_memory,
+            destroy_ascend_model_parallel,
+        )
+
+        old_ep_size = get_ep_group().world_size
+        old_ep_rank = get_ep_group().rank
+        new_ep_size = reconfig_request.new_data_parallel_size * get_tp_group().world_size * get_pp_group().world_size
+
+        assert old_ep_size != new_ep_size
+        self.model_runner.shared_dict["scale"] = True
+        self.model_runner.shared_dict["old_ep_size"] = old_ep_size
+        self.model_runner.shared_dict["new_ep_size"] = new_ep_size
+        self.model_runner.vllm_config.parallel_config.data_parallel_size = reconfig_request.new_data_parallel_size
+        self.model_runner.dp_size = reconfig_request.new_data_parallel_size
+        self.model_runner.eplb_updator.compute_and_set_moe_load()
+
+        if old_ep_size > new_ep_size:
+            self._eplb_before_scale_down(old_ep_size, new_ep_size)
+
+        shutdown_ray = self.parallel_config.data_parallel_backend == "ray"
+        destroy_ascend_model_parallel()
+        cleanup_dist_env_and_memory(shutdown_ray=shutdown_ray)
+
+        if reconfig_request.new_data_parallel_rank == ReconfigureRankType.SHUTDOWN_CURRENT_RANK:
+            assert old_ep_rank >= new_ep_size
+            return
+
+        self._reconfigure_parallel_config(reconfig_request)
+
+        with set_current_vllm_config(self.vllm_config):
+            self._init_worker_distributed_environment()
+
+        ascend_config = get_ascend_config()
+        num_redundant_experts = ascend_config.eplb_config.num_redundant_experts
+        num_logical_experts = self.vllm_config.model_config.hf_config.num_experts
+        experts_per_npu = (num_logical_experts + num_redundant_experts) // old_ep_size
+        num_redundant_experts = experts_per_npu * new_ep_size - num_logical_experts
+        assert num_redundant_experts >= 0
+        broadcast_num_redundant_experts(num_redundant_experts)
+
+        self.reconfig_moe(old_ep_size, new_ep_size, num_logical_experts, num_logical_experts + num_redundant_experts)
+
+        if new_ep_size > old_ep_size:
+            self._eplb_after_scale_up(old_ep_size, new_ep_size)
+            warm_up_eplb = self.model_runner.eplb_updator.warm_up_eplb
+            logger.info("starting EplbUpdator warm_eplb thread")
+            thread = threading.Thread(target=warm_up_eplb, daemon=True)
+            thread.start()
+
+
+def broadcast_num_redundant_experts(num_redundancy_experts=-1):
+    cpu_group = get_ep_group().cpu_group
+    tensor = torch.tensor([num_redundancy_experts], dtype=torch.int64, device="cpu")
+    dist.broadcast(tensor, src=0, group=cpu_group)
+
+    if tensor.item() != -1:
+        get_ascend_config().eplb_config.num_redundant_experts = tensor.item()
 
 
 def parse_text_output(output) -> None:
