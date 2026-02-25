@@ -202,7 +202,7 @@ class EplbUpdator:
             req.wait()
 
     def broadcast_global_placement(self):
-        global_placement = self.shared_dict["global_placement"].to(torch.int32)
+        global_placement = self.shared_dict["global_placement"].to(torch.int32).cpu()
 
         cpu_group = get_ep_group().cpu_group
         flag = torch.tensor([True], dtype=torch.bool, device="cpu")

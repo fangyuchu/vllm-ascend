@@ -69,7 +69,7 @@ class ElasticEPLB(EplbPolicy):
         if new_ep_size * experts_per_npu < num_original_expert:
             raise ValueError(
                 f"new_ep_size {new_ep_size} * experts_per_npu {experts_per_npu}  "
-                f"must be grater than or equal to num_original_expert {num_original_expert}"
+                f"must be greater than or equal to num_original_expert {num_original_expert}"
             )
 
         # Number of experts deployed on each card includes one redundant expert
@@ -78,7 +78,7 @@ class ElasticEPLB(EplbPolicy):
         max_heat_per_layer_after = np.zeros([layer_num])
         for layer in range(layer_num):
             # Get the expert IDs and their corresponding workloads for the current layer;
-            # workloads need to be normalized, and one redundant expert is added per card
+            # redundant experts will be created and distributed during the packing process
             weights = np.zeros((expert_num,), dtype="object")
             for expert_id, workload_weight in enumerate(layer_workloads[layer]):
                 weights[expert_id] = (expert_id, workload_weight)
@@ -94,8 +94,10 @@ class ElasticEPLB(EplbPolicy):
         new_global_deployment = global_deployment
         # Obtain the priority of each layer
         layer_changed_ratio = []
+        eps = np.finfo(float).eps
         for layer_idx in range(layer_num):
-            layer_changed_ratio.append(max_heat_per_layer_after[layer_idx] / max_heat_per_layer_before[layer_idx])
+            denom = max(max_heat_per_layer_before[layer_idx], eps)
+            layer_changed_ratio.append(max_heat_per_layer_after[layer_idx] / denom)
 
         per_layer_priority = np.argsort(layer_changed_ratio)
         npu_heat_all_after = sum(max_heat_per_layer_after)

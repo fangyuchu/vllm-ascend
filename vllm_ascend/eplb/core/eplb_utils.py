@@ -96,7 +96,7 @@ def init_eplb_config(eplb_config, layer_id, moe_config):
 
 def reinit_expert(local_expert_map, num_moe_layers, layer_id):
     global _GLOBAL_PLACEMENT
-    cpu_group = get_ep_group.cpu_group
+    cpu_group = get_ep_group().cpu_group
     rank = cpu_group.rank()
     world_size = cpu_group.size()
     num_local_experts = local_expert_map.max() + 1

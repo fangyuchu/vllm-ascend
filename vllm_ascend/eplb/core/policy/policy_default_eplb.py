@@ -371,7 +371,7 @@ class DefaultEplb(EplbPolicy):
         max_heat_per_layer_after = np.zeros([layer_num])
         for layer in range(layer_num):
             # Get the expert IDs and their corresponding workloads for the current layer;
-            # workloads need to be normalized, and one redundant expert is added per card
+            # redundant experts will be created and distributed during the packing process
             weights = np.zeros((expert_num,), dtype="object")
             for expert_id, workload_weight in enumerate(layer_workloads[layer]):
                 weights[expert_id] = (expert_id, workload_weight)

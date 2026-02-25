@@ -46,7 +46,6 @@ class EplbWorker:
         # D2D
         # H2D
         # Get initial expert_map
-        logger.info("EPLB Process compute started")
         torch.set_num_threads(1)
         if self.old_expert_maps is None:
             self.old_expert_maps = self.get_init_expert_maps()
@@ -69,9 +68,7 @@ class EplbWorker:
             new_ep_size = self.shared_dict["new_ep_size"]
             assert old_ep_size != new_ep_size
             self.elastic_policy.set_new_ep_size(new_ep_size)
-            _, _, new_placement = self.calculate_rebalance_experts(load_info, old_placement)
-        else:
-            _, _, new_placement = self.calculate_rebalance_experts(load_info, old_placement)
+        _, _, new_placement = self.calculate_rebalance_experts(load_info, old_placement)
 
         if not torch.is_tensor(new_placement):
             new_placement = torch.tensor(new_placement)
@@ -82,9 +79,10 @@ class EplbWorker:
 
         if scale:
             if old_ep_size > new_ep_size:
-                shape = list(new_expert_maps.shape)
                 # when scale down, ensure that the shutdown ranks do not own any experts
                 # by setting their expert_map to all -1
+                shape = list(new_expert_maps.shape)
+                shape[1] = old_ep_size - new_ep_size
                 shutdown_rank_expert_maps = torch.full(shape, -1, dtype=new_expert_maps.dtype)
                 new_expert_maps = torch.cat([new_expert_maps, shutdown_rank_expert_maps], dim=1)
             else:
@@ -92,7 +90,7 @@ class EplbWorker:
                 new_expert_maps = new_expert_maps[:, :old_ep_size]
 
         update_info = self.compose_expert_update_info_greedy(new_expert_maps, self.old_expert_maps)
-        self.old_expert_maps = None
+        self.old_expert_maps = new_expert_maps.clone()
         logger.info("EPLB Process compute complete")
 
         packed_update_info = self.pack_update_info(update_info)
@@ -144,8 +142,8 @@ class EplbWorker:
                     )
                     new_placement_this_rank = new_placement_check.clone()
                     new_placement_this_rank[old_indices] = expert_not_move
-                    available_posotions = list(set(range(new_placement_check.shape[0]))) - set(old_indices)
-                    new_placement_this_rank[available_posotions] = new_placement_check[~expert_not_move_mask]
+                    available_positions = list(set(range(new_placement_check.shape[0])) - set(old_indices))
+                    new_placement_this_rank[available_positions] = new_placement_check[~expert_not_move_mask]
                     new_placement[layer_id][rank_id] = new_placement_this_rank
 
     # TODO: Here only expert weight exchange is considered, need to be extended to cover other weight update cases
