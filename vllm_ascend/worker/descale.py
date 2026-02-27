@@ -15,6 +15,7 @@ from vllm.distributed import (
     get_tp_group,
     stateless_init_torch_distributed_process_group,
 )
+from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig, FusedMoEParallelConfig
 from vllm.model_executor.model_loader import get_model_loader
@@ -309,12 +310,20 @@ def init_dp_device_group(vllm_config: VllmConfig) -> None:
         vllm_config.parallel_config.data_parallel_rank,
         vllm_config.parallel_config.data_parallel_size,
         backend="gloo",
-        gloo_comm_timeout=60,
-        enable_fault_tolerance=True,
+        fault_tolerance_config=vllm_config.fault_tolerance_config,
     )
+    get_dp_group().group_type = "stateless"
+    from datetime import timedelta
+
+    from torch.distributed.distributed_c10d import _set_pg_timeout
+
+    timeout = timedelta(seconds=vllm_config.fault_tolerance_config.gloo_comm_timeout)
+    dp_cpu_group = get_dp_group()
+    _set_pg_timeout(timeout=timeout, group=dp_cpu_group.cpu_group)
 
 
 def reinit_comm_group(use_mask_mc2: bool, vllm_config: VllmConfig, worker: NPUWorker) -> None:
+    logger.info(f"before init_dp_device_group is {vllm_config.parallel_config.data_parallel_rank}")
     if use_mask_mc2:
         init_dp_device_group(vllm_config)
     else:
@@ -405,8 +414,10 @@ def expand_parameter(old_param, axis: int = 0, extra_lines: int = 1) -> torch.nn
     return torch.nn.Parameter(new_tensor, requires_grad=old_param.requires_grad)
 
 
-def expand_expert_weights(model_runner: NPUModelRunner, added_experts: dict[int, list[int]], quant: bool | str) -> None:
-    rank = model_runner.vllm_config.parallel_config.data_parallel_rank
+def expand_expert_weights(
+    model_runner: NPUModelRunner, added_experts: dict[int, list[int]], quant: bool | str, rank: int
+) -> None:
+    # rank = model_runner.vllm_config.parallel_config.data_parallel_rank
     current_rank_expand_experts = added_experts[rank]
     expand_lines = len(current_rank_expand_experts)
     if expand_lines:
@@ -459,7 +470,8 @@ def reload_fault_expert_weights(
     added_experts: dict[int, list[int]],
     replaced_redundant_experts: dict[int, dict[int, tuple[int, int]]],
     quant: bool | str = False,
-) -> None:
+    old_rank: int = 0,
+) -> dict[int, list[int]]:
     def _load_single_expert(expert_id: int, target_index: int, quant: bool | str = False):
         prefix = f"{module.layer_name}.{expert_id}"
         w1_weight = experts_saved_weights[f"{prefix}.gate_proj.weight"]
@@ -521,7 +533,7 @@ def reload_fault_expert_weights(
                 tp_rank=module.tp_rank,
             )
 
-    old_rank = vllm_config.parallel_config.data_parallel_rank
+    # old_rank = vllm_config.parallel_config.data_parallel_rank
     experts_to_expand = added_experts[old_rank]
     init_local_experts_count = len(global_experts_distribution[old_rank])
     slot_to_routed_expert_map = {}
@@ -540,6 +552,7 @@ def reload_fault_expert_weights(
     global_experts_distribution = {}
     for i, rank in enumerate(list(sorted(redistributed_experts.keys()))):
         global_experts_distribution[i] = redistributed_experts[rank]
+    return global_experts_distribution
 
 
 def update_parallel_config(original_config: VllmConfig, update_config: dict[str, int]) -> None:  # , worker_guard)
@@ -547,7 +560,7 @@ def update_parallel_config(original_config: VllmConfig, update_config: dict[str,
         "data_parallel_size",
         "data_parallel_size_local",
         "data_parallel_rank",
-        "data_parallel_rank_local",
+        # "data_parallel_rank_local",
         "expert_parallel_size",
         "data_parallel_master_port",
     }
@@ -558,7 +571,7 @@ def update_parallel_config(original_config: VllmConfig, update_config: dict[str,
     original_config.parallel_config.data_parallel_size = update_config["data_parallel_size"]
     original_config.parallel_config.data_parallel_size_local = update_config["data_parallel_size_local"]
     original_config.parallel_config.data_parallel_rank = update_config["data_parallel_rank"]
-    original_config.parallel_config.data_parallel_rank_local = update_config["data_parallel_rank_local"]
+    # original_config.parallel_config.data_parallel_rank_local = update_config["data_parallel_rank_local"]
     original_config.parallel_config.expert_parallel_size = update_config["expert_parallel_size"]
     original_config.parallel_config.data_parallel_master_port = update_config["data_parallel_master_port"]
 
@@ -658,26 +671,23 @@ def reconfigure_moe(
     new_ep_size = parallel_config.data_parallel_size * parallel_config.tensor_parallel_size
     get_ascend_config().eplb_config.num_redundant_experts = num_global_new_phy_experts - num_global_logical_experts
 
-    moe_moules = [
-        module
-        for module in modelrunner.model.modules()
-        if (module.__class__.__name__ == "AscendFusedMoE" or module.__class__.__name__ == "SharedFusedMoE")
-    ]
+    moe_moules = [module for module in modelrunner.model.modules() if isinstance(module, FusedMoE)]
 
     for module in moe_moules:
         module.local_num_experts = num_global_new_phy_experts // new_ep_size
-        module.global_num_experts = num_global_logical_experts
-        module.global_redundant_experts_num = num_global_new_phy_experts - num_global_logical_experts
+        module.global_num_experts = num_global_new_phy_experts
+
+        module.global_redundant_expert_num = num_global_new_phy_experts - num_global_logical_experts
         module.moe_parallel_config = FusedMoEParallelConfig.make(
-            tp_size=get_tp_group().world_size,
-            pcp_size=get_pcp_group().world_size,
-            dp_size=get_dp_group().world_size,
+            tp_size_=get_tp_group().world_size,
+            pcp_size_=get_pcp_group().world_size,
+            dp_size_=get_dp_group().world_size,
             vllm_parallel_config=parallel_config,
         )
         module.moe_config = FusedMoEConfig(
             num_experts=module.global_num_experts,
-            experts_per_token=module.topk,
-            hidden_dim=module.hidden_dim,
+            experts_per_token=module.top_k,
+            hidden_dim=module.hidden_size,
             intermediate_size_per_partition=module.intermediate_size_per_partition,
             num_local_experts=module.local_num_experts,
             moe_parallel_config=module.moe_parallel_config,
@@ -693,8 +703,8 @@ def reconfigure_moe(
         )
         module.moe_config.num_experts = module.global_num_experts
         module.moe_config.num_local_experts = module.local_num_experts
-        module.moe_config.global_redundant_expert_num = module.global_redundant_experts_num
-        module.log2phy = log2phy
+        module.moe_config.global_redundant_expert_num = module.global_redundant_expert_num
+        module.log2phy.copy_(log2phy)
         if not use_mask_mc2:
             module.moe_config.tp_group = get_tp_group()
             module.moe_config.dp_group = get_dp_group()
