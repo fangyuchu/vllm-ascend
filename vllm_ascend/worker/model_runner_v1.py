@@ -19,6 +19,7 @@
 
 import math
 import sys
+import threading
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
@@ -50,6 +51,7 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.attention.selector import get_attn_backend  # type: ignore
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.engine.exceptions import EngineLoopPausedError
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
@@ -373,6 +375,11 @@ class NPUModelRunner(GPUModelRunner):
         self.intermediate_tensors: IntermediateTensors | None = None
         self.reorder_batch_threshold: int | None = None
         self.long_seq_metadata = None
+        self.pause_event = threading.Event()
+
+    def _check_pause_event(self):
+        if self.pause_event.is_set():
+            raise EngineLoopPausedError("Worker is paused.")
 
     @property
     def use_cp(self) -> bool:
@@ -1627,6 +1634,7 @@ class NPUModelRunner(GPUModelRunner):
         **model_kwargs: dict[str, Any],
     ):
         assert self.model is not None
+        self._check_pause_event()
         hidden_states = self.model(
             input_ids=input_ids,
             positions=positions,
@@ -1706,6 +1714,7 @@ class NPUModelRunner(GPUModelRunner):
         tensor = torch.zeros(2, self.dp_size, device="cpu", dtype=torch.int32)
         tensor[0][self.dp_rank] = num_tokens_padded
         tensor[1][self.dp_rank] = cudagraph_mode
+        self._check_pause_event()
         dist.all_reduce(tensor, group=get_dp_group().cpu_group)
 
         num_tokens_across_dp = tensor[0, :]
