@@ -21,6 +21,7 @@ import copy
 import gc
 import threading
 from collections.abc import Callable
+from datetime import timedelta
 from types import NoneType
 
 import torch
@@ -28,13 +29,20 @@ import torch.nn as nn
 import torch_npu
 import vllm.envs as envs_vllm
 import zmq
+from torch.distributed.distributed_c10d import _set_pg_timeout
 from torch_npu.op_plugin.atb._atb_ops import _register_atb_extensions
 from torch_npu.profiler import dynamic_profile as dp
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.distributed import ensure_model_parallel_initialized, init_distributed_environment
 from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
 from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized, get_kv_transfer_group, has_kv_transfer_group
-from vllm.distributed.parallel_state import get_all_model_groups, get_dp_group, get_pp_group, get_tp_group
+from vllm.distributed.parallel_state import (
+    get_all_model_groups,
+    get_dp_group,
+    get_pp_group,
+    get_tp_group,
+    stateless_init_torch_distributed_process_group,
+)
 from vllm.logger import logger
 from vllm.lora.request import LoRARequest
 from vllm.sequence import IntermediateTensors
@@ -81,7 +89,6 @@ class WorkerSentinel(BaseSentinel):
     def __init__(
         self,
         vllm_config: VllmConfig,
-        pause_event: threading.Event,
         clear_input_batch_callback: Callable,
         device: torch.device,
         worker: WorkerBase,
@@ -103,9 +110,6 @@ class WorkerSentinel(BaseSentinel):
         self.clear_input_batch_callback = clear_input_batch_callback
         self.device = device
 
-        self.worker_sentinel_dead = False
-        self.pause_event = pause_event
-        self.communicator_aborted = False
         torch.npu.set_device(self.device)
 
         threading.Thread(target=self.run, daemon=True, name="WorkerSentinelMonitorThread").start()
@@ -119,19 +123,14 @@ class WorkerSentinel(BaseSentinel):
                 success, method_uuid, reason = self._execute_cmd(cmd_str)
                 self._send_execution_result(success, method_uuid, reason)
 
-    def pause_by_signale(self):
-        self.pause_event.set()
-        return True
-
-    def pause(self, timeout: int = 1, **kwargs):
-        self.pause_event.set()
+    def pause(self, timeout: int = 1, **kwargs) -> bool:
         NPUPlatform.set_device(self.device)
         result = torch_npu.npu.stop_device(self.device.index)
         if result == 0:
-            logger.info("npu stop device %s succeeded", self.device.index)
+            self.logger("npu stop device %s succeeded", self.device.index)
             return True
         elif result == 1:
-            logger.info("npu stop device %s failed", self.device.index)
+            self.logger("npu stop device %s failed", self.device.index)
             return False
         else:
             raise ValueError(f"Unexpected return value from stop_device: {result}")
@@ -140,19 +139,13 @@ class WorkerSentinel(BaseSentinel):
         NPUPlatform.set_device(self.device)
         torch_npu.npu.restart_device(self.device.index)
         logger.info(f"npu restart device {self.device}")
+        get_dp_group.destroy_cpu_group()
+        self.worker.init_dp_device_group(self.vllm_config)
         comm_groups = get_all_model_groups()
         for group in comm_groups:
             torch_npu.distributed.reinit_process_group(group.device_group, False)
         torch.npu.synchronize()
         self.clear_input_batch_callback()
-        self.pause_event.clear()
-        return True
-
-    def descale(self, timeout: int = 60, **kwargs) -> bool:
-        NPUPlatform.set_device(self.device)
-        torch_npu.npu.restart_device(self.device.index)
-        self.clear_input_batch_callback()
-        self.pause_event.clear()
         return True
 
 
@@ -240,6 +233,20 @@ class NPUWorker(WorkerBase):
 
             signal.signal(signal.SIGTERM, signal_handler)
             signal.signal(signal.SIGINT, signal_handler)
+
+    def init_dp_device_group(vllm_config: VllmConfig) -> None:
+        # TODO: Temporarily hardcode the port value for debugging. Will replace with get_open_port().
+        get_dp_group().cpu_group = stateless_init_torch_distributed_process_group(
+            vllm_config.parallel_config.data_parallel_master_ip,
+            vllm_config.parallel_config.data_parallel_master_port + 100,
+            vllm_config.parallel_config.data_parallel_rank,
+            vllm_config.parallel_config.data_parallel_size,
+            backend="gloo",
+            fault_tolerance_config=vllm_config.fault_tolerance_config,
+        )
+        timeout = timedelta(seconds=vllm_config.fault_tolerance_config.gloo_comm_timeout)
+        dp_cpu_group = get_dp_group()
+        _set_pg_timeout(timeout=timedelta(seconds=timeout), group=dp_cpu_group.cpu_group)
 
     def uninstall_static_kernel(self):
         import fcntl
@@ -394,7 +401,6 @@ class NPUWorker(WorkerBase):
 
             self.worker_sentinel = WorkerSentinel(
                 self.vllm_config,
-                self.model_runner.pause_event,
                 clear_input_batch_callback,
                 self.device,
                 self,
@@ -627,10 +633,6 @@ class NPUWorker(WorkerBase):
         ensure_kv_transfer_initialized(self.vllm_config)
         ensure_ec_transfer_initialized(self.vllm_config)
         if self.vllm_config.fault_tolerance_config.enable_fault_tolerance:
-            from datetime import timedelta
-
-            from torch.distributed.distributed_c10d import _set_pg_timeout
-
             timeout = timedelta(seconds=self.vllm_config.fault_tolerance_config.gloo_comm_timeout)
             dp_cpu_group = get_dp_group()
             _set_pg_timeout(timeout=timeout, group=dp_cpu_group.cpu_group)
