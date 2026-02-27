@@ -83,7 +83,6 @@ class WorkerSentinel(BaseSentinel):
         self,
         vllm_config: VllmConfig,
         pause_event: threading.Event,
-        init_distributed_env_callback: Callable,
         clear_input_batch_callback: Callable,
         device: torch.device,
         worker: WorkerBase,
@@ -102,7 +101,6 @@ class WorkerSentinel(BaseSentinel):
         )
         self.vllm_config = vllm_config
         self.zmq_ctx = zmq.Context()
-        self.init_distributed_env_callback = init_distributed_env_callback
         self.clear_input_batch_callback = clear_input_batch_callback
         self.device = device
 
@@ -131,10 +129,10 @@ class WorkerSentinel(BaseSentinel):
         NPUPlatform.set_device(self.device)
         result = torch_npu.npu.stop_device(self.device.index)
         if result == 0:
-            logger.info("npu stop device %s succeeded", {self.device.index})
+            logger.info("npu stop device %s succeeded", self.device.index)
             return True
         elif result == 1:
-            logger.info("npu stop device %s failed", {self.device.index})
+            logger.info("npu stop device %s failed", self.device.index)
         else:
             raise ValueError(f"Unexpected return value from stop_device: {result}")
 
@@ -384,15 +382,6 @@ class NPUWorker(WorkerBase):
         else:
             self.model_runner = NPUModelRunner(self.vllm_config, self.device)
         if self.vllm_config.fault_tolerance_config.enable_fault_tolerance:
-            with set_current_vllm_config(self.vllm_config):
-                init_distributed_env_callback = partial(
-                    self._init_worker_distributed_environment,
-                    self.vllm_config,
-                    self.rank,
-                    self.distributed_init_method,
-                    self.local_rank,
-                )
-
             def clear_input_batch_callback():
                 input_batch = self.model_runner.input_batch
                 cached_req_ids = input_batch.req_id_to_index.keys()
@@ -402,7 +391,6 @@ class NPUWorker(WorkerBase):
             self.worker_sentinel = WorkerSentinel(
                 self.vllm_config,
                 self.model_runner.pause_event,
-                init_distributed_env_callback,
                 clear_input_batch_callback,
                 self.device,
                 self,

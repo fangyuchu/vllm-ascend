@@ -110,6 +110,11 @@ class NPUModelRunner(GPUModelRunner):
             device="cpu",
             pin_memory=self.pin_memory,
         )
+        self.pause_event = threading.Event()
+
+    def _check_pause_event(self):
+        if self.pause_event.is_set():
+            raise EngineLoopPausedError("Worker is paused.")
 
     def prepare_inputs(
         self,
