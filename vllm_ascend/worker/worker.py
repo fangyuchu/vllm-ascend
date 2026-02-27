@@ -21,7 +21,6 @@ import copy
 import gc
 import threading
 from collections.abc import Callable
-from functools import partial
 from types import NoneType
 
 import torch
@@ -382,6 +381,7 @@ class NPUWorker(WorkerBase):
         else:
             self.model_runner = NPUModelRunner(self.vllm_config, self.device)
         if self.vllm_config.fault_tolerance_config.enable_fault_tolerance:
+
             def clear_input_batch_callback():
                 input_batch = self.model_runner.input_batch
                 cached_req_ids = input_batch.req_id_to_index.keys()
