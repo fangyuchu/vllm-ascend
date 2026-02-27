@@ -17,11 +17,14 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import threading
+
 import numpy as np
 import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.engine.exceptions import EngineLoopPausedError
 from vllm.v1.worker.gpu.input_batch import (
     InputBatch,
     combine_sampled_and_draft_tokens,

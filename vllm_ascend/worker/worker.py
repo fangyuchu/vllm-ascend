@@ -132,6 +132,7 @@ class WorkerSentinel(BaseSentinel):
             return True
         elif result == 1:
             logger.info("npu stop device %s failed", self.device.index)
+            return False
         else:
             raise ValueError(f"Unexpected return value from stop_device: {result}")
 
