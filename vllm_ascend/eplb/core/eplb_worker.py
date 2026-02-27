@@ -24,14 +24,11 @@ from vllm.logger import logger
 from vllm_ascend.eplb.core.eplb_utils import generate_log2phy_map
 from vllm_ascend.eplb.core.policy.policy_factory import DynamicConfig, PolicyFactory
 
-from .policy.policy_elastic_eplb import ElasticEPLB
-
 
 class EplbWorker:
     def __init__(self, shared_dict, policy_type, enable_d2d: bool = True):
         self.policy_type = policy_type
         self.policy = PolicyFactory.generate_policy(policy_type, DynamicConfig())
-        self.elastic_policy = ElasticEPLB(DynamicConfig())
         self.shared_dict = shared_dict
         self.old_expert_maps = None
         self.enable_d2d = enable_d2d
@@ -67,7 +64,7 @@ class EplbWorker:
             old_ep_size = self.shared_dict["old_ep_size"]
             new_ep_size = self.shared_dict["new_ep_size"]
             assert old_ep_size != new_ep_size
-            self.elastic_policy.set_new_ep_size(new_ep_size)
+            self.policy.set_new_ep_size(new_ep_size)
         _, _, new_placement = self.calculate_rebalance_experts(load_info, old_placement)
 
         if not torch.is_tensor(new_placement):
@@ -211,11 +208,7 @@ class EplbWorker:
         if self.old_expert_maps is None:
             return False, None, None
 
-        scale = self.shared_dict.get("scale", False)
-        if scale:
-            changed, priority, new_map = self.elastic_policy.rebalance_experts(old_placement, load_info)
-        else:
-            changed, priority, new_map = self.policy.rebalance_experts(old_placement, load_info)
+        changed, priority, new_map = self.policy.rebalance_experts(old_placement, load_info)
 
         return changed, priority, new_map
 
