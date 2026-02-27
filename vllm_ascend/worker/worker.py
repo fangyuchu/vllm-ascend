@@ -417,6 +417,7 @@ class NPUWorker(WorkerBase):
 
     def compile_or_warm_up_model(self) -> None:
         # Note: need to adapt for graph mode.
+        self.model_runner.eplb_warmup()
         warmup_sizes = (self.vllm_config.compilation_config.compile_sizes or []).copy()
         if not self.model_config.enforce_eager:
             cg_capture_sizes: list[int] = []
@@ -610,6 +611,12 @@ class NPUWorker(WorkerBase):
         return
 
     def _reshard_experts(self, old_ep_size: int, new_ep_size: int):
+        if get_ep_group().rank == 0:
+            if old_ep_size > new_ep_size:
+                logger.info("[Elastic EP] Starting expert resharding before scaling down...")
+            else:
+                logger.info("[Elastic EP] Starting expert resharding before scaling up...")
+
         eplb_loader = self.model_runner.eplb_loader
         eplb_adaptor = self.model_runner.eplb_adaptor
         eplb_updator = self.model_runner.eplb_updator
@@ -653,21 +660,6 @@ class NPUWorker(WorkerBase):
             eplb_updator.broadcast_global_placement()
         # Synchronize NPU to ensure all transfers are complete
         torch_npu.npu.synchronize()
-
-    def _eplb_before_scale_down(self, old_ep_size: int, new_ep_size: int) -> None:
-        if get_ep_group().rank == 0:
-            logger.info("[Elastic EP] Starting expert resharding before scaling down...")
-
-        self._reshard_experts(old_ep_size, new_ep_size)
-
-        if get_ep_group().rank == 0:
-            logger.info("[Elastic EP] Expert resharding completed!")
-
-    def _eplb_after_scale_up(self, old_ep_size: int, new_ep_size: int) -> None:
-        if get_ep_group().rank == 0:
-            logger.info("[Elastic EP] Starting expert resharding after scaling up...")
-
-        self._reshard_experts(old_ep_size, new_ep_size)
 
         if get_ep_group().rank == 0:
             logger.info("[Elastic EP] Expert resharding completed!")
@@ -723,9 +715,13 @@ class NPUWorker(WorkerBase):
                 num_experts=num_global_logical_experts,
                 experts_per_token=module.top_k,
                 hidden_dim=module.hidden_size,
-                num_local_experts=module.num_local_experts,
+                num_local_experts=module.local_num_experts,
                 moe_parallel_config=module.moe_parallel_config,
                 in_dtype=module.params_dtype,
+                intermediate_size_per_partition=module.moe_config.intermediate_size_per_partition,
+                activation=module.moe_config.activation,
+                device=module.moe_config.device,
+                routing_method=module.moe_config.routing_method,
             )
             # Set up all parallel groups for the MoE configuration
             module.moe_config.tp_group = get_tp_group()
@@ -748,11 +744,9 @@ class NPUWorker(WorkerBase):
                 module.quant_method = AscendW8A8DynamicFusedMoEMethod()
 
     def reinitialize_distributed(self, reconfig_request: ReconfigureDistributedRequest) -> None:
-        from vllm.config import set_current_vllm_config
-        from vllm.distributed.parallel_state import (
-            cleanup_dist_env_and_memory,
-            destroy_ascend_model_parallel,
-        )
+        from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
+
+        from vllm_ascend.distributed.parallel_state import destroy_ascend_model_parallel
 
         # Get current EP (Expert Parallel) size and rank before reconfiguration
         old_ep_size = get_ep_group().world_size
@@ -771,9 +765,8 @@ class NPUWorker(WorkerBase):
         # Compute and set the MoE load based on the new configuration
         self.model_runner.eplb_updator.compute_and_set_moe_load()
 
-        # Perform expert resharding before scaling down (when reducing EP size)
-        if old_ep_size > new_ep_size:
-            self._eplb_before_scale_down(old_ep_size, new_ep_size)
+        # Regardless of scaling up or down, we just start EPLB resharding with current ranks
+        self._reshard_experts(old_ep_size, new_ep_size)
 
         # Check if Ray is used as the data parallel backend
         shutdown_ray = self.parallel_config.data_parallel_backend == "ray"
@@ -812,11 +805,13 @@ class NPUWorker(WorkerBase):
         broadcast_num_redundant_experts(num_redundant_experts)
 
         # Reconfigure MoE modules with new expert counts
-        self.reconfig_moe(old_ep_size, new_ep_size, num_logical_experts, num_logical_experts + num_redundant_experts)
+        self.reconfigure_moe(old_ep_size, new_ep_size, num_logical_experts, num_logical_experts + num_redundant_experts)
 
-        # Perform expert resharding after scaling up (when increasing EP size)
+        # when scaling up we need to broadcast global placement to sync the eplb results across ranks
+        # and start a EplbUpdator warm_up_eplb thread to pair new ranks
         if new_ep_size > old_ep_size:
-            self._eplb_after_scale_up(old_ep_size, new_ep_size)
+            # Broadcast global expert placement when scaling up (new EP ranks)
+            self.model_runner.eplb_updator.broadcast_global_placement()
             # Start the warm-up thread for EPLB updator
             warm_up_eplb = self.model_runner.eplb_updator.warm_up_eplb
             logger.info("starting EplbUpdator warm_eplb thread")

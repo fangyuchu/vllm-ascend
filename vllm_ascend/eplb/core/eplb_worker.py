@@ -74,6 +74,7 @@ class EplbWorker:
             new_placement = torch.tensor(new_placement)
         self.check_expert_placement(old_placement, new_placement)
         new_expert_maps = self.local2global(new_placement)
+        new_expert_maps_clone = new_expert_maps.clone()
         self.update_expert_map(new_expert_maps)
         self.update_global_placement(new_placement)
 
@@ -90,7 +91,7 @@ class EplbWorker:
                 new_expert_maps = new_expert_maps[:, :old_ep_size]
 
         update_info = self.compose_expert_update_info_greedy(new_expert_maps, self.old_expert_maps)
-        self.old_expert_maps = new_expert_maps.clone()
+        self.old_expert_maps = new_expert_maps_clone
         logger.info("EPLB Process compute complete")
 
         packed_update_info = self.pack_update_info(update_info)
@@ -282,7 +283,17 @@ class EplbWorker:
         log2phy_all = []
         layer_ids = []
 
+        # when scale up, update_info_generator only contains new_expert_map of old ranks, it may cause error in
+        # generate_log2phy_map, so we get new_expert_map from self.shared_dict["expert_map"]
+        scale = self.shared_dict.get("scale", False)
+        scale_up = False
+        if scale:
+            old_ep_size = self.shared_dict["old_ep_size"]
+            new_ep_size = self.shared_dict["new_ep_size"]
+            scale_up = new_ep_size > old_ep_size
         for send_info, recv_info, new_expert_map, layer_id in update_info_generator:
+            if scale and scale_up:
+                new_expert_map = self.shared_dict["expert_maps"][layer_id]
             send_info_this_rank = send_info.get(self.rank_id, [])
             recv_info_this_rank = recv_info.get(self.rank_id, [])
             send_all.append(send_info_this_rank)
@@ -290,7 +301,7 @@ class EplbWorker:
 
             maps.append(new_expert_map[self.rank_id].numpy().tolist())
 
-            log2phy_map = generate_log2phy_map(new_expert_map, self.rank_id)
+            log2phy_map = generate_log2phy_map(new_expert_map)[self.rank_id]
             log2phy_all.append(log2phy_map.numpy().tolist())
 
             layer_ids.append(layer_id)

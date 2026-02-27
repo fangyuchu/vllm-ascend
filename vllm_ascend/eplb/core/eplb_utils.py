@@ -89,9 +89,10 @@ def init_eplb_config(eplb_config, layer_id, moe_config):
         global_expert_map.append(expert_map)
         if rankid == moe_config.ep_rank:
             local_expert_map = expert_map.npu()
-    log2phy = generate_log2phy_map(global_expert_map, moe_config.ep_rank).npu() if eplb_enable else None
+    global_expert_map = torch.stack(global_expert_map)
+    log2phy = generate_log2phy_map(global_expert_map)[moe_config.ep_rank].npu() if eplb_enable else None
 
-    return torch.stack(global_expert_map), local_expert_map, log2phy, n_redundant
+    return global_expert_map, local_expert_map, log2phy, n_redundant
 
 
 def reinit_expert(local_expert_map, num_moe_layers, layer_id):
@@ -133,7 +134,7 @@ def generate_log2phy_map(expert_map, sync=False):
     else:
         dice = 0
 
-    log2phy_map = expert_map.clone().cpu()
+    log2phy_map = expert_map.clone().cpu().to(torch.int32)
     device = "cpu"
     world_size, num_experts = log2phy_map.shape
     num_local_experts = log2phy_map.max() + 1
