@@ -728,8 +728,6 @@ class NPUWorker(WorkerBase):
             module.moe_config.dp_group = get_dp_group()
             module.moe_config.ep_group = get_ep_group()
             module.moe_config.mc2_group = get_mc2_group()
-            # Reset iteration counter for expert load balancing
-            module.cur_iterations = 0
             # Calculate the step interval for updating logical to physical expert mapping
             module.update_log2phy_map_step = (
                 get_ascend_config().eplb_config.expert_heat_collection_interval // get_ep_group().world_size

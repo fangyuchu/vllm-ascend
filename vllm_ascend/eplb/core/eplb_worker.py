@@ -294,7 +294,7 @@ class EplbWorker:
 
             maps.append(new_expert_map[self.rank_id].numpy().tolist())
 
-            log2phy_map = generate_log2phy_map(new_expert_map)[self.rank_id]
+            log2phy_map = generate_log2phy_map(new_expert_map, self.rank_id)
             log2phy_all.append(log2phy_map.numpy().tolist())
 
             layer_ids.append(layer_id)

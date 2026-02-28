@@ -17,6 +17,7 @@
 # Todo: Once https://github.com/vllm-project/vllm/issues/22246 is merged in vllm. Remove eplb utils.
 import json
 import os.path
+from collections import defaultdict
 
 import numpy as np
 import torch
@@ -89,10 +90,9 @@ def init_eplb_config(eplb_config, layer_id, moe_config):
         global_expert_map.append(expert_map)
         if rankid == moe_config.ep_rank:
             local_expert_map = expert_map.npu()
-    global_expert_map = torch.stack(global_expert_map)
-    log2phy = generate_log2phy_map(global_expert_map)[moe_config.ep_rank].npu() if eplb_enable else None
+    log2phy = generate_log2phy_map(global_expert_map, moe_config.ep_rank).npu() if eplb_enable else None
 
-    return global_expert_map, local_expert_map, log2phy, n_redundant
+    return torch.stack(global_expert_map), local_expert_map, log2phy, n_redundant
 
 
 def reinit_expert(local_expert_map, num_moe_layers, layer_id):
@@ -119,35 +119,31 @@ def reinit_expert(local_expert_map, num_moe_layers, layer_id):
             local_expert_map[local_placement] = torch.arange(local_placement.shape[0], dtype=torch.int32)
             global_expert_map.append(local_expert_map)
         global_expert_map = torch.stack(global_expert_map)
-        log2phy = generate_log2phy_map(global_expert_map)[rank].npu()
+        log2phy = generate_log2phy_map(global_expert_map, rank).npu()
 
         return global_expert_map, global_expert_map[rank].npu(), log2phy
     else:
         return None
 
 
-def generate_log2phy_map(expert_map, sync=False):
-    if sync:
-        cpu_group = get_ep_group().cpu_group
-        dice = torch.randint(low=0, high=256, size=(1,), device="cpu")
-        dist.all_reduce(dice, op=dist.ReduceOp.SUM, group=cpu_group)
-    else:
-        dice = 0
+def generate_log2phy_map(global_expert_map, ep_rank):
+    log2phy_map = defaultdict(list)
+    valid_count = torch.sum(global_expert_map[0] != -1)
+    for rankid, map_per_rank in enumerate(global_expert_map):
+        for idx, val in enumerate(map_per_rank):
+            val = val.item()
+            if val != -1:
+                log2phy_map[idx].append(val + rankid * valid_count)
 
-    log2phy_map = expert_map.clone().cpu().to(torch.int32)
-    device = "cpu"
-    world_size, num_experts = log2phy_map.shape
-    num_local_experts = log2phy_map.max() + 1
-    row_indices = (
-        torch.arange(world_size, device=device).view(-1, 1).expand(world_size, num_experts) * num_local_experts
+    for key in log2phy_map:
+        num_of_duplications = len(log2phy_map[key])
+        log2phy_map[key] = log2phy_map[key][ep_rank % num_of_duplications]
+
+    log2phy_map = torch.scatter(
+        torch.zeros(len(log2phy_map), dtype=torch.int32),
+        0,
+        torch.tensor(list(log2phy_map), dtype=torch.int64),
+        torch.tensor(list(log2phy_map.values()), dtype=torch.int32),
     )
-    log2phy_map[log2phy_map != -1] += row_indices[log2phy_map != -1]
-    mask_valid = log2phy_map != -1
-    valid_cnts = mask_valid.sum(dim=0)
-    assert valid_cnts.all()
-    sel_off = dice % valid_cnts
-    sorted_vals, _ = log2phy_map.sort(dim=0, stable=True, descending=True)
-    selected = sorted_vals[sel_off, torch.arange(num_experts, device=device)]
-    log2phy_map = selected.unsqueeze(0).expand(world_size, -1)
 
     return log2phy_map

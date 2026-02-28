@@ -31,7 +31,7 @@ from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.distributed.parallel_state import get_mc2_group
-from vllm_ascend.eplb.core.eplb_utils import generate_log2phy_map, init_eplb_config, reinit_expert
+from vllm_ascend.eplb.core.eplb_utils import init_eplb_config, reinit_expert
 from vllm_ascend.flash_common3_context import get_flash_common3_context, set_flash_common3_context
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts, zero_experts_compute
 from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl, FusedExpertsResult, setup_moe_comm_method
@@ -170,11 +170,6 @@ class AscendFusedMoE(FusedMoE):
 
         self._expert_map = None
         self.log2phy = None
-
-        self.cur_iterations = 0
-        self.update_log2phy_map_step = max(
-            1, get_ascend_config().eplb_config.expert_heat_collection_interval // self.ep_size
-        )
 
         if self.quant_config is None:
             self.quant_method = AscendUnquantizedFusedMoEMethod(self.moe_config)
@@ -348,9 +343,6 @@ class AscendFusedMoE(FusedMoE):
             hidden_states, pertoken_scale = hidden_states
         else:
             pertoken_scale = None
-
-        if self.cur_iterations % self.update_log2phy_map_step == 0:
-            self.log2phy = generate_log2phy_map(self.global_expert_map, sync=True)[self.ep_rank].npu()
 
         # Matrix multiply.
         fused_experts_results: FusedExpertsResult = self.quant_method.apply(
