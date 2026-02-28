@@ -125,6 +125,7 @@ class MoECommMethod(ABC):
         w2_offset: torch.Tensor | None = None,
         # For load balance
         log2phy: torch.Tensor = None,
+        global_redundant_expert_num: int = 0,
         need_trans: bool = False,
         dynamic_eplb: bool = False,
         mc2_mask: torch.Tensor = None,
@@ -146,7 +147,7 @@ class MoECommMethod(ABC):
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             expert_map=expert_map,
-            global_redundant_expert_num=self.moe_config.global_redundant_expert_num,
+            global_redundant_expert_num=global_redundant_expert_num,
             mc2_mask=mc2_mask,
             apply_router_weight_on_input=apply_router_weight_on_input,
             with_quant=use_int8_w8a8 or use_int4_w4a8,

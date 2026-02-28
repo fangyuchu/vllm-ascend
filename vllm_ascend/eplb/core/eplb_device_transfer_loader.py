@@ -30,6 +30,7 @@ class D2DExpertWeightLoader:
     def __init__(self):
         self.comm_op_list = None
         self.updated_expert_map = None
+        self.updated_global_expert_map = None
         self.updated_log2phy_map = None
         self.layer_id = -1  # layer id to be updated
         self.state = ExpertWeightUpdateState.WAITING
@@ -39,13 +40,16 @@ class D2DExpertWeightLoader:
     def set_adator(self, eplb_adaptor):
         self.eplb_adaptor = eplb_adaptor
 
-    def generate_expert_d2d_transfer_task(self, expert_send_info, expert_recv_info, updated_expert_map, layer_id):
+    def generate_expert_d2d_transfer_task(
+        self, expert_send_info, expert_recv_info, updated_expert_map, updated_global_expert_map, layer_id
+    ):
         # When current send/recv and weight.expert_map update tasks are not finished, cannot accept new d2d task
         if self.state != ExpertWeightUpdateState.WAITING:
             logger.warning_once("current d2d weight update tasks are on-going, cannot accept new weight update task")
             return
 
         self.updated_expert_map = updated_expert_map
+        self.updated_global_expert_map = updated_global_expert_map
 
         self.layer_id = layer_id
         self.comm_op_list = []
@@ -93,6 +97,9 @@ class D2DExpertWeightLoader:
 
         # update expert_map
         self.eplb_adaptor.do_update_expert_map(self.layer_id, self.updated_expert_map)
+
+        # update global_expert_map
+        self.eplb_adaptor.do_update_global_expert_map(self.layer_id, self.updated_global_expert_map)
 
         # update log2phy_map
         self.eplb_adaptor.do_update_log2phy_map(self.layer_id, self.updated_log2phy_map)

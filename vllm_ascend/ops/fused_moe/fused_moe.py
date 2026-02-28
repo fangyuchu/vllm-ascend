@@ -31,7 +31,7 @@ from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.distributed.parallel_state import get_mc2_group
-from vllm_ascend.eplb.core.eplb_utils import init_eplb_config
+from vllm_ascend.eplb.core.eplb_utils import init_eplb_config, reinit_expert
 from vllm_ascend.flash_common3_context import get_flash_common3_context, set_flash_common3_context
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts, zero_experts_compute
 from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl, FusedExpertsResult, setup_moe_comm_method
@@ -148,6 +148,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             dynamic_eplb=self.dynamic_eplb,
             log2phy=log2phy,
             mc2_mask=kwargs.get("mc2_mask"),
+            global_redundant_expert_num=kwargs.get("global_redundant_expert_num", 0),
         )
         if zero_expert_num > 0 and zero_expert_type is not None:
             final_hidden_states += zero_expert_result
@@ -236,6 +237,14 @@ class AscendFusedMoE(FusedMoE):
         self.enable_shared_expert_dp = ascend_config.enable_shared_expert_dp
 
         setup_moe_comm_method(self.moe_config)
+
+        num_dense_layers = len(getattr(self.vllm_config.model_config.hf_text_config, "mlp_only_layers", []))
+        num_hidden_layers = getattr(self.vllm_config.model_config.hf_text_config, "num_hidden_layers", 0)
+        num_moe_layers = num_hidden_layers - num_dense_layers
+        results = reinit_expert(self._expert_map, num_moe_layers, self.moe_instance_id)
+        if results:
+            self.global_expert_map, self._expert_map, self.log2phy = results
+
         self.quant_type = self._get_quant_type()
 
     def _get_quant_type(self) -> QuantType:

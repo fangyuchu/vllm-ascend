@@ -21,7 +21,11 @@ from collections import defaultdict
 
 import numpy as np
 import torch
+import torch.distributed as dist
+from vllm.distributed import get_ep_group
 from vllm.logger import logger
+
+_GLOBAL_PLACEMENT = None
 
 
 def expert_file_to_tensor(expert_map_path, layer_id):
@@ -89,6 +93,37 @@ def init_eplb_config(eplb_config, layer_id, moe_config):
     log2phy = generate_log2phy_map(global_expert_map, moe_config.ep_rank).npu() if eplb_enable else None
 
     return torch.stack(global_expert_map), local_expert_map, log2phy, n_redundant
+
+
+def reinit_expert(local_expert_map, num_moe_layers, layer_id):
+    global _GLOBAL_PLACEMENT
+    cpu_group = get_ep_group().cpu_group
+    rank = cpu_group.rank()
+    world_size = cpu_group.size()
+    num_local_experts = local_expert_map.max() + 1
+    if _GLOBAL_PLACEMENT is None:
+        flag = torch.tensor([False], dtype=torch.bool, device="cpu")
+        dist.broadcast(flag, src=0, group=cpu_group)
+        if flag:
+            shape = (num_moe_layers, world_size, num_local_experts)
+            _GLOBAL_PLACEMENT = torch.empty(shape, dtype=torch.int32, device="cpu")
+            dist.broadcast(_GLOBAL_PLACEMENT, src=0, group=cpu_group)
+
+    if _GLOBAL_PLACEMENT is not None:
+        global_placement = _GLOBAL_PLACEMENT[layer_id]
+        n_experts = len(torch.unique(global_placement))
+        global_expert_map = []
+        for rankid in range(world_size):
+            local_expert_map = torch.full((n_experts,), -1, dtype=torch.int32)
+            local_placement = global_placement[rankid]
+            local_expert_map[local_placement] = torch.arange(local_placement.shape[0], dtype=torch.int32)
+            global_expert_map.append(local_expert_map)
+        global_expert_map = torch.stack(global_expert_map)
+        log2phy = generate_log2phy_map(global_expert_map, rank).npu()
+
+        return global_expert_map, global_expert_map[rank].npu(), log2phy
+    else:
+        return None
 
 
 def generate_log2phy_map(global_expert_map, ep_rank):

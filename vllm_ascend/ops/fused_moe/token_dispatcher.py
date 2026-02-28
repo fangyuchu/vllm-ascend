@@ -329,8 +329,6 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher):
             hidden_states = hidden_states * topk_weights.to(hidden_states.dtype)
         if expert_map is not None:
             global_num_experts = len(expert_map) + global_redundant_expert_num
-            mask = expert_map[topk_ids] != -1
-            topk_weights = topk_weights * mask
             first_expert_idx = get_ep_group().rank_in_group * self.num_experts_local
             last_expert_idx = first_expert_idx + self.num_experts_local
         else:
@@ -352,6 +350,8 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher):
             )
         )
         expert_tokens = expert_tokens.to(torch.int64)
+        topk = topk_weights.shape[-1]
+        topk_weights = topk_weights * (expanded_row_idx.reshape(-1, topk) != -1)
         group_list_type = 1  # `count` mode
         context_metadata = {"topk_weights": topk_weights, "expanded_row_idx": expanded_row_idx}
 

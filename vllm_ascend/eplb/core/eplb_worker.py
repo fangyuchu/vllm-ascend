@@ -48,6 +48,7 @@ class EplbWorker:
             self.old_expert_maps = self.get_init_expert_maps()
             if self.old_expert_maps is not None:
                 self.num_local_experts = self.old_expert_maps.max() + 1
+                self.num_experts = self.old_expert_maps.shape[-1]
             else:
                 raise ValueError("Failed to get expert_maps from shared_dict.")
 
@@ -58,16 +59,36 @@ class EplbWorker:
 
         # Get the updated expert table based on the workload information
         old_placement = self.global2local(self.old_expert_maps, self.num_local_experts)
+        scale = self.shared_dict.get("scale", False)
+        if scale:
+            old_ep_size = self.shared_dict["old_ep_size"]
+            new_ep_size = self.shared_dict["new_ep_size"]
+            assert old_ep_size != new_ep_size
+            self.policy.set_new_ep_size(new_ep_size)
         _, _, new_placement = self.calculate_rebalance_experts(load_info, old_placement)
 
         if not torch.is_tensor(new_placement):
             new_placement = torch.tensor(new_placement)
         self.check_expert_placement(old_placement, new_placement)
         new_expert_maps = self.local2global(new_placement)
+        new_expert_maps_clone = new_expert_maps.clone()
         self.update_expert_map(new_expert_maps)
+        self.update_global_placement(new_placement)
+
+        if scale:
+            if old_ep_size > new_ep_size:
+                # when scale down, ensure that the shutdown ranks do not own any experts
+                # by setting their expert_map to all -1
+                shape = list(new_expert_maps.shape)
+                shape[1] = old_ep_size - new_ep_size
+                shutdown_rank_expert_maps = torch.full(shape, -1, dtype=new_expert_maps.dtype)
+                new_expert_maps = torch.cat([new_expert_maps, shutdown_rank_expert_maps], dim=1)
+            else:
+                # when scale up, only compute expert movement in old ranks
+                new_expert_maps = new_expert_maps[:, :old_ep_size]
 
         update_info = self.compose_expert_update_info_greedy(new_expert_maps, self.old_expert_maps)
-        self.old_expert_maps = new_expert_maps
+        self.old_expert_maps = new_expert_maps_clone
         logger.info("EPLB Process compute complete")
 
         packed_update_info = self.pack_update_info(update_info)
@@ -76,20 +97,22 @@ class EplbWorker:
 
     def check_expert_placement(self, old_placement, new_placement):
         num_layers = old_placement.shape[0]
-        num_ranks = old_placement.shape[1]
+        num_ranks = max(old_placement.shape[1], new_placement.shape[1])
 
         for layer_id in range(num_layers):
             # check if any logical expert is not placed on any rank
-            if torch.unique(new_placement[layer_id]).numel() < torch.unique(old_placement[layer_id]).numel():
+            if torch.unique(new_placement[layer_id]).numel() < self.num_experts:
                 logger.error(f"There exists expert not placed on any rank in layer {layer_id}")
                 new_placement[layer_id] = old_placement[layer_id]
                 continue
 
             for rank_id in range(num_ranks):
-                new_placement_check = new_placement[layer_id][rank_id]
-                old_placement_check = old_placement[layer_id][rank_id]
+                new_placement_check = new_placement[layer_id][rank_id] if new_placement.shape[1] > rank_id else None
+                old_placement_check = old_placement[layer_id][rank_id] if old_placement.shape[1] > rank_id else None
 
                 # check if same logical experts are placed on the same NPU
+                if new_placement_check is None:
+                    break
                 if new_placement_check.numel() != torch.unique(new_placement_check).numel():
                     logger.error(
                         "Replicated experts are placed on the same NPU; expert placement on "
@@ -99,14 +122,27 @@ class EplbWorker:
                     break
 
                 # check if there is any experts movement inside one NPU
-                expert_not_move = torch.isin(new_placement_check, old_placement_check)
-                if not torch.equal(new_placement_check[expert_not_move], old_placement_check[expert_not_move]):
-                    logger.error(
+                if old_placement_check is None:
+                    continue
+                expert_not_move_mask = torch.isin(new_placement_check, old_placement_check)
+                if not expert_not_move_mask.any():
+                    continue
+                expert_not_move = new_placement_check[expert_not_move_mask]
+                old_indices = []
+                for expert in expert_not_move:
+                    old_idx = torch.where(old_placement_check == expert)[0]
+                    old_indices.append(old_idx.item())
+                new_indices = torch.where(expert_not_move_mask)[0].tolist()
+                if old_indices != new_indices:
+                    logger.info(
                         "There exists expert movement inside NPU; expert placement on "
-                        f"layer {layer_id}, rank {rank_id} is invalid"
+                        f"layer {layer_id}, rank {rank_id} is invalid, try to rearrange it"
                     )
-                    new_placement[layer_id] = old_placement[layer_id]
-                    break
+                    new_placement_this_rank = new_placement_check.clone()
+                    new_placement_this_rank[old_indices] = expert_not_move
+                    available_positions = list(set(range(new_placement_check.shape[0])) - set(old_indices))
+                    new_placement_this_rank[available_positions] = new_placement_check[~expert_not_move_mask]
+                    new_placement[layer_id][rank_id] = new_placement_this_rank
 
     # TODO: Here only expert weight exchange is considered, need to be extended to cover other weight update cases
     def compose_expert_update_info_greedy(self, updated_expert_maps, current_expert_maps):
@@ -173,6 +209,7 @@ class EplbWorker:
             return False, None, None
 
         changed, priority, new_map = self.policy.rebalance_experts(old_placement, load_info)
+
         return changed, priority, new_map
 
     def get_init_expert_maps(self):
@@ -189,7 +226,10 @@ class EplbWorker:
         return self.shared_dict.get("moe_load", None)
 
     def update_expert_map(self, expert_maps):
-        self.shared_dict["expert_maps"] = expert_maps
+        self.shared_dict["expert_maps"] = expert_maps.clone()
+
+    def update_global_placement(self, new_placement):
+        self.shared_dict["global_placement"] = new_placement.clone()
 
     def global2local(self, placement: torch.Tensor, E_local: int) -> tuple[torch.Tensor, torch.Tensor]:
         L, G, _ = placement.shape
@@ -236,7 +276,17 @@ class EplbWorker:
         log2phy_all = []
         layer_ids = []
 
+        # when scale up, update_info_generator only contains new_expert_map of old ranks, it may cause error in
+        # generate_log2phy_map, so we get new_expert_map from self.shared_dict["expert_map"]
+        scale = self.shared_dict.get("scale", False)
+        scale_up = False
+        if scale:
+            old_ep_size = self.shared_dict["old_ep_size"]
+            new_ep_size = self.shared_dict["new_ep_size"]
+            scale_up = new_ep_size > old_ep_size
         for send_info, recv_info, new_expert_map, layer_id in update_info_generator:
+            if scale and scale_up:
+                new_expert_map = self.shared_dict["expert_maps"][layer_id]
             send_info_this_rank = send_info.get(self.rank_id, [])
             recv_info_this_rank = recv_info.get(self.rank_id, [])
             send_all.append(send_info_this_rank)

@@ -19,6 +19,7 @@ import numpy
 import torch
 import torch.distributed as dist
 import vllm.envs as envs
+from vllm.distributed.parallel_state import get_ep_group
 from vllm.logger import logger
 
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
@@ -37,11 +38,6 @@ class EplbUpdator:
     def set_adaptor(self, adaptor: VllmEplbAdaptor):
         self.adaptor = adaptor
         self.num_moe_layers = self.adaptor.num_moe_layers
-        local_load = self.adaptor.get_rank_expert_workload()
-        self.world_size = dist.get_world_size()
-        self.device = local_load.device
-        shape = (self.world_size, *local_load.shape)
-        self._gather_buffer = torch.empty(shape, dtype=local_load.dtype, device=self.device)
 
     def init_eplb(self, expert_map_path, process):
         self.rank_id = dist.get_rank()
@@ -133,6 +129,10 @@ class EplbUpdator:
 
     def compute_and_set_moe_load(self):
         local_load = self.adaptor.get_rank_expert_workload()
+        self.world_size = dist.get_world_size()
+        self.device = local_load.device
+        shape = (self.world_size, *local_load.shape)
+        self._gather_buffer = torch.empty(shape, dtype=local_load.dtype, device=self.device)
         dist.all_gather_into_tensor(self._gather_buffer, local_load)
 
         moe_load = self._gather_buffer.permute(1, 0, 2)
@@ -200,6 +200,14 @@ class EplbUpdator:
 
         for req in reqs:
             req.wait()
+
+    def broadcast_global_placement(self):
+        global_placement = self.shared_dict["global_placement"].to(torch.int32).cpu()
+
+        cpu_group = get_ep_group().cpu_group
+        flag = torch.tensor([True], dtype=torch.bool, device="cpu")
+        dist.broadcast(flag, src=0, group=cpu_group)
+        dist.broadcast(global_placement, src=0, group=cpu_group)
 
     def shutdown(self):
         """
