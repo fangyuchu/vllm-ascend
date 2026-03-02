@@ -28,7 +28,6 @@ import torch
 import torch.nn as nn
 import torch_npu
 import vllm.envs as envs_vllm
-import zmq
 from torch.distributed.distributed_c10d import _set_pg_timeout
 from torch_npu.op_plugin.atb._atb_ops import _register_atb_extensions
 from torch_npu.profiler import dynamic_profile as dp
@@ -138,7 +137,7 @@ class WorkerSentinel(BaseSentinel):
     def retry(self, timeout: int = 1, **kwargs) -> bool:
         NPUPlatform.set_device(self.device)
         torch_npu.npu.restart_device(self.device.index)
-        self.logger(f"npu restart device %s",self.device.index)
+        self.logger("npu restart device %s", self.device.index)
         dp_group = get_dp_group()
         dp_group.destroy_cpu_group()
         self.worker.init_dp_device_group(self.vllm_config)
@@ -234,7 +233,7 @@ class NPUWorker(WorkerBase):
             signal.signal(signal.SIGTERM, signal_handler)
             signal.signal(signal.SIGINT, signal_handler)
 
-    def init_dp_device_group(self,vllm_config: VllmConfig) -> None:
+    def init_dp_device_group(self, vllm_config: VllmConfig) -> None:
         # TODO: Temporarily hardcode the port value for debugging. Will replace with get_open_port().
         get_dp_group().cpu_group = stateless_init_torch_distributed_process_group(
             vllm_config.parallel_config.data_parallel_master_ip,
