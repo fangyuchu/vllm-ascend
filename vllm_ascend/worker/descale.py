@@ -2,9 +2,11 @@ import copy
 import gc
 import math
 from collections import defaultdict
+from datetime import timedelta
 from typing import TYPE_CHECKING
 
 import torch
+from torch.distributed.distributed_c10d import _set_pg_timeout
 from vllm.compilation.wrapper import reset_compile_wrapper
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed import (
@@ -302,21 +304,24 @@ def destroy_comm_group(use_mask_mc2: bool) -> None:
         cleanup_dist_env_and_memory()
 
 
-def init_dp_device_group(vllm_config: VllmConfig) -> None:
+def init_dp_cpu_group(vllm_config: VllmConfig, group_type="normal") -> None:
+    # TODO: Temporarily hardcode the port value for debugging. Will replace with get_open_port().
     get_dp_group().cpu_group = stateless_init_torch_distributed_process_group(
         vllm_config.parallel_config.data_parallel_master_ip,
         vllm_config.parallel_config.data_parallel_master_port + 100,
         vllm_config.parallel_config.data_parallel_rank,
         vllm_config.parallel_config.data_parallel_size,
         backend="gloo",
-        gloo_comm_timeout=60,
-        enable_fault_tolerance=True,
+        fault_tolerance_config=vllm_config.fault_tolerance_config,
     )
+    get_dp_group().group_type = group_type
+    timeout = timedelta(seconds=vllm_config.fault_tolerance_config.gloo_comm_timeout)
+    _set_pg_timeout(timeout=timeout, group=get_dp_group().cpu_group)
 
 
 def reinit_comm_group(use_mask_mc2: bool, vllm_config: VllmConfig, worker: NPUWorker) -> None:
     if use_mask_mc2:
-        init_dp_device_group(vllm_config)
+        init_dp_cpu_group(vllm_config, "stateless")
     else:
         worker._init_worker_distributed_environment()
 
@@ -405,8 +410,9 @@ def expand_parameter(old_param, axis: int = 0, extra_lines: int = 1) -> torch.nn
     return torch.nn.Parameter(new_tensor, requires_grad=old_param.requires_grad)
 
 
-def expand_expert_weights(model_runner: NPUModelRunner, added_experts: dict[int, list[int]], quant: bool | str) -> None:
-    rank = model_runner.vllm_config.parallel_config.data_parallel_rank
+def expand_expert_weights(
+    model_runner: NPUModelRunner, added_experts: dict[int, list[int]], quant: bool | str, rank: int
+) -> None:
     current_rank_expand_experts = added_experts[rank]
     expand_lines = len(current_rank_expand_experts)
     if expand_lines:
@@ -454,12 +460,12 @@ def reload_fault_expert_weights(
     model_runner: NPUModelRunner,
     global_experts_distribution: dict[int, list[int]],
     experts_saved_weights: dict[str, torch.Tensor],
-    vllm_config: VllmConfig,
     redistributed_experts: dict[int, list[int]],
     added_experts: dict[int, list[int]],
     replaced_redundant_experts: dict[int, dict[int, tuple[int, int]]],
     quant: bool | str = False,
-) -> None:
+    old_rank: int = 0,
+) -> dict[int, list[int]]:
     def _load_single_expert(expert_id: int, target_index: int, quant: bool | str = False):
         prefix = f"{module.layer_name}.{expert_id}"
         w1_weight = experts_saved_weights[f"{prefix}.gate_proj.weight"]
@@ -487,7 +493,6 @@ def reload_fault_expert_weights(
                 loaded_weight=w3_weight.to(device),
                 tp_rank=module.tp_rank,
             )
-            # TODO: load quantization weights need verification
             w1_weight_scale = experts_saved_weights[f"{prefix}.gate_proj.weight_scale"].to(device)
             w2_weight_scale = experts_saved_weights[f"{prefix}.down_proj.weight_scale"].to(device)
             w3_weight_scale = experts_saved_weights[f"{prefix}.up_proj.weight_scale"].to(device)
@@ -521,7 +526,6 @@ def reload_fault_expert_weights(
                 tp_rank=module.tp_rank,
             )
 
-    old_rank = vllm_config.parallel_config.data_parallel_rank
     experts_to_expand = added_experts[old_rank]
     init_local_experts_count = len(global_experts_distribution[old_rank])
     slot_to_routed_expert_map = {}
@@ -540,6 +544,7 @@ def reload_fault_expert_weights(
     global_experts_distribution = {}
     for i, rank in enumerate(list(sorted(redistributed_experts.keys()))):
         global_experts_distribution[i] = redistributed_experts[rank]
+    return global_experts_distribution
 
 
 def update_parallel_config(original_config: VllmConfig, update_config: dict[str, int]) -> None:  # , worker_guard)
@@ -585,6 +590,33 @@ def update_ep2dp_map(
             else:
                 ep2dp_map[old_ep_rank] = rank_mapping[str(dp_rank)]
     return ep2dp_map
+
+
+def init_elastic_info(
+    use_mask_mc2: bool,
+    ep_size: int,
+    phy_experts_num: int,
+    share_expert_rank_num: int = 0,
+):
+    if use_mask_mc2:
+        # ----- 1 Basic configuration (first 4 parameters) -----
+        # Meaning: whether to descale (0 = no descale), actual number of ranks after descale
+        # reduction (=ep_size), number of ranks for shared experts,number of MoE experts
+        descale = 0
+        base_config = torch.tensor([descale, ep_size, share_expert_rank_num, phy_experts_num], dtype=torch.int32)
+
+        # ----- 2 Mapping tables -----
+        # Table1: epRankID -> localEpRankId(-1 indicates invalid）
+        table1 = torch.arange(0, ep_size, dtype=torch.int32)
+        # Table2: localEpRankId -> epRankID(-1 indicates padding）
+        table2 = torch.arange(0, ep_size, dtype=torch.int32)
+
+        # ----- 3 Concatenate into a complete 1D Tensor -----
+        elastic_info = torch.cat([base_config, table1, table2], dim=0).npu().contiguous()
+
+        # ---- 4 Configure Tensor properties and set global variables
+        elastic_info.requires_grad_(False)
+        set_elastic_info(elastic_info)
 
 
 def update_elastic_info(
@@ -658,26 +690,22 @@ def reconfigure_moe(
     new_ep_size = parallel_config.data_parallel_size * parallel_config.tensor_parallel_size
     get_ascend_config().eplb_config.num_redundant_experts = num_global_new_phy_experts - num_global_logical_experts
 
-    moe_moules = [
-        module
-        for module in modelrunner.model.modules()
-        if (module.__class__.__name__ == "AscendFusedMoE" or module.__class__.__name__ == "SharedFusedMoE")
-    ]
+    moe_moules = [module for module in modelrunner.model.modules() if isinstance(module, FusedMoE)]
 
     for module in moe_moules:
         module.local_num_experts = num_global_new_phy_experts // new_ep_size
-        module.global_num_experts = num_global_logical_experts
-        module.global_redundant_experts_num = num_global_new_phy_experts - num_global_logical_experts
+        module.global_num_experts = num_global_new_phy_experts
+        module.global_redundant_expert_num = num_global_new_phy_experts - num_global_logical_experts
         module.moe_parallel_config = FusedMoEParallelConfig.make(
-            tp_size=get_tp_group().world_size,
-            pcp_size=get_pcp_group().world_size,
-            dp_size=get_dp_group().world_size,
+            tp_size_=get_tp_group().world_size,
+            pcp_size_=get_pcp_group().world_size,
+            dp_size_=get_dp_group().world_size,
             vllm_parallel_config=parallel_config,
         )
         module.moe_config = FusedMoEConfig(
             num_experts=module.global_num_experts,
-            experts_per_token=module.topk,
-            hidden_dim=module.hidden_dim,
+            experts_per_token=module.top_k,
+            hidden_dim=module.hidden_size,
             intermediate_size_per_partition=module.intermediate_size_per_partition,
             num_local_experts=module.local_num_experts,
             moe_parallel_config=module.moe_parallel_config,
@@ -693,8 +721,8 @@ def reconfigure_moe(
         )
         module.moe_config.num_experts = module.global_num_experts
         module.moe_config.num_local_experts = module.local_num_experts
-        module.moe_config.global_redundant_expert_num = module.global_redundant_experts_num
-        module.log2phy = log2phy
+        module.moe_config.global_redundant_expert_num = module.global_redundant_expert_num
+        module.log2phy.copy_(log2phy, non_blocking=True)
         if not use_mask_mc2:
             module.moe_config.tp_group = get_tp_group()
             module.moe_config.dp_group = get_dp_group()
