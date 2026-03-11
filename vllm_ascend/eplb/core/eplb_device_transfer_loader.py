@@ -16,7 +16,7 @@
 #
 from enum import Enum
 
-import torch.distributed as dist
+from vllm.distributed.parallel_state import get_ep_group
 from vllm.logger import logger
 
 
@@ -52,15 +52,21 @@ class D2DExpertWeightLoader:
         for send_info in expert_send_info:
             dst_rank, global_expert_id_to_send = send_info
             local_expert_id = self.eplb_adaptor.expert_map_per_layer_cpu[layer_id][global_expert_id_to_send].item()
+            op_info = {"peer_rank": dst_rank, "tensors": [], "expert_id": global_expert_id_to_send, "op": "send"}
             for src_tensor in self.eplb_adaptor.expert_param_per_layer[layer_id][local_expert_id]:
-                self.comm_op_list.append(dist.P2POp(dist.isend, src_tensor, dst_rank))
+                op_info["tensors"].append(src_tensor)
+            self.comm_op_list.append(op_info)
 
         for buffer_tensor_id, recv_info in enumerate(expert_recv_info):
             recv_rank, global_expert_id_to_recv = recv_info
+            op_info = {"peer_rank": recv_rank, "tensors": [], "expert_id": global_expert_id_to_recv, "op": "send"}
             for buffer_tensor in self.eplb_adaptor.buffer_tensor_list[buffer_tensor_id]:
-                self.comm_op_list.append(dist.P2POp(dist.irecv, buffer_tensor, recv_rank))
+                op_info["tensors"].append(buffer_tensor)
+            self.comm_op_list.append(op_info)
             local_expert_to_replace = self.updated_expert_map[global_expert_id_to_recv].item()
             self.recv_expert_list.append((local_expert_to_replace, buffer_tensor_id))
+
+        self.comm_op_list = sorted(self.comm_op_list, key=lambda x: x["expert_id"])
 
         self.state = ExpertWeightUpdateState.READY
 
@@ -74,8 +80,17 @@ class D2DExpertWeightLoader:
 
         # set asynchronous stream for d2d expert weight transfer
         if self.comm_op_list:
-            ret_list = dist.batch_isend_irecv(self.comm_op_list)
-            reqs.extend(ret_list)
+            for op_info in self.comm_op_list:
+                peer_rank = op_info["peer_rank"]
+                tensors = op_info["tensors"]
+                expert_id = op_info["expert_id"]
+                op = op_info["op"]
+                for i, tensor in enumerate(tensors):
+                    if op == "send":
+                        worker = get_ep_group().device_group.send([tensor], peer_rank, tag=expert_id * (i + 1))
+                    else:
+                        worker = get_ep_group().device_group.recv([tensor], peer_rank, tag=expert_id * (i + 1))
+                    reqs.append(worker)
 
         self.state = ExpertWeightUpdateState.TRANSFERRING
 

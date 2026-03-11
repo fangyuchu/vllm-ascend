@@ -2,10 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import weakref
 from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 from unittest.mock import patch
 
 import torch
@@ -58,6 +59,14 @@ class ACLGraphWrapper:
     guaranteed when VLLM_LOGGING_LEVEL == "DEBUG".
     """
 
+    _all_instances: ClassVar[weakref.WeakSet["ACLGraphWrapper"]] = weakref.WeakSet()
+
+    @classmethod
+    def clear_all_graphs(cls) -> None:
+        """Clear captured graphs from all ACLGraphWrapper instances."""
+        for instance in list(cls._all_instances):
+            instance.clear_graphs()
+
     def __init__(
         self,
         runnable: Callable,
@@ -94,6 +103,9 @@ class ACLGraphWrapper:
     def unwrap(self) -> Callable:
         # in case we need to access the original runnable.
         return self.runnable
+
+    def clear_graphs(self):
+        self.concrete_aclgraph_entries.clear()
 
     def __call__(self, *args, **kwargs):
         forward_context = get_forward_context()
