@@ -227,7 +227,7 @@ class NPUWorker(WorkerBase):
             self.backup_expert_rank_mapping = {}
             init_elastic_info(self.use_mask_mc2, ep_size, (self.num_logical_expert + num_redundancy_expert))
 
-    def dp_descale(self, exclude_dp_ranks: list[int], vllm_update_config):
+    def dp_descale(self, exclude_ep_ranks: list[int], vllm_update_config):
         """
         Reconfigure data-parallel (DP) layout and MoE expert placement after
         excluding one or more DP ranks (e.g., due to failure).
@@ -240,7 +240,7 @@ class NPUWorker(WorkerBase):
         over experts previously hosted on failed or excluded ranks.
         Parameters
         ----------
-        exclude_dp_ranks:
+        exclude_ep_ranks:
             A collection (e.g., list) of data-parallel ranks that should be
             excluded from service. These ranks are treated as failed or
             removed, and their experts are redistributed to remaining ranks.
@@ -289,7 +289,7 @@ class NPUWorker(WorkerBase):
         expert_ids_to_save = list()
         self.global_log2phy_map, redistributed_experts, added_experts, replaced_redundant_experts, self.use_mask_mc2 = (
             get_expert_distribution_after_descale(
-                exclude_dp_ranks,
+                exclude_ep_ranks,
                 self.global_experts_distribution,
                 self.global_log2phy_map,
                 self.backup_expert_rank_mapping,
@@ -308,7 +308,7 @@ class NPUWorker(WorkerBase):
 
         destroy_comm_group(self.use_mask_mc2)
 
-        if rank not in exclude_dp_ranks:
+        if rank not in exclude_ep_ranks:
             # reload fault expert weights
             self.experts_saved_ids, self.experts_saved_weights = save_expert_weights_to_ram(
                 expert_ids_to_save,
@@ -336,7 +336,7 @@ class NPUWorker(WorkerBase):
             update_parallel_config(self.vllm_config, vllm_update_config)
             self.model_runner.dp_size = self.vllm_config.parallel_config.data_parallel_size
             self.model_runner.dp_rank = self.vllm_config.parallel_config.data_parallel_rank
-            self.ep2dp_map = update_ep2dp_map(self.ep2dp_map, exclude_dp_ranks, rank_mapping)
+            self.ep2dp_map = update_ep2dp_map(self.ep2dp_map, exclude_ep_ranks, rank_mapping)
             elastic_info = get_elastic_info()
             num_new_phy_experts = sum(map(len, redistributed_experts.values()))
             update_elastic_info(self.use_mask_mc2, elastic_info, num_new_phy_experts, old_ep_size, self.ep2dp_map)
