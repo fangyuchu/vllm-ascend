@@ -19,18 +19,20 @@ from __future__ import annotations
 
 import math
 import os
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 import torch
 import vllm.envs as envs_vllm
+from torch.distributed.distributed_c10d import Backend, PrefixStore, ProcessGroup
 from vllm.logger import logger
 from vllm.platforms import Platform, PlatformEnum
 
 # todo: please remove it when solve cuda hard code in vllm
 os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
 
-from vllm_ascend.ascend_config import init_ascend_config
+from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 
 # isort: off
 from vllm_ascend.utils import (
@@ -449,6 +451,9 @@ class NPUPlatform(Platform):
         ):
             speculative_config.enforce_eager = False
 
+        if parallel_config.enable_elastic_ep:
+            NPUPlatform.allocate_platform_elastic_ep_ports(parallel_config)
+
     @classmethod
     def import_kernels(cls) -> None:
         # Directly importing vllm_ascend_C prevents ASCEND_RT_VISIBLE_DEVICES
@@ -790,3 +795,127 @@ class NPUPlatform(Platform):
                     "ignored on Ascend. Resetting to default (32)."
                 )
                 att_config.flash_attn_max_num_splits_for_cuda_graph = 32
+
+    @staticmethod
+    def allocate_platform_elastic_ep_ports(parallel_config, dp_size: int = None):
+        from vllm.config.parallel import get_open_ports_list
+
+        if not hasattr(parallel_config, "_platform_stateless_groups_ports"):
+            parallel_config._platform_stateless_groups_ports = dict()
+
+        assert isinstance(parallel_config._platform_stateless_groups_ports, dict)
+
+        ascend_config = get_ascend_config()
+        global_tp_size = parallel_config.tensor_parallel_size
+        global_dp_size = dp_size or parallel_config.data_parallel_size
+        world_size = parallel_config.world_size_across_dp
+        all_ranks = torch.arange(world_size).reshape(
+            -1, global_dp_size * parallel_config.prefill_context_parallel_size * global_tp_size
+        )
+
+        num_ports = 0
+        group_ranks = all_ranks.unbind(0)
+        num_ports += len(group_ranks) * 3
+        if ascend_config.eplb_config.dynamic_eplb:
+            num_ports += len(group_ranks) * 3
+
+        if ascend_config.multistream_overlap_gate:
+            num_ports += len(group_ranks) * 3
+
+        all_ports = get_open_ports_list(num_ports)
+        vllm_ports = set()
+        for port in parallel_config._data_parallel_master_port_list:
+            vllm_ports.add(port)
+        for group_ports in parallel_config._stateless_dp_group_port_list:
+            for port in group_ports:
+                vllm_ports.add(port)
+        for group_ports in parallel_config._stateless_ep_group_port_list:
+            for port in group_ports:
+                vllm_ports.add(port)
+        for group_ports in parallel_config._stateless_eplb_group_port_list:
+            for port in group_ports:
+                vllm_ports.add(port)
+        all_ports = set(all_ports)
+        while all_ports & vllm_ports:
+            conflict_ports = all_ports & vllm_ports
+            all_ports -= conflict_ports
+            all_ports.update(get_open_ports_list(len(conflict_ports)))
+
+        all_ports = list(all_ports)
+
+        parallel_config._platform_stateless_groups_ports["mc2"] = [
+            [all_ports.pop() for _ in range(3)] for _ in range(len(group_ranks))
+        ]
+        parallel_config._platform_stateless_groups_ports["dynamic_eplb"] = [
+            [all_ports.pop() for _ in range(3)] for _ in range(len(group_ranks))
+        ]
+        parallel_config._platform_stateless_groups_ports["fc3_quant_x"] = [
+            [all_ports.pop() for _ in range(3)] for _ in range(len(group_ranks))
+        ]
+
+    @classmethod
+    def stateless_init_device_torch_dist_pg(
+        cls,
+        backend: str,
+        prefix_store: PrefixStore,
+        group_rank: int,
+        group_size: int,
+        timeout: timedelta,
+        **kwargs,
+    ):
+        """
+        Initialize a stateless HCCL process group for CUDA devices.
+        This method creates a ProcessGroup with the specified backend configuration,
+        typically used for GPU communication. It sets up the necessary backend
+        options and registers the backend with the process group.
+        Args:
+            backend: The distributed backend to use (e.g., 'hccl')
+            prefix_store: The prefix store for distributed coordination
+            group_rank: The rank of the current process within the group
+            group_size: The total number of processes in the group
+            timeout: Maximum time to wait for the operation to complete
+            **kwargs: Additional backend-specific options
+        warning:
+        Uses internal PyTorch API (torch._C._distributed_c10d.ProcessGroupHCCL)
+        which may change in future PyTorch versions. Compatibility should be
+        verified with each PyTorch upgrade.
+        Compatibility Risk:
+        - High risk of breakage in PyTorch 2.4+
+        - No semantic versioning guarantees
+        - Requires testing with new PyTorch releases
+        Returns:
+            A ProcessGroup object configured with the specified backend
+        """
+
+        # INTERNAL API USAGE - COMPATIBILITY RISK
+        # This internal import is necessary for stateless process group functionality
+        # but carries compatibility risks. Monitor PyTorch release notes for changes.
+        # TODO: Migrate to public API when available in future PyTorch versions
+        from torch_npu._C._distributed_c10d import ProcessGroupHCCL
+
+        pg = ProcessGroup(prefix_store, group_rank, group_size)
+
+        backend_options = ProcessGroupHCCL.Options()
+        backend_options._timeout = timeout
+
+        # Create Backend object
+        backend = Backend("hccl")
+
+        # Set default backend for ProcessGroup
+        pg._set_default_backend(Backend.backend_type_map[backend])
+
+        device = torch.device("npu")
+        if hasattr(backend_options, "_device"):
+            backend_options._device = device
+
+        backend_class = ProcessGroupHCCL(prefix_store, group_rank, group_size, backend_options)
+
+        backend_class._set_sequence_number_for_group()
+        backend_type = ProcessGroup.BackendType.CUSTOM
+        pg._register_backend(device, backend_type, backend_class)
+        if "group_name" in kwargs:
+            group_desc = "undefined"
+            backend_class._set_hccl_comm_name(kwargs["group_name"])
+            pg._set_group_desc(group_desc)
+
+        return pg

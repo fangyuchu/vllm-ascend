@@ -40,12 +40,12 @@ class EplbUpdator:
         self.adaptor = adaptor
         self.num_moe_layers = self.adaptor.num_moe_layers
         local_load = self.adaptor.get_rank_expert_workload()
-        self.world_size = dist.get_world_size()
+        self.world_size = self.comm_group.world_size
         self.device = local_load.device
         self.eplb_loader.num_layers = self.adaptor.num_dense_layers + self.adaptor.num_moe_layers
 
     def init_eplb(self, expert_map_path, process):
-        self.rank_id = dist.get_rank()
+        self.rank_id = self.comm_group.rank_in_group
         self.num_expert_load_gather = 10
         self.periodic_load_gather = True
         self.expert_heat_collection_interval: torch.int64 = self.eplb_config.expert_heat_collection_interval
@@ -130,8 +130,13 @@ class EplbUpdator:
         self.update_iteration()
 
     def compute_and_set_moe_load(self):
-        local_load = self.adaptor.get_rank_expert_workload()
-        moe_load = self.comm_group.all_gather(local_load, dim=0).reshape(-1, self.world_size, *local_load.shape[1:])
+        self.comm_group = get_dynamic_eplb_group()
+        self.world_size = self.comm_group.world_size
+        local_load = self.adaptor.get_rank_expert_workload().cpu()
+        gather_buffer = [torch.empty_like(local_load) for _ in range(self.world_size)]
+        self.comm_group.cpu_group.all_gather(gather_buffer, local_load)
+        self.comm_group.cpu_group.all_gather(gather_buffer, local_load).wait()
+        moe_load = torch.stack(gather_buffer).permute(1, 0, 2)
 
         self.shared_dict["moe_load"] = moe_load.cpu()
         logger.debug(f"[ModelRunner] Updated shared_dict['moe_load'] shape={moe_load.shape}")
@@ -139,7 +144,8 @@ class EplbUpdator:
         return moe_load
 
     def warm_up_eplb(self):
-        self.shared_dict["expert_maps"] = self.adaptor.get_global_expert_map()
+        if self.shared_dict["expert_maps"] is None:
+            self.shared_dict["expert_maps"] = self.adaptor.get_global_expert_map()
         self.compute_and_set_moe_load()
 
         src_tensor = torch.empty((1,), device=self.device)

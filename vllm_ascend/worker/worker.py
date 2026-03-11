@@ -19,6 +19,8 @@
 
 import copy
 import gc
+import os
+from contextlib import AbstractContextManager, nullcontext
 from types import NoneType
 
 import torch
@@ -119,6 +121,10 @@ class NPUWorker(WorkerBase):
             distributed_init_method=distributed_init_method,
             is_driver_worker=is_driver_worker,
         )
+
+        from vllm_ascend.distributed.elastic_ep.elastic_execute import AscendElasticEPScalingExecutor
+
+        self.elastic_ep_executor = AscendElasticEPScalingExecutor(self)
 
         if self.cache_config.cache_dtype == "auto":
             self.cache_dtype = self.model_config.dtype
@@ -244,6 +250,17 @@ class NPUWorker(WorkerBase):
                 if name in self._sleep_saved_buffers:
                     buffer.data.copy_(self._sleep_saved_buffers[name].data)
             self._sleep_saved_buffers = {}
+
+    def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
+        if self.vllm_config.model_config.enable_sleep_mode:
+            from vllm_ascend.device_allocator.camem import CaMemAllocator
+
+            allocator = CaMemAllocator.get_instance()
+            if tag == "weights":
+                assert allocator.get_current_usage() == 0, "Sleep model can only be used for one instance per process."
+            return allocator.use_memory_pool(tag=tag)
+        else:
+            return nullcontext()
 
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
         self.cache_config.num_gpu_blocks = num_gpu_blocks
@@ -418,20 +435,30 @@ class NPUWorker(WorkerBase):
         return self.model_runner.sample_tokens(grammar_output)
 
     def load_model(self) -> None:
-        if self.vllm_config.model_config.enable_sleep_mode:
-            allocator = CaMemAllocator.get_instance()
-            assert allocator.get_current_usage() == 0, "Sleep mode can only be used for one instance per process."
-            context = allocator.use_memory_pool(tag="weights")
-        else:
-            from contextlib import nullcontext
+        dummy_weights = os.environ.get("VLLM_ELASTIC_EP_SCALE_UP_LAUNCH") == "1"
+        if dummy_weights:
+            (
+                expert_maps,
+                num_local_experts,
+                num_logical_experts,
+            ) = self.elastic_ep_executor.receive_expert_mapping()
+            dp_size = self.parallel_config.data_parallel_size
+            tp_size = self.parallel_config.tensor_parallel_size
+            pcp_size = self.parallel_config.prefill_context_parallel_size
+            ep_size = dp_size * tp_size * pcp_size
+            get_ascend_config().eplb_config.num_redundant_experts = ep_size * num_local_experts - num_logical_experts
+            if get_ascend_config().eplb_config.dynamic_eplb:
+                self.model_runner.shared_dict["expert_maps"] = expert_maps
 
-            context = nullcontext()  # type: ignore
-
-        with context, set_current_vllm_config(self.vllm_config):
-            self.model_runner.load_model()
+        with (
+            self._maybe_get_memory_pool_context(tag="weights"),
+            set_current_vllm_config(self.vllm_config),
+        ):
+            self.model_runner.load_model(load_dummy_weights=dummy_weights)
 
     def compile_or_warm_up_model(self) -> float:
         # Note: need to adapt for graph mode.
+        self.model_runner.eplb_warmup()
         warmup_sizes = (self.vllm_config.compilation_config.compile_sizes or []).copy()
         if not self.model_config.enforce_eager:
             cg_capture_sizes: list[int] = []
@@ -651,6 +678,9 @@ class NPUWorker(WorkerBase):
         except Exception as e:
             logger.info(f"query NPU card {self.local_rank} fail: {e}")
         return
+
+    def elastic_ep_execute(self, execute_method: str, *args, **kwargs):
+        return self.elastic_ep_executor.execute(execute_method, *args, **kwargs)
 
 
 def parse_text_output(output) -> None:
