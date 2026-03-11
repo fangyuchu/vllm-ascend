@@ -170,9 +170,7 @@ class WorkerSentinel(BaseSentinel):
         self.clear_input_batch_callback()
         return True
 
-    def descale(self, **kwargs) -> bool:
-        vllm_update_config = kwargs["vllm_config_update_dict"]
-        exclude_ep_ranks = kwargs["exclude_ep_ranks"]
+    def descale(self, vllm_config_update_dict: dict, exclude_ep_ranks: list[int], **kwargs) -> bool:
         NPUPlatform.set_device(self.device)
         torch_npu.npu.restart_device(self.device.index)
         self.clear_input_batch_callback()
@@ -181,7 +179,7 @@ class WorkerSentinel(BaseSentinel):
         for group in comm_groups:
             torch_npu.distributed.reinit_process_group(group.device_group, False)
         torch.npu.synchronize()
-        self.worker.dp_descale(exclude_ep_ranks, vllm_update_config)
+        self.worker.dp_descale(exclude_ep_ranks, vllm_config_update_dict)
         self.worker.execute_dummy_batch()
         return True
 
