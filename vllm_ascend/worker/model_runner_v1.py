@@ -339,7 +339,16 @@ class NPUModelRunner(GPUModelRunner):
             self.policy_type = eplb_config.eplb_policy_type
             self.eplb_loader = D2DExpertWeightLoader()
             self.manager = Manager()
-            self.shared_dict = self.manager.dict({"expert_map": None, "moe_load": None, "expert_maps": None})
+            self.shared_dict = self.manager.dict(
+                {
+                    "expert_map": None,
+                    "moe_load": None,
+                    "expert_maps": None,
+                    "scale": False,
+                    "old_ep_size": None,
+                    "new_ep_size": None,
+                }
+            )
             self.eplb_process = EplbProcess(shared_dict=self.shared_dict, policy_type=self.policy_type, enable_d2d=True)
             self.process = self.eplb_process._launch_process()
             self.eplb_updator = EplbUpdator(eplb_config, self.eplb_loader, self.eplb_process, self.process)
@@ -2476,6 +2485,9 @@ class NPUModelRunner(GPUModelRunner):
         self.max_num_tokens = origin_max_num_tokens
 
     def eplb_warmup(self):
+        if self.dynamic_eplb and self.is_eplb_warmuped:
+            # just warm up EPLB again to synchronize the new rank information
+            self.eplb_adaptor.warm_up_eplb()
         if self.dynamic_eplb and not self.is_eplb_warmuped:
             self.is_eplb_warmuped = True
             self.eplb_adaptor = VllmEplbAdaptor(model=self.model)
@@ -2483,11 +2495,13 @@ class NPUModelRunner(GPUModelRunner):
             self.eplb_updator.set_adaptor(self.eplb_adaptor)
             self.eplb_updator.warm_up_eplb()
 
-    def load_model(self) -> None:
+    def load_model(self, load_dummy_weights: bool = False) -> None:
         logger.info("Starting to load model %s...", self.model_config.model)
 
         with DeviceMemoryProfiler() as m:  # noqa: SIM117
-            self.model = get_model(vllm_config=self.vllm_config)
+            if load_dummy_weights:
+                self.load_config.load_format = "dummy"
+            self.model = get_model(vllm_config=self.vllm_config, load_config=self.load_config)
             if self.dynamic_eplb:
                 model_register(self.model)
             if self.drafter:
