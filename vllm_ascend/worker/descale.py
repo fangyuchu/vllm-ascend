@@ -552,7 +552,6 @@ def update_parallel_config(original_config: VllmConfig, update_config: dict[str,
         "data_parallel_size",
         "data_parallel_size_local",
         "data_parallel_rank",
-        "data_parallel_rank_local",
         "data_parallel_master_port",
     }
     missing_keys = required_keys - set(update_config.keys())
@@ -562,7 +561,6 @@ def update_parallel_config(original_config: VllmConfig, update_config: dict[str,
     original_config.parallel_config.data_parallel_size = update_config["data_parallel_size"]
     original_config.parallel_config.data_parallel_size_local = update_config["data_parallel_size_local"]
     original_config.parallel_config.data_parallel_rank = update_config["data_parallel_rank"]
-    original_config.parallel_config.data_parallel_rank_local = update_config["data_parallel_rank_local"]
     original_config.parallel_config.data_parallel_master_port = update_config["data_parallel_master_port"]
 
 

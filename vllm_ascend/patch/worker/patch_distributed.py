@@ -126,6 +126,7 @@ class GroupCoordinatorPatch(GroupCoordinator):
         self.device = None
         self.use_custom_op_call = True
         self.use_cpu_custom_send_recv = False
+        self.group_type = "normal"
 
         reuse_domain = _resolve_reuse_domain(group_name)
 
