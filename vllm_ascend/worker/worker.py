@@ -174,7 +174,6 @@ class WorkerSentinel(BaseSentinel):
         NPUPlatform.set_device(self.device)
         torch_npu.npu.restart_device(self.device.index)
         self.clear_input_batch_callback()
-        self.pause_event.clear()
         comm_groups = get_all_model_groups()
         for group in comm_groups:
             torch_npu.distributed.reinit_process_group(group.device_group, False)

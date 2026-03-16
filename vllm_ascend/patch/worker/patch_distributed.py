@@ -88,6 +88,7 @@ class GroupCoordinatorPatch(GroupCoordinator):
 
         self.use_custom_op_call = False
         self.use_cpu_custom_send_recv = False
+        self.group_type = "normal"
 
     def all_to_all(
         self,
