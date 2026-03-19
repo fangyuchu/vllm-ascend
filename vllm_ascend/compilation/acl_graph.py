@@ -60,12 +60,14 @@ class ACLGraphWrapper:
     """
 
     _all_instances: ClassVar[weakref.WeakSet["ACLGraphWrapper"]] = weakref.WeakSet()
+    graph_pool = tuple[int, int] = current_platform.get_global_graph_pool()
 
     @classmethod
     def clear_all_graphs(cls) -> None:
         """Clear captured graphs from all ACLGraphWrapper instances."""
         for instance in list(cls._all_instances):
             instance.clear_graphs()
+        cls.graph_pool = (cls.graph_pool[0], cls.graph_pool[1] + 1)
 
     def __init__(
         self,
@@ -85,7 +87,6 @@ class ACLGraphWrapper:
         # assert runtime_mode is not NONE(no aclgraph), otherwise, we don't
         # need to initialize a ACLGraphWrapper.
         assert self.runtime_mode != CUDAGraphMode.NONE
-        self.graph_pool = current_platform.get_global_graph_pool()
 
         if cudagraph_options is None:
             cudagraph_options = CUDAGraphOptions()
@@ -93,6 +94,8 @@ class ACLGraphWrapper:
         # the entries for different batch descriptors that we need to capture
         # aclgraphs for.
         self.concrete_aclgraph_entries: dict[BatchDescriptor, ACLGraphEntry] = {}
+
+        ACLGraphWrapper._all_instances.add(self)
 
     def __getattr__(self, key: str):
         # allow accessing the attributes of the runnable.
@@ -154,7 +157,7 @@ class ACLGraphWrapper:
 
                 # mind-exploding: carefully manage the reference and memory.
                 forward_context.capturing = True
-                with torch.npu.graph(aclgraph, pool=self.graph_pool):
+                with torch.npu.graph(aclgraph, pool=ACLGraphWrapper.graph_pool):
                     # `output` is managed by pytorch's aclgraph pool
                     output = self.runnable(*args, **kwargs)
                     if self.aclgraph_options.weak_ref_output:
