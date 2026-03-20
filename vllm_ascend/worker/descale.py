@@ -614,6 +614,51 @@ def init_elastic_info(
         elastic_info.requires_grad_(False)
         set_elastic_info(elastic_info)
 
+def update_elastic_info_for_same_dpsize_mask(
+        use_mask_mc2: bool,
+        elastic_info: torch.Tensor,
+        expert_num: int,
+        raw_ep_size: int,
+        dp_rank: int,
+        share_expert_num: int = 0,
+    ) -> None:
+    if use_mask_mc2:
+        if dp_rank < raw_ep_size/2:
+            print(f"[lhc] [debug] dp_rank {dp_rank} is in the first half, keeping ep_ranks [{0}, {raw_ep_size//2})")
+            valid_ep_ranks = list(range(raw_ep_size//2))
+        else:
+            print(f"[lhc] [debug] dp_rank {dp_rank} is in the second half, keeping ep_ranks [{raw_ep_size//2}, {raw_ep_size})")
+            valid_ep_ranks = list(range(raw_ep_size//2, raw_ep_size))
+        descale_ep_size = len(valid_ep_ranks)
+        is_descale = 1 if descale_ep_size < raw_ep_size else 0
+
+        # Table1: epRankID -> localEpRankId(-1 indicates invalid）
+        table1 = torch.full((raw_ep_size,), -1, dtype=torch.int32, device="cpu")
+        for local_ep_rank, ep_rank in enumerate(valid_ep_ranks):
+            table1[ep_rank] = local_ep_rank
+
+        # Table2: localEpRankId -> epRankID(-1 indicates padding）
+        table2 = torch.full((raw_ep_size,), -1, dtype=torch.int32, device="cpu")
+        for local_ep_rank, ep_rank in enumerate(valid_ep_ranks):
+            if local_ep_rank < descale_ep_size:
+                table2[local_ep_rank] = ep_rank
+
+        # update elastic_info
+        elastic_info[0] = is_descale
+        elastic_info[1] = descale_ep_size
+        elastic_info[2] = share_expert_num
+        elastic_info[3] = expert_num/2
+        # update Table1
+        table1_start = 4
+        elastic_info[table1_start : table1_start + raw_ep_size] = table1
+        # update Table2
+        table2_start = table1_start + raw_ep_size
+        elastic_info[table2_start : table2_start + raw_ep_size] = table2
+        set_elastic_info(elastic_info)
+    else:
+        set_elastic_info(None)
+
+
 
 def update_elastic_info(
     use_mask_mc2: bool,

@@ -91,6 +91,7 @@ from vllm_ascend.worker.descale import (
     update_elastic_info,
     update_ep2dp_map,
     update_parallel_config,
+    update_elastic_info_for_same_dpsize_mask,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
@@ -180,6 +181,12 @@ class WorkerSentinel(BaseSentinel):
         torch.npu.synchronize()
         self.worker.dp_descale(exclude_ep_ranks, vllm_config_update_dict)
         self.worker.execute_dummy_batch()
+        return True
+    
+    def recover_raw_elastic_info(self, **kwargs) -> bool:
+        from vllm_ascend.distributed.parallel_state import set_elastic_info
+        set_elastic_info(self.raw_elastic_info)
+        logger.info("[lhc] [debug] recover_raw_elastic_info set elastic_info to %s", self.raw_elastic_info)
         return True
 
 
@@ -302,6 +309,13 @@ class NPUWorker(WorkerBase):
             self.log2phy = gen_local_log2phy_map(self.global_log2phy_map)
             self.backup_expert_rank_mapping = {}
             init_elastic_info(self.use_mask_mc2, ep_size, (self.num_logical_expert + num_redundancy_expert))
+            elastic_info = get_elastic_info()
+            self.raw_elastic_info = copy.deepcopy(elastic_info)
+            logger.info("[lhc] [debug] init elastic_info: %s", elastic_info)
+            update_elastic_info_for_same_dpsize_mask(self.use_mask_mc2, elastic_info,
+            (self.num_logical_expert + num_redundancy_expert), len(self.ep2dp_map), 
+            self.vllm_config.parallel_config.data_parallel_rank)
+            logger.info("[lhc] [debug] after update_elastic_info_for_same_dpsize_mask elastic_info: %s", elastic_info)
 
     def dp_descale(self, exclude_ep_ranks: list[int], vllm_update_config):
         """
