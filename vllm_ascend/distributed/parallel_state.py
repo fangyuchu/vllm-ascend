@@ -270,6 +270,26 @@ def init_ascend_model_parallel(
             )
 
 
+def _replace_ascend_active_groups(
+    *,
+    mc2: GroupCoordinator | None,
+    dynamic_eplb: GroupCoordinator | None,
+    fc3_quant_x: GroupCoordinator | None,
+) -> None:
+    """Destroy the current DP/EP/WORLD/EPLB groups and replace them.
+
+    Destruction is collective — all ranks in the old groups must call this
+    function together.  Pass all-``None`` to tear down without replacement.
+    """
+    global _MC2, _DYNAMIC_EPLB, _FC3_QUANT_X
+    for group in (_MC2, _DYNAMIC_EPLB, _FC3_QUANT_X):
+        if group is not None:
+            group.destroy()
+    _MC2 = mc2
+    _DYNAMIC_EPLB = dynamic_eplb
+    _FC3_QUANT_X = fc3_quant_x
+
+
 def model_parallel_initialized():
     return _MC2 is not None
 

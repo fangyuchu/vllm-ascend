@@ -29,11 +29,11 @@ from vllm_ascend.eplb.core.eplb_worker import EplbProcess
 class EplbUpdator:
     def __init__(self, eplb_config, loader: D2DExpertWeightLoader, eplb_process: EplbProcess, process):
         self.eplb_config = eplb_config
+        self.comm_group = get_dynamic_eplb_group()
         self.init_eplb(self.eplb_config.expert_map_path, process)
         self.eplb_loader = loader
         self.eplb_process = eplb_process
         self.shared_dict = self.eplb_process.shared_dict
-        self.comm_group = get_dynamic_eplb_group()
 
     def set_adaptor(self, adaptor: VllmEplbAdaptor):
         self.adaptor = adaptor
