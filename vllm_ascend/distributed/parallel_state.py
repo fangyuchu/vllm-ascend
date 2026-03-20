@@ -44,7 +44,7 @@ def init_ascend_model_parallel(
     global_dp_size = parallel_config.data_parallel_size
     global_pp_size = parallel_config.pipeline_parallel_size
     if enable_elastic_ep:
-        world_size = get_world_group.world_size
+        world_size = get_world_group().world_size
         tp_pp_pcp_size = global_tp_size * global_pp_size * parallel_config.prefill_context_parallel_size
         local_all_ranks = torch.arange(tp_pp_pcp_size).reshape(
             global_pp_size, parallel_config.prefill_context_parallel_size, global_tp_size

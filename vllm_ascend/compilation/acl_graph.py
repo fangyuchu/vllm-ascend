@@ -60,7 +60,7 @@ class ACLGraphWrapper:
     """
 
     _all_instances: ClassVar[weakref.WeakSet["ACLGraphWrapper"]] = weakref.WeakSet()
-    graph_pool = tuple[int, int] = current_platform.get_global_graph_pool()
+    graph_pool = ClassVar[tuple[int, int]] = current_platform.get_global_graph_pool()
 
     @classmethod
     def clear_all_graphs(cls) -> None:

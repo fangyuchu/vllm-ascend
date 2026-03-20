@@ -55,8 +55,8 @@ def create_ascend_standby_groups(
         backend,
     )
 
-    dynamic_eplb_ports = [group_ports["dynamic_eplb"].pop() for _ in standby_ep_ranks]
     if get_ascend_config().eplb_config.dynamic_eplb:
+        dynamic_eplb_ports = [group_ports["dynamic_eplb"].pop() for _ in standby_ep_ranks]
         _STANDBY_DYNAMIC_EPLB = _init_stateless_group(
             standby_ep_ranks,
             "dynamic_eplb",
@@ -69,7 +69,7 @@ def create_ascend_standby_groups(
         fc3_quant_x_ports = [group_ports["fc3_quant_x"].pop() for _ in standby_ep_ranks]
         _STANDBY_FC3_QUANT_X = _init_stateless_group(
             standby_ep_ranks,
-            "fc3_quantx",
+            "fc3_quant_x",
             fc3_quant_x_ports,
             master_ip,
             backend,

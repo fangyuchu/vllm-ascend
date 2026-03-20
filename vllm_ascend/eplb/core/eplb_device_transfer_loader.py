@@ -59,7 +59,7 @@ class D2DExpertWeightLoader:
 
         for buffer_tensor_id, recv_info in enumerate(expert_recv_info):
             recv_rank, global_expert_id_to_recv = recv_info
-            op_info = {"peer_rank": recv_rank, "tensors": [], "expert_id": global_expert_id_to_recv, "op": "send"}
+            op_info = {"peer_rank": recv_rank, "tensors": [], "expert_id": global_expert_id_to_recv, "op": "recv"}
             for buffer_tensor in self.eplb_adaptor.buffer_tensor_list[buffer_tensor_id]:
                 op_info["tensors"].append(buffer_tensor)
             self.comm_op_list.append(op_info)
@@ -87,9 +87,9 @@ class D2DExpertWeightLoader:
                 op = op_info["op"]
                 for i, tensor in enumerate(tensors):
                     if op == "send":
-                        worker = get_ep_group().device_group.send([tensor], peer_rank, tag=expert_id * (i + 1))
+                        worker = get_ep_group().device_group.send([tensor], peer_rank, tag=(expert_id + 1) * (i + 1))
                     else:
-                        worker = get_ep_group().device_group.recv([tensor], peer_rank, tag=expert_id * (i + 1))
+                        worker = get_ep_group().device_group.recv([tensor], peer_rank, tag=(expert_id + 1) * (i + 1))
                     reqs.append(worker)
 
         self.state = ExpertWeightUpdateState.TRANSFERRING
