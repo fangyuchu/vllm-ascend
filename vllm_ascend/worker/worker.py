@@ -430,6 +430,7 @@ class NPUWorker(WorkerBase):
             elastic_info = get_elastic_info()
             num_new_phy_experts = sum(map(len, redistributed_experts.values()))
             update_elastic_info(self.use_mask_mc2, elastic_info, num_new_phy_experts, old_ep_size, self.ep2dp_map)
+            logger.info("[lhc] [debug] after update_elastic_info elastic_info: %s", elastic_info)
             self.log2phy.copy_(gen_local_log2phy_map(self.global_log2phy_map))
             # reinit comm_group
             with set_current_vllm_config(self.vllm_config):
