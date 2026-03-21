@@ -623,12 +623,15 @@ def update_elastic_info_for_same_dpsize_mask(
         share_expert_num: int = 0,
     ) -> None:
     if use_mask_mc2:
-        if dp_rank < raw_ep_size/2:
-            print(f"[lhc] [debug] dp_rank {dp_rank} is in the first half, keeping ep_ranks [{0}, {raw_ep_size//2})")
-            valid_ep_ranks = list(range(raw_ep_size//2))
-        else:
-            print(f"[lhc] [debug] dp_rank {dp_rank} is in the second half, keeping ep_ranks [{raw_ep_size//2}, {raw_ep_size})")
-            valid_ep_ranks = list(range(raw_ep_size//2, raw_ep_size))
+        # if dp_rank < raw_ep_size/2:
+        #     print(f"[lhc] [debug] dp_rank {dp_rank} is in the first half, keeping ep_ranks [{0}, {raw_ep_size//2})")
+        #     valid_ep_ranks = list(range(raw_ep_size//2))
+        # else:
+        #     print(f"[lhc] [debug] dp_rank {dp_rank} is in the second half, keeping ep_ranks [{raw_ep_size//2}, {raw_ep_size})")
+        #     valid_ep_ranks = list(range(raw_ep_size//2, raw_ep_size))
+
+        print(f"[lhc] [debug] in the first half, keeping ep_ranks [{0}, {raw_ep_size//2})")
+        valid_ep_ranks = list(range(raw_ep_size//2))
         descale_ep_size = len(valid_ep_ranks)
         is_descale = 1 if descale_ep_size < raw_ep_size else 0
 
