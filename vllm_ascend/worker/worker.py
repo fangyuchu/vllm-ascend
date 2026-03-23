@@ -320,8 +320,11 @@ class NPUWorker(WorkerBase):
         self.raw_global_log2phy_map =  copy.deepcopy(self.global_log2phy_map)
         self.raw_log2phy = copy.deepcopy(self.log2phy)
 
-    def dp_descale_for_the_first_half_dp(self):
-        exclude_ep_ranks = list(range(len(self.ep2dp_map)//2, len(self.ep2dp_map)))
+    def dp_descale_for_the_half_dp(self):
+        if self.vllm_config.parallel_config.data_parallel_rank < self.vllm_config.parallel_config.data_parallel_size // 2:
+            exclude_ep_ranks = list(range(len(self.ep2dp_map)//2, len(self.ep2dp_map)))
+        else:
+            exclude_ep_ranks = list(range(0, len(self.ep2dp_map)//2))
 
         self.global_log2phy_map, redistributed_experts, added_experts, replaced_redundant_experts, self.use_mask_mc2 = (
             get_expert_distribution_after_descale(
