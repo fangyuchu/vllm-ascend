@@ -308,54 +308,53 @@ class NPUWorker(WorkerBase):
 
         destroy_comm_group(self.use_mask_mc2)
 
-        if rank not in exclude_ep_ranks:
-            # reload fault expert weights
-            self.experts_saved_ids, self.experts_saved_weights = save_expert_weights_to_ram(
-                expert_ids_to_save,
-                self.experts_saved_ids,
-                self.experts_saved_weights,
-                self.vllm_config,
-                self.model_runner,
-                self.quant,
-            )
-            expand_expert_weights(self.model_runner, added_experts, self.quant, old_rank)
-            self.global_experts_distribution = reload_fault_expert_weights(
-                self.model_runner,
-                self.global_experts_distribution,
-                self.experts_saved_weights,
-                redistributed_experts,
-                added_experts,
-                replaced_redundant_experts,
-                self.quant,
-                old_rank,
-            )
-            old_ep_size = len(self.ep2dp_map)
-            # update parallel config
-            # TODO: When a current vLLM config instance is available (via get_current_vllm_config),
-            #       its parallel configuration should also be updated using vllm_update_config.
-            update_parallel_config(self.vllm_config, vllm_update_config)
-            self.model_runner.dp_size = self.vllm_config.parallel_config.data_parallel_size
-            self.model_runner.dp_rank = self.vllm_config.parallel_config.data_parallel_rank
-            self.ep2dp_map = update_ep2dp_map(self.ep2dp_map, exclude_ep_ranks, rank_mapping)
-            elastic_info = get_elastic_info()
-            num_new_phy_experts = sum(map(len, redistributed_experts.values()))
-            update_elastic_info(self.use_mask_mc2, elastic_info, num_new_phy_experts, old_ep_size, self.ep2dp_map)
-            self.log2phy.copy_(gen_local_log2phy_map(self.global_log2phy_map))
-            # reinit comm_group
-            with set_current_vllm_config(self.vllm_config):
-                reinit_comm_group(self.use_mask_mc2, self.vllm_config, self)
-            # update AscendFusedMoE
-            reconfigure_moe(
-                self.use_mask_mc2,
-                self.model_runner,
-                self.vllm_config,
-                num_logical_expert,
-                num_new_phy_experts,
-                self.log2phy,
-            )
-            # rebuild acl_graph
-            if not self.model_config.enforce_eager:
-                rebuild_acl_graph(self.use_mask_mc2, self)
+        # reload fault expert weights
+        self.experts_saved_ids, self.experts_saved_weights = save_expert_weights_to_ram(
+            expert_ids_to_save,
+            self.experts_saved_ids,
+            self.experts_saved_weights,
+            self.vllm_config,
+            self.model_runner,
+            self.quant,
+        )
+        expand_expert_weights(self.model_runner, added_experts, self.quant, old_rank)
+        self.global_experts_distribution = reload_fault_expert_weights(
+            self.model_runner,
+            self.global_experts_distribution,
+            self.experts_saved_weights,
+            redistributed_experts,
+            added_experts,
+            replaced_redundant_experts,
+            self.quant,
+            old_rank,
+        )
+        old_ep_size = len(self.ep2dp_map)
+        # update parallel config
+        # TODO: When a current vLLM config instance is available (via get_current_vllm_config),
+        #       its parallel configuration should also be updated using vllm_update_config.
+        update_parallel_config(self.vllm_config, vllm_update_config)
+        self.model_runner.dp_size = self.vllm_config.parallel_config.data_parallel_size
+        self.model_runner.dp_rank = self.vllm_config.parallel_config.data_parallel_rank
+        self.ep2dp_map = update_ep2dp_map(self.ep2dp_map, exclude_ep_ranks, rank_mapping)
+        elastic_info = get_elastic_info()
+        num_new_phy_experts = sum(map(len, redistributed_experts.values()))
+        update_elastic_info(self.use_mask_mc2, elastic_info, num_new_phy_experts, old_ep_size, self.ep2dp_map)
+        self.log2phy.copy_(gen_local_log2phy_map(self.global_log2phy_map))
+        # reinit comm_group
+        with set_current_vllm_config(self.vllm_config):
+            reinit_comm_group(self.use_mask_mc2, self.vllm_config, self)
+        # update AscendFusedMoE
+        reconfigure_moe(
+            self.use_mask_mc2,
+            self.model_runner,
+            self.vllm_config,
+            num_logical_expert,
+            num_new_phy_experts,
+            self.log2phy,
+        )
+        # rebuild acl_graph
+        if not self.model_config.enforce_eager:
+            rebuild_acl_graph(self.use_mask_mc2, self)
 
     def init_dp_device_group(self,vllm_config: VllmConfig) -> None:
         # TODO: Temporarily hardcode the port value for debugging. Will replace with get_open_port().
