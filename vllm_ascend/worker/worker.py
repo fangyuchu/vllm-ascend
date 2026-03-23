@@ -309,13 +309,59 @@ class NPUWorker(WorkerBase):
             self.log2phy = gen_local_log2phy_map(self.global_log2phy_map)
             self.backup_expert_rank_mapping = {}
             init_elastic_info(self.use_mask_mc2, ep_size, (self.num_logical_expert + num_redundancy_expert))
+            self.backup_raw_data()
+            self.dp_descale_for_the_first_half_dp()
             elastic_info = get_elastic_info()
-            self.raw_elastic_info = copy.deepcopy(elastic_info)
-            logger.info("[lhc] [debug] init elastic_info: %s", elastic_info)
-            update_elastic_info_for_same_dpsize_mask(self.use_mask_mc2, elastic_info,
-            (self.num_logical_expert + num_redundancy_expert), len(self.ep2dp_map), 
+            logger.info("[lhc] [debug] after dp_descale_for_the_first_half_dp elastic_info: %s", elastic_info)
+            
+
+    def backup_raw_data(self):
+        elastic_info = get_elastic_info()
+        self.raw_elastic_info = copy.deepcopy(elastic_info)
+        logger.info("[lhc] [debug] init elastic_info: %s", elastic_info)
+
+        self.raw_global_log2phy_map =  copy.deepcopy(self.global_log2phy_map)
+        self.raw_log2phy = copy.deepcopy(self.log2phy)
+
+    def dp_descale_for_the_first_half_dp(self):
+        exclude_ep_ranks = list(range(len(self.ep2dp_map)//2, len(self.ep2dp_map)))
+
+        self.global_log2phy_map, redistributed_experts, added_experts, replaced_redundant_experts, self.use_mask_mc2 = (
+            get_expert_distribution_after_descale(
+                exclude_ep_ranks,
+                self.global_experts_distribution,
+                self.global_log2phy_map,
+                self.backup_expert_rank_mapping,
+                self.use_mask_mc2,
+            )
+        )
+        self.log2phy.copy_(gen_local_log2phy_map(self.global_log2phy_map))
+
+        if hasattr(self.vllm_config.model_config.hf_config, "num_experts"):
+            num_logical_expert = self.vllm_config.model_config.hf_config.num_experts
+        elif hasattr(self.vllm_config.model_config.hf_config, "n_routed_experts"):
+            num_logical_expert = self.vllm_config.model_config.hf_config.n_routed_experts
+        else:
+            raise ValueError("unknown number of experts")
+        
+        num_new_phy_experts = sum(map(len, redistributed_experts.values()))
+        logger.info("[lhc] [debug] after dp_descale_for_the_first_half_dp num_new_phy_experts: %s", num_new_phy_experts)
+
+        elastic_info = get_elastic_info()
+        update_elastic_info_for_same_dpsize_mask(self.use_mask_mc2, elastic_info,
+            num_new_phy_experts, len(self.ep2dp_map), 
             self.vllm_config.parallel_config.data_parallel_rank)
-            logger.info("[lhc] [debug] after update_elastic_info_for_same_dpsize_mask elastic_info: %s", elastic_info)
+
+        # update AscendFusedMoE
+        reconfigure_moe(
+            self.use_mask_mc2,
+            self.model_runner,
+            self.vllm_config,
+            num_logical_expert,
+            num_new_phy_experts,
+            self.log2phy,
+        )
+
 
     def dp_descale(self, exclude_ep_ranks: list[int], vllm_update_config):
         """

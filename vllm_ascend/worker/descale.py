@@ -650,7 +650,7 @@ def update_elastic_info_for_same_dpsize_mask(
         elastic_info[0] = is_descale
         elastic_info[1] = descale_ep_size
         elastic_info[2] = share_expert_num
-        elastic_info[3] = expert_num/2
+        elastic_info[3] = expert_num
         # update Table1
         table1_start = 4
         elastic_info[table1_start : table1_start + raw_ep_size] = table1
