@@ -310,9 +310,6 @@ class NPUWorker(WorkerBase):
             self.backup_expert_rank_mapping = {}
             init_elastic_info(self.use_mask_mc2, ep_size, (self.num_logical_expert + num_redundancy_expert))
             self.backup_raw_data()
-            self.dp_descale_for_the_first_half_dp()
-            elastic_info = get_elastic_info()
-            logger.info("[lhc] [debug] after dp_descale_for_the_first_half_dp elastic_info: %s", elastic_info)
             
 
     def backup_raw_data(self):
@@ -351,6 +348,8 @@ class NPUWorker(WorkerBase):
         update_elastic_info_for_same_dpsize_mask(self.use_mask_mc2, elastic_info,
             num_new_phy_experts, len(self.ep2dp_map), 
             self.vllm_config.parallel_config.data_parallel_rank)
+        elastic_info = get_elastic_info()
+        logger.info("[lhc] [debug] after dp_descale_for_the_first_half_dp elastic_info: %s", elastic_info)
 
         # update AscendFusedMoE
         reconfigure_moe(
