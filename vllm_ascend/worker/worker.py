@@ -183,10 +183,25 @@ class WorkerSentinel(BaseSentinel):
         self.worker.execute_dummy_batch()
         return True
     
-    def recover_raw_elastic_info(self, **kwargs) -> bool:
+    def recover_raw_data(self, **kwargs) -> bool:
         from vllm_ascend.distributed.parallel_state import set_elastic_info
-        set_elastic_info(self.raw_elastic_info)
-        logger.info("[lhc] [debug] recover_raw_elastic_info set elastic_info to %s", self.raw_elastic_info)
+        set_elastic_info(self.worker.raw_elastic_info)
+        logger.info("[lhc] [debug] recover_raw_elastic_info set elastic_info to %s", self.worker.raw_elastic_info)
+        self.worker.global_log2phy_map = copy.deepcopy(self.worker.raw_global_log2phy_map)
+        self.worker.log2phy = copy.deepcopy(self.worker.raw_log2phy)
+
+        additional_config = self.worker.vllm_config.additional_config or {}
+        eplb_cfg = additional_config.get("eplb_config", {})
+        num_redundancy_expert = eplb_cfg.get("num_redundant_experts")
+        # update AscendFusedMoE
+        reconfigure_moe(
+            self.worker.use_mask_mc2,
+            self.worker.model_runner,
+            self.worker.vllm_config,
+            self.worker.num_logical_expert,
+            self.worker.num_logical_expert + num_redundancy_expert,
+            self.worker.log2phy,
+        )
         return True
 
 
