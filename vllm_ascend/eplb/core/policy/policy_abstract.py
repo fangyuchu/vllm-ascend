@@ -15,6 +15,9 @@ class EplbPolicy:
     def __init__(self, config: DynamicConfig):
         self.config = config
 
+    def set_new_ep_size(self, new_ep_size):
+        pass
+
     @abstractmethod
     def rebalance_experts(self, current_expert_table, expert_workload):
         """
