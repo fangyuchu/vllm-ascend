@@ -60,7 +60,7 @@ def init_eplb_config(eplb_config, layer_id, moe_config):
     ep_size = moe_config.ep_size
     global_placement = None
     eplb_enable = eplb_config.dynamic_eplb
-    n_redundant = eplb_config.num_redundant_experts if eplb_enable else 0
+    n_redundant = eplb_config.num_redundant_experts
 
     if ep_size == 1:
         assert not eplb_enable, "EPLB must used in expert parallelism."
@@ -75,11 +75,6 @@ def init_eplb_config(eplb_config, layer_id, moe_config):
             n_redundant = physical_count - n_experts
             if not moe_config.supports_eplb:
                 raise ValueError("Eplb supports only w8a8_dynamic quantization.")
-        else:
-            eplb_enable = False
-    elif not eplb_enable:
-        _, expert_map, _ = determine_expert_map(ep_size, moe_config.ep_rank, n_experts)
-        return None, expert_map, None, 0
 
     if global_placement is None:
         global_placement = generate_global_placement(n_experts, ep_size, n_redundant)
@@ -92,7 +87,7 @@ def init_eplb_config(eplb_config, layer_id, moe_config):
         global_expert_map.append(expert_map)
         if rankid == moe_config.ep_rank:
             local_expert_map = expert_map
-    log2phy = generate_log2phy_map(global_expert_map, moe_config.ep_rank).npu() if eplb_enable else None
+    log2phy = generate_log2phy_map(global_expert_map, moe_config.ep_rank).npu()
 
     return torch.stack(global_expert_map), local_expert_map, log2phy, n_redundant
 

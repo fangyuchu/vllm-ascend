@@ -6,6 +6,8 @@ from datetime import timedelta
 from typing import TYPE_CHECKING
 
 import torch
+import numpy as np
+import torch_npu
 from torch.distributed.distributed_c10d import _set_pg_timeout
 from vllm.compilation.wrapper import reset_compile_wrapper
 from vllm.config import VllmConfig, set_current_vllm_config
@@ -22,8 +24,8 @@ from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig, FusedMoE
 from vllm.model_executor.model_loader import get_model_loader
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.distributed.parallel_state import destroy_ascend_model_parallel, get_mc2_group, set_elastic_info
-from vllm_ascend.eplb.core.eplb_utils import init_eplb_config
+from vllm_ascend.distributed.parallel_state import destroy_ascend_model_parallel, get_mc2_group, set_elastic_info, get_dynamic_eplb_group
+from vllm_ascend.eplb.core.eplb_utils import init_eplb_config, generate_log2phy_map
 from vllm_ascend.ops.fused_moe.fused_moe import setup_moe_comm_method
 
 if TYPE_CHECKING:
@@ -163,117 +165,28 @@ def generate_redundant_expert_ids(num_experts: int, ep_size: int, num_redundant_
 
 
 def get_expert_distribution_after_descale(
-    excluded_dp_ranks: list[int],
-    old_expert_distribution: dict[int, list[int]],
-    global_log2phy_map: dict[int, list[int]],
-    backup_expert_rank_mapping,
-    use_mask_mc2,
-) -> tuple[
-    dict[int, list[int]], dict[int, list[int]], dict[int, list[int]], dict[int, dict[int, tuple[int, int]]], bool
-]:
-    expert_distribution = copy.deepcopy(old_expert_distribution)
-    num_experts_per_rank = len(expert_distribution[0])
-    health_ranks = [r for r in range(len(expert_distribution)) if r not in excluded_dp_ranks]
-    if not health_ranks:
-        raise RuntimeError("All DP ranks are faulty")
-    for rank in excluded_dp_ranks:
-        expert_distribution.pop(rank)
+        model_runner,
+        exclued_dp_ranks,
+        enable_d2d_after_failure,
+        rank_id,
+):
+    eplb_updator = model_runner.eplb_updator
+    model_runner.shared_dict["descale"] = True
+    model_runner.shared_dict["enable_d2d_after_failure"] = enable_d2d_after_failure
+    model_runner.shared_dict["excluded_dp_ranks"] = exclued_dp_ranks
+    if model_runner.shared_dict["expert_maps"] is None:
+        model_runner.shared_dict["expert_maps"] = get_global_expert_map(model_runner)
 
-    added_experts: dict[int, list[int]] = {r: [] for r in health_ranks}
-    replaced_redundant_experts: dict[int, dict[int, tuple[int, int]]] = defaultdict(dict)
-    rank_load: dict[int, float] = {r: 0.0 for r in health_ranks}
+    eplb_updator.wakeup_eplb_worker()
+    eplb_updator.update_info_all = eplb_updator.eplb_process.block_update_q.get()
+    need_load_h2d = model_runner.shared_dict["need_load_h2d"]
 
-    # ======= 1: Remove failed physical experts & identify lost logical experts
-    failed_logical_experts: set[int] = set()
-    for rank in excluded_dp_ranks:
-        global_offset = rank * num_experts_per_rank
-        for local_idx, expert_id in enumerate(old_expert_distribution[rank]):
-            global_pos = global_offset + local_idx
-            assert global_pos in global_log2phy_map[expert_id], (
-                f"physical position {global_pos} missing from global_log2phy_map[{expert_id}]"
-            )
-            global_log2phy_map[expert_id].remove(global_pos)
-            if not global_log2phy_map[expert_id]:
-                failed_logical_experts.add(expert_id)
-    failed_logical_experts = sorted(failed_logical_experts)
+    cur_rank_need_load_h2d = []
+    for layer_id in range(len(need_load_h2d)):
+        cur_rank_need_load = need_load_h2d[layer_id][rank_id].cpoy()
+        cur_rank_need_load_h2d.append(cur_rank_need_load)
 
-    # ======= 2: collect all available redundant expert slots
-
-    # {rank: [(redundant_expert_id, local_slot_idx)]}
-    redundant_slots: dict[int, list[tuple[int, int]]] = defaultdict(list)
-
-    for expert_id, phy_positions in global_log2phy_map.items():
-        if len(phy_positions) <= 1:
-            continue
-        for global_pos in phy_positions[1:]:
-            rank = global_pos // num_experts_per_rank
-            if rank in excluded_dp_ranks:
-                continue
-            local_idx = global_pos - rank * num_experts_per_rank
-            redundant_slots[rank].append((expert_id, local_idx))
-
-    total_redundant_slots = sum(len(v) for v in redundant_slots.values())
-
-    # ======= 3: add extra redundant slots if necessary
-
-    if total_redundant_slots < len(failed_logical_experts):
-        use_mask_mc2 = False
-        extra_needed = len(failed_logical_experts) - total_redundant_slots
-        slots_per_rank = math.ceil(extra_needed / len(health_ranks))
-        for rank in health_ranks:
-            backup_experts = [eid for eid, r in backup_expert_rank_mapping.items() if r == rank]
-            slot_gap = slots_per_rank
-            assert backup_experts, "backup_experts is empty, will cause infinite loop!"
-            while slot_gap > 0:
-                assert slot_gap > 0, "slot_gap should be positive in loop!"
-                assert backup_experts, "backup_experts became empty during loop!"
-                assert len(backup_experts) >= slot_gap, (
-                    f"Insufficient backup experts! Need {slot_gap}, but only {len(backup_experts)} left (rank={rank})"
-                )
-                for eid in backup_experts[:slot_gap]:
-                    expert_distribution[rank].append(eid)
-                    added_experts[rank].append(eid)
-                    redundant_slots[rank].append((eid, len(expert_distribution[rank]) - 1))
-                    slot_gap -= 1
-
-    # ======== 4: restore lost logical experts
-
-    remaining_lost = []
-
-    # restore on backup rank(RAM load)
-    for expert_id in failed_logical_experts:
-        backup_rank = backup_expert_rank_mapping.get(expert_id)
-        if backup_rank is not None and backup_rank in health_ranks and redundant_slots[backup_rank]:
-            redundant_id, slot_idx = redundant_slots[backup_rank].pop()
-            expert_distribution[backup_rank][slot_idx] = expert_id
-            replaced_redundant_experts[backup_rank][redundant_id] = (slot_idx, expert_id)
-            rank_load[backup_rank] += 0.5
-        else:
-            remaining_lost.append(expert_id)
-
-    # restore on least-loaded rank (disk load)
-    for expert_id in remaining_lost:
-        target_rank = min(rank_load, key=rank_load.get)
-        while len(redundant_slots[target_rank]) == 0:
-            rank_load[target_rank] = float("inf")
-            target_rank = min(rank_load, key=rank_load.get)
-        redundant_id, slot_idx = redundant_slots[target_rank].pop()
-        expert_distribution[target_rank][slot_idx] = expert_id
-        replaced_redundant_experts[target_rank][redundant_id] = (slot_idx, expert_id)
-        rank_load[target_rank] += 1.0
-
-    # ======== 5: rebuild global logical to physical mapping
-
-    new_global_log2phy_map = defaultdict(list)
-    flat_distribution = []
-    for rank in sorted(expert_distribution):
-        flat_distribution.extend(expert_distribution[rank])
-
-    for phy_idx, expert_id in enumerate(flat_distribution):
-        new_global_log2phy_map[expert_id].append(phy_idx)
-
-    return new_global_log2phy_map, expert_distribution, added_experts, replaced_redundant_experts, use_mask_mc2
-
+    return cur_rank_need_load_h2d
 
 def destroy_acl_graph(use_mask_mc2: bool, vllm_config: VllmConfig, model: NPUModelRunner) -> VllmConfig:
     if not use_mask_mc2:
@@ -299,12 +212,25 @@ def rebuild_acl_graph(use_mask_mc2: bool, worker: NPUWorker) -> None:
 def destroy_comm_group(use_mask_mc2: bool) -> None:
     if use_mask_mc2:
         get_dp_group().destroy_cpu_group()
+        if get_ascend_config().eplb_config.dynamic_eplb:
+            get_dynamic_eplb_group().destroy_cpu_group()
     else:
         destroy_ascend_model_parallel()
         cleanup_dist_env_and_memory()
 
 
 def init_dp_cpu_group(vllm_config: VllmConfig, group_type="normal") -> None:
+    if get_ascend_config().eplb_config.dynamic_eplb:
+        get_dynamic_eplb_group().cpu_group = stateless_init_torch_distributed_process_group(
+            vllm_config.parallel_config.data_parallel_master_ip,
+            vllm_config.parallel_config.data_parallel_master_port + 200,
+            vllm_config.parallel_config.data_parallel_rank,
+            vllm_config.parallel_config.data_parallel_size,
+            backend="gloo",
+            fault_tolerance_config = vllm_config.fault_tolerance_config,
+        )
+        get_dynamic_eplb_group().group_type = group_type
+
     # TODO: Temporarily hardcode the port value for debugging. Will replace with get_open_port().
     get_dp_group().cpu_group = stateless_init_torch_distributed_process_group(
         vllm_config.parallel_config.data_parallel_master_ip,
@@ -327,32 +253,23 @@ def reinit_comm_group(use_mask_mc2: bool, vllm_config: VllmConfig, worker: NPUWo
 
 
 def save_expert_weights_to_ram(
-    experts_id_to_save: list[int],
-    experts_saved_ids: list[int],
-    experts_saved_weights: dict[str, torch.Tensor],
-    vllm_config: VllmConfig,
-    model_runner: NPUModelRunner,
-    quant: bool | str = False,
-) -> tuple[list[int], dict[str, torch.Tensor]]:
+        cur_rank_need_load_h2d,
+        vllm_config,
+        model_runner,
+        quant,
+) -> dict[str, torch.Tensor]:
     """
     Load the specified unsaved expert weights and save them to memory (RAM)
 
     Args:
-        experts_id_to_save: List of expert IDs that need to be saved
-        experts_saved_ids: List of already saved expert IDs (will be updated within the function)
-        experts_saved_weights: Dictionary storing the weights of saved experts (will be updated within the function)
+        cur_rank_need_load_h2d: Experts to be loaded from SSD
         vllm_config: VLLM configuration object
         model_runner: NPU model runner
         quant: Whether it is a quantized model (affects the suffix of weight names)
 
     Returns:
-        tuple: (Updated list of saved expert IDs, Updated dictionary of saved expert weights)
+        updated dictionary of saved expert weights
     """
-    saved_ids_set = set(experts_saved_ids)
-    unsaved_expert_ids = list({eid for eid in experts_id_to_save if eid not in saved_ids_set})
-
-    if not unsaved_expert_ids:
-        return experts_saved_ids, experts_saved_weights
 
     BASE_WEIGHT_SUFFIXES = {"down_proj.weight", "up_proj.weight", "gate_proj.weight"}
     QUANT_WEIGHT_SUFFIXES = {
@@ -365,31 +282,32 @@ def save_expert_weights_to_ram(
     }
 
     weight_suffixes = BASE_WEIGHT_SUFFIXES.union(QUANT_WEIGHT_SUFFIXES) if quant else BASE_WEIGHT_SUFFIXES
-    num_hidden_layers = vllm_config.model_config.hf_config.num_hidden_layers
 
     def _generate_expert_weight_name(layer_id: int, expert_id: int, suffix: str) -> str:
         """Generate the full parameter name for a single expert weight."""
         return f"model.layers.{layer_id}.mlp.experts.{expert_id}.{suffix}"
 
+    num_dense_layers = getattr(model_runner.model.config, "first_k_dense_replace", 0)
     weights_to_save = set()
-    for expert_id in unsaved_expert_ids:
-        for layer_id in range(num_hidden_layers):
-            for suffix in weight_suffixes:
-                weights_to_save.add(_generate_expert_weight_name(layer_id, expert_id, suffix))
+    for index, cur_layer_need_load_h2d in enumerate(cur_rank_need_load_h2d):
+        layer_id = index + num_dense_layers
+        if cur_layer_need_load_h2d:
+            for pos, expert_id in cur_layer_need_load_h2d:
+                for suffix in weight_suffixes:
+                    weights_to_save.add(_generate_expert_weight_name(layer_id, expert_id, suffix))
 
     model_loader = get_model_loader(vllm_config.load_config)
     all_weight_iter = model_loader.get_all_weights(vllm_config.model_config, model_runner.model)
 
+    saved_expert_weights = {}
     for weight_name, weight_tensor in all_weight_iter:
         if weight_name in weights_to_save:
             weight_tensor = weight_tensor.transpose(0, 1).contiguous()
             if any(weight_name.endswith(suffix) for suffix in QUANT_WEIGHT_SUFFIXES):
                 weight_tensor = torch.squeeze(weight_tensor)
-            experts_saved_weights[weight_name] = weight_tensor
+            saved_expert_weights[weight_name] = weight_tensor
 
-    experts_saved_ids.extend(unsaved_expert_ids)
-
-    return experts_saved_ids, experts_saved_weights
+    return saved_expert_weights
 
 
 def expand_parameter(old_param, axis: int = 0, extra_lines: int = 1) -> torch.nn.Parameter:
@@ -411,10 +329,8 @@ def expand_parameter(old_param, axis: int = 0, extra_lines: int = 1) -> torch.nn
 
 
 def expand_expert_weights(
-    model_runner: NPUModelRunner, added_experts: dict[int, list[int]], quant: bool | str, rank: int
+    model_runner: NPUModelRunner, expand_lines: int, quant: bool | str
 ) -> None:
-    current_rank_expand_experts = added_experts[rank]
-    expand_lines = len(current_rank_expand_experts)
     if expand_lines:
         for module in model_runner.model.modules():
             if isinstance(module, FusedMoE) and expand_lines:
@@ -458,20 +374,16 @@ def dynamic_merge_view(
 
 def reload_fault_expert_weights(
     model_runner: NPUModelRunner,
-    global_experts_distribution: dict[int, list[int]],
+    cur_rank_need_load_h2d,
     experts_saved_weights: dict[str, torch.Tensor],
-    redistributed_experts: dict[int, list[int]],
-    added_experts: dict[int, list[int]],
-    replaced_redundant_experts: dict[int, dict[int, tuple[int, int]]],
     quant: bool | str = False,
-    old_rank: int = 0,
-) -> dict[int, list[int]]:
+) -> None:
     def _load_single_expert(expert_id: int, target_index: int, quant: bool | str = False):
         prefix = f"{module.layer_name}.{expert_id}"
         w1_weight = experts_saved_weights[f"{prefix}.gate_proj.weight"]
         w2_weight = experts_saved_weights[f"{prefix}.down_proj.weight"]
         w3_weight = experts_saved_weights[f"{prefix}.up_proj.weight"]
-        if quant:
+        if get_ascend_config().eplb_config.dynamic_eplb:
             device = module.w2_weight_list[target_index].device
             module._load_w2(
                 expert_data=module.w2_weight_list[target_index],
@@ -493,16 +405,6 @@ def reload_fault_expert_weights(
                 loaded_weight=w3_weight.to(device),
                 tp_rank=module.tp_rank,
             )
-            w1_weight_scale = experts_saved_weights[f"{prefix}.gate_proj.weight_scale"].to(device)
-            w2_weight_scale = experts_saved_weights[f"{prefix}.down_proj.weight_scale"].to(device)
-            w3_weight_scale = experts_saved_weights[f"{prefix}.up_proj.weight_scale"].to(device)
-            w1_weight_offset = experts_saved_weights[f"{prefix}.gate_proj.weight_offset"].to(device)
-            w2_weight_offset = experts_saved_weights[f"{prefix}.down_proj.weight_offset"].to(device)
-            w3_weight_offset = experts_saved_weights[f"{prefix}.up_proj.weight_offset"].to(device)
-            module.w2_weight_scale_list[target_index].copy_(w2_weight_scale)
-            module.w2_weight_offset.data[target_index].copy_(w2_weight_offset)
-            dynamic_merge_view(module.w13_weight_scale_fp32_list[target_index], w1_weight_scale, w3_weight_scale)
-            dynamic_merge_view(module.w13_weight_offset.data[target_index], w1_weight_offset, w3_weight_offset)
         else:
             device = module.w2_weight.device
             module._load_w2(
@@ -526,26 +428,26 @@ def reload_fault_expert_weights(
                 tp_rank=module.tp_rank,
             )
 
-    experts_to_expand = added_experts[old_rank]
-    init_local_experts_count = len(global_experts_distribution[old_rank])
-    slot_to_routed_expert_map = {}
-    for redundant_expert_id, (pos, routed_expert_id) in replaced_redundant_experts[old_rank].items():
-        slot_to_routed_expert_map[pos] = routed_expert_id
+        if quant:
+            w1_weight_scale = experts_saved_weights[f"{prefix}.gate_proj.weight_scale"].to(device)
+            w2_weight_scale = experts_saved_weights[f"{prefix}.down_proj.weight_scale"].to(device)
+            w3_weight_scale = experts_saved_weights[f"{prefix}.up_proj.weight_scale"].to(device)
+            w1_weight_offset = experts_saved_weights[f"{prefix}.gate_proj.weight_offset"].to(device)
+            w2_weight_offset = experts_saved_weights[f"{prefix}.down_proj.weight_offset"].to(device)
+            w3_weight_offset = experts_saved_weights[f"{prefix}.up_proj.weight_offset"].to(device)
+            module.w2_weight_scale_list[target_index].copy_(w2_weight_scale)
+            module.w2_weight_offset.data[target_index].copy_(w2_weight_offset)
+            dynamic_merge_view(module.w13_weight_scale_fp32_list[target_index], w1_weight_scale, w3_weight_scale)
+            dynamic_merge_view(module.w13_weight_offset.data[target_index], w1_weight_offset, w3_weight_offset)
 
+    cur_layer_id = 0
     for module in model_runner.model.modules():
         if isinstance(module, FusedMoE):
-            if experts_to_expand:
-                for idx, eid in enumerate(experts_to_expand):
-                    _load_single_expert(eid, init_local_experts_count + idx, quant=quant)
-            if slot_to_routed_expert_map:
-                for slot_pos, expert_id in slot_to_routed_expert_map.items():
-                    _load_single_expert(expert_id, slot_pos, quant=quant)
+            if cur_rank_need_load_h2d[cur_layer_id] is not None:
+                for slot_pos, expert_id in cur_rank_need_load_h2d[cur_layer_id]:
+                    _load_single_expert(expert_id=expert_id, target_index=slot_pos, quant=quant)
 
-    global_experts_distribution = {}
-    for i, rank in enumerate(list(sorted(redistributed_experts.keys()))):
-        global_experts_distribution[i] = redistributed_experts[rank]
-    return global_experts_distribution
-
+            cur_layer_id += 1
 
 def update_parallel_config(original_config: VllmConfig, update_config: dict[str, int]) -> None:  # , worker_guard)
     required_keys = {
@@ -688,7 +590,7 @@ def reconfigure_moe(
 
     moe_moules = [module for module in modelrunner.model.modules() if isinstance(module, FusedMoE)]
 
-    for module in moe_moules:
+    for cur_layer_id, module in enumerate(moe_moules):
         module.local_num_experts = num_global_new_phy_experts // new_ep_size
         module.global_num_experts = num_global_new_phy_experts
         module.global_redundant_expert_num = num_global_new_phy_experts - num_global_logical_experts
@@ -718,7 +620,7 @@ def reconfigure_moe(
         module.moe_config.num_experts = module.global_num_experts
         module.moe_config.num_local_experts = module.local_num_experts
         module.moe_config.global_redundant_expert_num = module.global_redundant_expert_num
-        module.log2phy.copy_(log2phy, non_blocking=True)
+        module.log2phy.copy_(log2phy[cur_layer_id].npu(), non_blocking=True)
         if not use_mask_mc2:
             module.moe_config.tp_group = get_tp_group()
             module.moe_config.dp_group = get_dp_group()
@@ -739,3 +641,68 @@ def reconfigure_moe(
 
                 module.quant_method.quant_method = AscendW8A8DynamicFusedMoEMethod()
                 # todo support other quant like w4a4 w4a8 ...
+
+def update_eplb_adaptor_info(model_runner, num_add_experts_per_rank, rank):
+    model_runner.eplb_adaptor.rank_id = rank
+    model_runner.eplb_adaptor.model.clear_all_moe_loads()
+    model_runner.shared_dict["moe_load"] = None
+    model_runner.eplb_adaptor.cur_iterations = 0
+
+    if num_add_experts_per_rank > 0:
+        model_runner.eplb_adaptor.init_buffer_tensor(num_add_experts_per_rank)
+
+    model_runner.eplb_adaptor.init_expert_param_per_layer()
+    cur_deployment = model_runner.shared_dict["expert_maps"]
+    for layer_id in range(cur_deployment.shape[0]):
+        model_runner.eplb_adaptor.do_clone_update_expert_map(layer_id, cur_deployment[layer_id][rank])
+
+def d2d_transmission_for_scaling_down(model_runner):
+    eplb_loader = model_runner.eplb_loader
+    eplb_adaptor = model_runner.eplb_adaptor
+    eplb_updator = model_runner.eplb_updator
+
+    all_layer_log2phy_map = []
+
+    while eplb_updator.update_info_all:
+        (expert_send_info, expert_recv_info, updated_expert_map, log2phy_map, layer_id) = (
+            eplb_updator.update_info_all.pop(0)
+        )
+
+        log2phy_map_this_rank = torch.from_numpy(np.array(log2phy_map))
+        all_layer_log2phy_map.append(log2phy_map_this_rank)
+        eplb_loader.set_log2phy_map(log2phy_map_this_rank)
+        updated_expert_map_this_rank = torch.from_numpy(np.array(updated_expert_map))
+
+        eplb_loader.generate_expert_d2d_transfer_task(
+            expert_send_info,
+            expert_recv_info,
+            updated_expert_map_this_rank,
+            layer_id + eplb_adaptor.num_dense_layers,
+        )
+
+        reqs = []
+        eplb_loader.asyn_expert_weight_transfer(reqs)
+        eplb_loader.update_expert_map_and_weight(reqs)
+
+    torch_npu.npu.synchronize()
+
+    return all_layer_log2phy_map
+
+def gen_all_layer_log2phy(model_runner, rank):
+    all_layer_log2phy = []
+    cur_deployment = model_runner.shared_dict["expert_maps"]
+    for layer_id in range(cur_deployment.shape[0]):
+        cur_layer_log2phy_map = generate_log2phy_map(cur_deployment[layer_id], rank)
+        all_layer_log2phy.append(cur_layer_log2phy_map)
+
+    return all_layer_log2phy
+
+def get_global_expert_map(model_runner):
+    num_dense_layers = getattr(model_runner.model.config, "first_k_dense_replace", 0)
+    num_moe_layers = model_runner.model.config.num_hidden_layers - num_dense_layers
+    all_layer_global_expert_map = []
+    for layer_id in range(num_moe_layers):
+        map_cpu = model_runner.model.model.layers[num_dense_layers + layer_id].mlp.experts.global_expert_map.cpu()
+        all_layer_global_expert_map.append(map_cpu)
+
+    return torch.stack(all_layer_global_expert_map)
