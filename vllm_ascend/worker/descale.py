@@ -646,7 +646,7 @@ def update_eplb_adaptor_info(model_runner, num_add_experts_per_rank, rank):
     model_runner.eplb_adaptor.rank_id = rank
     model_runner.eplb_adaptor.model.clear_all_moe_loads()
     model_runner.shared_dict["moe_load"] = None
-    model_runner.eplb_adaptor.cur_iterations = 0
+    model_runner.eplb_updator.cur_iterations = 0
 
     if num_add_experts_per_rank > 0:
         model_runner.eplb_adaptor.init_buffer_tensor(num_add_experts_per_rank)

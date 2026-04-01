@@ -75,7 +75,6 @@ class EplbWorker:
         else:
             num_add_experts_per_rank = 0
             _, _, new_placement = self.calculate_rebalance_experts(load_info, old_placement)
-        _, _, new_placement = self.calculate_rebalance_experts(load_info, old_placement)
 
         if not torch.is_tensor(new_placement):
             new_placement = torch.tensor(new_placement)
