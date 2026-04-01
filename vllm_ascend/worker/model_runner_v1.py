@@ -367,12 +367,13 @@ class NPUModelRunner(GPUModelRunner):
         eplb_config = self.ascend_config.eplb_config
         self.dynamic_eplb = eplb_config.dynamic_eplb
         self.eplb_enable = self.dynamic_eplb or (eplb_config.expert_map_path is not None)
-        if self.dynamic_eplb:
+        self.fault_tolerance = vllm_config.fault_tolerance_config.enable_fault_tolerance
+        if self.dynamic_eplb or self.fault_tolerance:
             self.is_eplb_warmuped = False
             self.policy_type = eplb_config.eplb_policy_type
             self.eplb_loader = D2DExpertWeightLoader()
             self.manager = Manager()
-            self.shared_dict = self.manager.dict({"expert_map": None, "moe_load": None, "expert_maps": None})
+            self.shared_dict = self.manager.dict({"expert_map": None, "moe_load": None, "expert_maps": None, "descale": False})
             self.eplb_process = EplbProcess(shared_dict=self.shared_dict, policy_type=self.policy_type, enable_d2d=True)
             self.process = self.eplb_process._launch_process()
             self.eplb_updator = EplbUpdator(eplb_config, self.eplb_loader, self.eplb_process, self.process)
@@ -1407,8 +1408,8 @@ class NPUModelRunner(GPUModelRunner):
                     num_reqs_padded = self._pad_query_start_loc_for_fia(
                         num_tokens_padded, num_reqs_padded, num_reqs, cudagraph_mode, batch_desc.num_reqs
                     )
-                    
-                    
+
+
                     # FIA may add a virtual request in Mixed Batch scenarios.
                     # here we revert the request added by _pad_query_start_loc_for_fia if SP is enabled.
                     # RELAXED CONDITION: Check if num_reqs_padded was actually increased, rather than
@@ -1994,7 +1995,7 @@ class NPUModelRunner(GPUModelRunner):
             return round_up(num_scheduled_tokens, tp_size)
         return num_scheduled_tokens
 
-    # This is a function from the upstream vllm used to handle PP+SP. Since the judgment logic 
+    # This is a function from the upstream vllm used to handle PP+SP. Since the judgment logic
     # of flashcomm1 in Ascend is inconsistent with SP in vllm, it needs to be overridden.
     def sync_and_slice_intermediate_tensors(
         self,

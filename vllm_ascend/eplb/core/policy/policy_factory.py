@@ -5,6 +5,7 @@ from .policy_default_eplb import DefaultEplb
 from .policy_flashlb import FlashLB, warm_up
 from .policy_random import RandomLoadBalance
 from .policy_swift_balancer import SwiftBalanceEplb
+form .policy_fault_rearrangement import FaultRearrangement
 
 
 class PolicyFactory:
@@ -22,6 +23,8 @@ class PolicyFactory:
             # FlashLB EPLB policy: expert replacement based on Joint Optimization,
             # Multi-Shot Enhancement and Incremental Adjustment
             3: FlashLB,
+            # Redistribute expert weights on the xPU via H2D and D2D after a card failure.
+            4: FaultRearrangement,
         }
         policy_class = policy.get(policy_type, RandomLoadBalance)
         policy_instance = policy_class()
