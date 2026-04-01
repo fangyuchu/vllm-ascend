@@ -91,6 +91,9 @@ from vllm_ascend.worker.descale import (
     update_elastic_info,
     update_ep2dp_map,
     update_parallel_config,
+    update_eplb_adaptor_info,
+    d2d_transmission_for_sacling_down,
+    gen_all_layer_log2phy,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
@@ -297,10 +300,8 @@ class NPUWorker(WorkerBase):
                 redundant_expert_list = generate_redundant_expert_ids(
                     self.num_logical_expert, ep_size, num_redundancy_expert
                 )
-            self.global_log2phy_map = gen_global_log2phy_map(self.num_logical_expert, ep_size, redundant_expert_list)
-            self.global_experts_distribution = init_global_expert_distribution(self.global_log2phy_map, ep_size)
-            self.log2phy = gen_local_log2phy_map(self.global_log2phy_map)
-            self.backup_expert_rank_mapping = {}
+
+            self.backup_expert_rank_mapping = False
             init_elastic_info(self.use_mask_mc2, ep_size, (self.num_logical_expert + num_redundancy_expert))
 
     def dp_descale(self, exclude_ep_ranks: list[int], vllm_update_config):
@@ -346,8 +347,7 @@ class NPUWorker(WorkerBase):
         assert self.vllm_config.fault_tolerance_config.enable_fault_tolerance is True, "enable_fault_tolerance is False"
         if not self.backup_expert_rank_mapping:
             raise RuntimeError("not load model yet")
-        # todo  self.cache_config.gpu_memory_utilization = FAULT_TOLERANCE_MEM_UTILIZATION need to revise later
-        # This value will be adjusted automatically in future revisions.
+
         self.cache_config.gpu_memory_utilization = FAULT_TOLERANCE_MEM_UTILIZATION
         rank = self.vllm_config.parallel_config.data_parallel_rank
         rank_mapping = vllm_update_config.get("rank_mapping")
@@ -361,22 +361,16 @@ class NPUWorker(WorkerBase):
             num_logical_expert = self.vllm_config.model_config.hf_config.n_routed_experts
         else:
             raise ValueError("unknown number of experts")
+
         # recalculation of expert distribution
-        expert_ids_to_save = list()
-        self.global_log2phy_map, redistributed_experts, added_experts, replaced_redundant_experts, self.use_mask_mc2 = (
-            get_expert_distribution_after_descale(
-                exclude_ep_ranks,
-                self.global_experts_distribution,
-                self.global_log2phy_map,
-                self.backup_expert_rank_mapping,
-                self.use_mask_mc2,
-            )
-        )
-        expert_ids_to_save.extend(added_experts.get(old_rank, []))
-        for redundant_expert_id, (redundant_expert_pos, routed_expert_id) in replaced_redundant_experts.get(
-            old_rank, {}
-        ).items():
-            expert_ids_to_save.append(routed_expert_id)
+        enable_d2d_after_failure = self.vllm_config.fault_tolerance.enable_fault_tolerance_rebalance
+        if self.model_runner.shared_dict["moe_load"] is None or torch.all(self.model_runner.shared_dict["moe_load"][0] == 0):
+            enable_d2d_after_failure = False
+        cur_rank_need_load_h2d = get_expert_distribution_after_descale(self.model_runner, exclude_ep_ranks, enable_d2d_after_failure, rank)
+        num_add_experts_per_rank = self.model_runner.shared_dict["num_add_experts_per_rank"]
+
+        if num_add_experts_per_rank > 0:
+            self.use_mask_mc2 = False
 
         # clean acl_graph and comm_group
         if not self.model_config.enforce_eager and not self.use_mask_mc2:
@@ -386,39 +380,47 @@ class NPUWorker(WorkerBase):
 
         # reload fault expert weights
         self.experts_saved_ids, self.experts_saved_weights = save_expert_weights_to_ram(
-            expert_ids_to_save,
-            self.experts_saved_ids,
-            self.experts_saved_weights,
+            cur_rank_need_load_h2d,
             self.vllm_config,
             self.model_runner,
             self.quant,
         )
-        expand_expert_weights(self.model_runner, added_experts, self.quant, old_rank)
-        self.global_experts_distribution = reload_fault_expert_weights(
+
+        expand_expert_weights(self.model_runner, num_add_experts_per_rank, self.quant)
+
+        reload_fault_expert_weights(
             self.model_runner,
-            self.global_experts_distribution,
+            cur_rank_need_load_h2d,
             self.experts_saved_weights,
-            redistributed_experts,
-            added_experts,
-            replaced_redundant_experts,
             self.quant,
-            old_rank,
         )
+
+        if get_ascend_config().eplb_config.dynamic_eplb:
+            update_eplb_adaptor_info(self.model_runner, num_add_experts_per_rank, rank)
+
+        # allow balanced D2D transmission
+        if enable_d2d_after_failure:
+            all_layer_log2phy = d2d_transmission_for_sacling_down(self.model_runner)
+        else:
+            all_layer_log2phy = gen_all_layer_log2phy(self.model_runner, rank)
+
+        self.global_experts_distribution = self.model_runner.eplb_process.worker.local2global(self.model_runner.shared_dict["expert_maps"])
+
         old_ep_size = len(self.ep2dp_map)
         # update parallel config
-        # TODO: When a current vLLM config instance is available (via get_current_vllm_config),
-        #       its parallel configuration should also be updated using vllm_update_config.
         update_parallel_config(self.vllm_config, vllm_update_config)
         self.model_runner.dp_size = self.vllm_config.parallel_config.data_parallel_size
         self.model_runner.dp_rank = self.vllm_config.parallel_config.data_parallel_rank
         self.ep2dp_map = update_ep2dp_map(self.ep2dp_map, exclude_ep_ranks, rank_mapping)
         elastic_info = get_elastic_info()
-        num_new_phy_experts = sum(map(len, redistributed_experts.values()))
+        num_new_phy_experts = (self.model_runner.shared_dict["expert_maps"][0] != -1).sum().item()
         update_elastic_info(self.use_mask_mc2, elastic_info, num_new_phy_experts, old_ep_size, self.ep2dp_map)
-        self.log2phy.copy_(gen_local_log2phy_map(self.global_log2phy_map))
+
         # reinit comm_group
+        destroy_comm_group(self.use_mask_mc2)
         with set_current_vllm_config(self.vllm_config):
             reinit_comm_group(self.use_mask_mc2, self.vllm_config, self)
+
         # update AscendFusedMoE
         reconfigure_moe(
             self.use_mask_mc2,
@@ -426,7 +428,7 @@ class NPUWorker(WorkerBase):
             self.vllm_config,
             num_logical_expert,
             num_new_phy_experts,
-            self.log2phy,
+            all_layer_log2phy,
         )
         # rebuild acl_graph
         if not self.model_config.enforce_eager:
@@ -719,19 +721,7 @@ class NPUWorker(WorkerBase):
         with context, set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()
         if self.vllm_config.fault_tolerance_config.enable_fault_tolerance:
-            dp_size = self.vllm_config.parallel_config.data_parallel_size
-            tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-            is_a3 = get_ascend_device_type() in {AscendDeviceType.A3}
-            expert_backup_map = gen_expert_backup_map(
-                num_experts=self.num_logical_expert,
-                ep_size=dp_size * tp_size,
-                num_die_per_npu=2 if is_a3 else 1,
-                global_expert_distribution=self.global_experts_distribution,
-            )
-            self.backup_expert_rank_mapping = {}
-            for rank, expert_ids in enumerate(expert_backup_map):
-                for expert in expert_ids:
-                    self.backup_expert_rank_mapping[expert] = rank
+            self.backup_expert_rank_mapping = True
             # todo Hot backup-related code has not yet been ported here.
 
     def compile_or_warm_up_model(self) -> float:

@@ -1,48 +1,9 @@
 # Copyright Huawei Technologies Co., Ltd. 2024-2025. All rights reserved.
 # Todo: Once https://github.com/vllm-project/vllm/pull/24069 is merged in vllm. Remove this policy.
-from abc import abstractmethod
 from collections import defaultdict
-
 import numpy as np
 from vllm.logger import logger
-
-
-class DynamicConfig:
-    placement_policy = None
-
-    max_transferred_expert_per_layer = 100  # Maximum number of experts that can be migrated per layer on a single host
-    ep_worldsize = 64  # Total number of dies across the entire cluster where experts are distributed
-    num_die_per_host = 8  # Number of dies on each host machine
-
-
-class EplbPolicy:
-    def __init__(self, config: DynamicConfig):
-        self.config = config
-
-    @abstractmethod
-    def rebalance_experts(self, current_expert_table, expert_workload):
-        """
-        Pass in the weights and return expert replication and placement under relevant constraints.
-        INPUT:
-        current_expert_table: [layerId, rankId, expert_num_i]
-        expert_workload = expert_table[layer0][rankId][expert_num_i]
-
-        RETURNED: (res, expert_table)
-        res:
-        1 -- table_changed
-        0 -- not_changed
-
-        expert_table: [layerId, rankId, expert_num_i]
-        expert_num_i --- [0, MaxExpertPerRank]
-        expertID = expert_table[layer0][rankId][expert_num_i]
-        array_values:
-        [0, 1, 2, 3, 248]
-        [4, 5, 6, 7, 254]
-        [8, 9, 10, 11, 71]
-        ...
-        [252, 253, 254, 255, 0]
-        """
-        pass
+from .policy_abstract import DynamicConfig, EplbPolicy
 
 
 class DynamicTable:
@@ -68,21 +29,21 @@ class SwiftBalanceEplb(EplbPolicy):
     @staticmethod
     def safe_divide(a, b):
         if b == 0:
-            logger.info("Division by zero is not allowed")
+            logger.debug("Division by zero is not allowed")
             return 0
         return a / b
 
     @staticmethod
     def safe_exact_divide(a, b):
         if b == 0:
-            logger.info("Division by zero is not allowed")
+            logger.debug("Division by zero is not allowed")
             return 0
         return a // b
 
     @staticmethod
     def safe_mod(a, b):
         if b == 0:
-            logger.info("Division by zero is not allowed")
+            logger.debug("Division by zero is not allowed")
             return 0
         return a % b
 
@@ -144,22 +105,22 @@ class SwiftBalanceEplb(EplbPolicy):
 
         return layer_imbalance
 
-    def compute_redundant_assignments(self, base_experts, num_redundant_experts, num_experts):
+    def compute_redundant_assignments(self, base_experts, num_redundant_experts, num_experts, num_ranks):
         redundant_assignments: list[list[int]] = [[] for _ in range(num_experts)]
         current_weights = base_experts.copy()
 
         for i in range(num_redundant_experts):
             sorted_indices = np.argsort([w for _, w in current_weights], kind="stable")[::-1]
-            sorted_weights = [current_weights[i] for i in sorted_indices]
-
-            target_expert = sorted_weights[0]
-            expert_id, original_weight = target_expert
-
-            current_redundancy = len(redundant_assignments[expert_id])
-            new_avg_weight = self.safe_divide(original_weight * (current_redundancy + 1), (current_redundancy + 2))
-
-            redundant_assignments[expert_id].append(num_experts + i)
-            current_weights[sorted_indices[0]] = (expert_id, new_avg_weight)
+            for index in sorted_indices:
+                target_expert = current_weights[index]
+                expert_id, original_weight = target_expert
+                current_redundancy = len(redundant_assignments[expert_id])
+                if current_redundancy < num_ranks:
+                    new_avg_weight = self.safe_divide(original_weight * (current_redundancy + 1),
+                                                      (current_redundancy + 2))
+                    redundant_assignments[expert_id].append(num_experts + i)
+                    current_weights[index] = (expert_id, new_avg_weight)
+                    break
 
         sorted_indices = np.argsort([w for _, w in current_weights], kind="stable")[::-1]
         sorted_weights = [current_weights[i] for i in sorted_indices]
@@ -352,7 +313,7 @@ class SwiftBalanceEplb(EplbPolicy):
             num_redundant_experts += len(rank_empty_pos)
 
         redundant_assignments, updated_weights = self.compute_redundant_assignments(
-            origin_weights, num_redundant_experts, num_experts
+            origin_weights, num_redundant_experts, num_experts, origin_deployment.shape[0]
         )
 
         redundant_expert_list = self.prepare_expert_list(updated_weights, redundant_assignments, num_redundant_experts)
@@ -715,13 +676,6 @@ class SwiftBalanceEplb(EplbPolicy):
 
         if num_npus <= 0:
             raise ValueError("The number of NPUs must be greater than 0")
-
-        if num_npus < num_redundancy_expert:
-            raise ValueError(
-                "The number of NPUs "
-                f"({num_npus}) must be greater than or equal to the number of redundant experts "
-                f"({num_redundancy_expert})"
-            )
 
         global_deployment: list[list[list[int]]] = [[[] for _ in range(num_npus)] for _ in range(layer_num)]
         layer_initial_imbalance = self.calculate_initial_imbalance(info.placement_table, layer_workloads)

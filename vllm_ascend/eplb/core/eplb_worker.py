@@ -34,6 +34,7 @@ class EplbWorker:
         self.old_expert_maps = None
         self.enable_d2d = enable_d2d
         self.rank_id = dist.get_rank()
+        self.rank_id_to_initial_global = list(range(dist.get_world_size()))
 
     def do_update(self):
         # put data in to queue
@@ -54,22 +55,27 @@ class EplbWorker:
 
         # Get MOE load information
         load_info = self.fetch_and_sum_load_info()
-        if load_info is None:
+        if load_info is None and not self.shared_dict["descale"]:
             return
 
         # Get the updated expert table based on the workload information
         old_placement = self.global2local(self.old_expert_maps, self.num_local_experts)
+        if self.shared_dict["descale"]:
+            exclude_dp_ranks = self.shared_dict["exclude_dp_ranks"]
+            enable_d2d_after_failure = self.shared_dict["enable_d2d_after_failure"]
+            self.update_rank_id(exclude_dp_ranks)
+            new_placement, old_deployment, need_load_h2d, num_add_experts_per_rank = (
+                self.trigger_fault_redeployment(load_info, old_placement, exclude_dp_ranks, enable_d2d_after_failure))
+            if not torch.is_tensor(old_deployment):
+                old_placement = torch.tensor(old_deployment)
+            self.old_expert_maps = self.local2global(old_placement)
+            self.shared_dict["need_load_h2d"] = need_load_h2d
+            self.shared_dict["num_add_experts_per_rank"] = num_add_experts_per_rank
+            self.shared_dict["descale"] = False
+        else:
+            num_add_experts_per_rank = 0
+            _, _, new_placement = self.calculate_rebalance_experts(load_info, old_placement)
         _, _, new_placement = self.calculate_rebalance_experts(load_info, old_placement)
-
-        if self.rank_id == 0:
-            hotness = self._calculate_hotness(old_placement, load_info)
-            current_mean, current_max = self._compute_imbalance(old_placement, hotness)
-            update_mean, update_max = self._compute_imbalance(new_placement, hotness)
-            logger.info(
-                "[Expert Hotness] Current: mean={:.3f}, max={:.3f}, Updated: mean={:.3f}, max={:.3f}".format(
-                    current_mean, current_max, update_mean, update_max
-                )
-            )
 
         if not torch.is_tensor(new_placement):
             new_placement = torch.tensor(new_placement)
@@ -82,6 +88,9 @@ class EplbWorker:
         logger.debug("EPLB Process compute complete")
 
         packed_update_info = self.pack_update_info(update_info)
+
+        if num_add_experts_per_rank > 0:
+            self.rank_id_to_initial_global = list(range(len(self.rank_id_to_initial_global)))
 
         return packed_update_info
 
@@ -166,8 +175,10 @@ class EplbWorker:
                 if src_rank_id not in expert_send_info_this_layer:
                     expert_send_info_this_layer[src_rank_id] = []
 
-                expert_send_info_this_layer[src_rank_id].append((dst_rank_id, expert_id))
-                expert_recv_info_this_layer[dst_rank_id].append((src_rank_id, expert_id))
+                dst_global_rank_id = self.rank_id_to_initial_global[dst_rank_id]
+                src_global_rank_id = self.rank_id_to_initial_global[src_rank_id]
+                expert_send_info_this_layer[src_rank_id].append((dst_global_rank_id, expert_id))
+                expert_recv_info_this_layer[dst_rank_id].append((src_global_rank_id, expert_id))
 
             yield (
                 expert_send_info_this_layer,
@@ -261,6 +272,27 @@ class EplbWorker:
             layer_ids.append(layer_id)
 
         return list(zip(send_all, recv_all, maps, log2phy_all, layer_ids))
+
+    def trigger_fault_redeployment(self, load_info, old_placement, exclude_dp_ranks, enable_d2d_after_failure):
+        policy = PolicyFactory.generate_policy(4, DynamicConfig())
+        policy.failed_cards = exclude_dp_ranks
+        policy.enable_d2d_after_failure = enable_d2d_after_failure
+
+        new_deployment, old_deployment, need_load_h2d, num_add_experts_per_rank = policy.rebalance_experts(old_placement, load_info)
+
+        return new_deployment, old_deployment, need_load_h2d, num_add_experts_per_rank
+
+    def update_rank_id(self, exclude_dp_ranks: list[int]):
+        unique_fault_ids = sorted(list(set(exclude_dp_ranks)))
+        fault_count = 0
+        for fault_id in unique_fault_ids:
+            if fault_id <= self.rank_id:
+                fault_count += 1
+            else:
+                break
+        self.rank_id = self.rank_id - fault_count
+        for i in sorted(exclude_dp_ranks, reverse=True):
+            self.rank_id_to_initial_global.pop(i)
 
     @staticmethod
     def _compute_imbalance(deployment_all_layer, hotness_all_layer: np.ndarray):

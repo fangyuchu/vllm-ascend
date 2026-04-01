@@ -123,6 +123,9 @@ class VllmEplbAdaptor:
     def do_update_expert_map(self, layer_id, updated_expert_map):
         self.expert_map_per_layer_cpu[layer_id].copy_(updated_expert_map)
 
+    def do_clone_update_expert_map(self, layer_id, updated_expert_map):
+        self.expert_map_per_layer_cpu[layer_id] = updated_expert_map.clone()
+
     def do_update_expert_weight(self, layer_id, local_expert_to_replace, buffer_tensor_id):
         for expert_tensor, buffer_tensor in zip(
             self.expert_param_per_layer[layer_id][local_expert_to_replace], self.buffer_tensor_list[buffer_tensor_id]

@@ -53,11 +53,14 @@ class DefaultEplb(EplbPolicy):
         for i in range(num_redundancy_expert):
             sorted_indices = np.argsort([t[1] for t in origin_weights], kind="stable")[::-1]
             weights = [origin_weights[idx] for idx in sorted_indices]
-            tmp_raw_weight = weights[0][1] * (len(route_expert_redundancy[weights[0][0]]) + 1)
-            route_expert_redundancy[weights[0][0]].append(route_expert_num + i)
-            avg_weight = tmp_raw_weight / (len(route_expert_redundancy[weights[0][0]]) + 1)
-            weights[0] = (weights[0][0], avg_weight)
-            origin_weights = weights
+            for index in range(len(weights)):
+                if len(route_expert_redundancy[weights[index][0]]) < card_num - 1:
+                    tmp_raw_weight = weights[index][1] * (len(route_expert_redundancy[weights[index][0]]) + 1)
+                    route_expert_redundancy[weights[index][0]].append(route_expert_num + i)
+                    avg_weight = tmp_raw_weight / (len(route_expert_redundancy[weights[index][0]]) + 1)
+                    weights[index] = (weights[index][0], avg_weight)
+                    origin_weights = weights
+                    break
 
         # Step 2: Calculate the number of items per box
         expert_num = route_expert_num + num_redundancy_expert
@@ -82,7 +85,7 @@ class DefaultEplb(EplbPolicy):
                 boxes_weights[index].append(cur_weight)
                 box_weights[index] += cur_weight
                 box_counts[index] += 1
-                index += 1
+                index = (index + 1) % card_num
 
         sorted_indices = np.argsort([t[1] for t in origin_weights], kind="stable")[::-1]
         origin_weights = [origin_weights[idx] for idx in sorted_indices]
@@ -310,13 +313,6 @@ class DefaultEplb(EplbPolicy):
 
         if num_npus <= 0:
             raise ValueError("the number of NPUs must be greater than 0")
-
-        if num_npus < num_redundancy_expert:
-            raise ValueError(
-                "the number of NPUs "
-                f"{num_npus} must be greater than or equal to the number of redundant experts "
-                f"{num_redundancy_expert}"
-            )
 
         # Number of experts deployed on each card includes one redundant expert
         global_deployment: list[list[list[int]]] = [[[] for _ in range(num_npus)] for _ in range(layer_num)]
