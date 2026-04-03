@@ -435,9 +435,7 @@ def reload_fault_expert_weights(
             w1_weight_offset = experts_saved_weights[f"{prefix}.gate_proj.weight_offset"].to(device)
             w2_weight_offset = experts_saved_weights[f"{prefix}.down_proj.weight_offset"].to(device)
             w3_weight_offset = experts_saved_weights[f"{prefix}.up_proj.weight_offset"].to(device)
-            module.w2_weight_scale_list[target_index].copy_(w2_weight_scale)
             module.w2_weight_offset.data[target_index].copy_(w2_weight_offset)
-            dynamic_merge_view(module.w13_weight_scale_fp32_list[target_index], w1_weight_scale, w3_weight_scale)
             dynamic_merge_view(module.w13_weight_offset.data[target_index], w1_weight_offset, w3_weight_offset)
             if get_ascend_config().eplb_config.dynamic_eplb:
                 module.w2_weight_scale_list[target_index].copy_(w2_weight_scale)
