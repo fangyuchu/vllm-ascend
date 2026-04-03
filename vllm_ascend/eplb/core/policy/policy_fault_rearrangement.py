@@ -54,7 +54,7 @@ class FaultRearrangement(EplbPolicy):
         new_deployment_list = []
         old_deployment_list = []
         # todo 变量命名
-        for card_id in range(slef.n_remain_cards):
+        for card_id in range(self.n_remain_cards):
             current_list = [int(x) for x in old_deployment[card_id]]
             new_list = [int(x) for x in new_deployment[card_id]]
             num = len(new_list)
@@ -190,8 +190,8 @@ class FaultRearrangement(EplbPolicy):
                     rank_deploy_sets[max_load_rank_id].add(swap_rank_expert)
                     rank_deploy_sets[swap_rank_id].add(max_rank_expert)
 
-                    rank_loads[max_load_rank_id] += (updated_weights[swap_rank_expert] - updated_weights[max_load_expert])
-                    rank_loads[swap_rank_id] += (updated_weights[max_load_expert] - updated_weights[swap_rank_expert])
+                    rank_loads[max_load_rank_id] += (updated_weights[swap_rank_expert] - updated_weights[max_rank_expert])
+                    rank_loads[swap_rank_id] += (updated_weights[max_rank_expert] - updated_weights[swap_rank_expert])
 
                     rev_expert_per_rank[max_load_rank_id].add(swap_rank_expert)
                     rev_expert_per_rank[swap_rank_id].add(max_rank_expert)
@@ -424,7 +424,7 @@ class FaultRearrangement(EplbPolicy):
         if num_redundant_experts > 0:
             for expert_id in range(self.n_experts):
                 for _ in range(redundant_assignments[expert_id]):
-                    redundant_expert_list.append(expert_id, float(update_weight[expert_id]))
+                    redundant_expert_list.append((expert_id, float(update_weight[expert_id])))
 
             redundant_expert_list.sort(key=lambda x: x[1], reverse=True)
 
