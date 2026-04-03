@@ -5,7 +5,7 @@ from .policy_default_eplb import DefaultEplb
 from .policy_flashlb import FlashLB, warm_up
 from .policy_random import RandomLoadBalance
 from .policy_swift_balancer import SwiftBalanceEplb
-form .policy_fault_rearrangement import FaultRearrangement
+from .policy_fault_rearrangement import FaultRearrangement
 
 
 class PolicyFactory:

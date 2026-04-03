@@ -183,7 +183,7 @@ def get_expert_distribution_after_descale(
 
     cur_rank_need_load_h2d = []
     for layer_id in range(len(need_load_h2d)):
-        cur_rank_need_load = need_load_h2d[layer_id][rank_id].cpoy()
+        cur_rank_need_load = need_load_h2d[layer_id][rank_id].copy()
         cur_rank_need_load_h2d.append(cur_rank_need_load)
 
     return cur_rank_need_load_h2d
@@ -439,6 +439,12 @@ def reload_fault_expert_weights(
             module.w2_weight_offset.data[target_index].copy_(w2_weight_offset)
             dynamic_merge_view(module.w13_weight_scale_fp32_list[target_index], w1_weight_scale, w3_weight_scale)
             dynamic_merge_view(module.w13_weight_offset.data[target_index], w1_weight_offset, w3_weight_offset)
+            if get_ascend_config().eplb_config.dynamic_eplb:
+                module.w2_weight_scale_list[target_index].copy_(w2_weight_scale)
+                dynamic_merge_view(module.w13_weight_scale_fp32_list[target_index], w1_weight_scale, w3_weight_scale)
+            else:
+                module.w2_weight_scale[target_index].copy_(w2_weight_scale)
+                dynamic_merge_view(module.w13_weight_scale_fp32[target_index], w1_weight_scale, w3_weight_scale)
 
     cur_layer_id = 0
     for module in model_runner.model.modules():

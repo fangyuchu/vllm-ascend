@@ -96,7 +96,7 @@ from vllm_ascend.worker.descale import (
     update_ep2dp_map,
     update_parallel_config,
     update_eplb_adaptor_info,
-    d2d_transmission_for_sacling_down,
+    d2d_transmission_for_scaling_down,
     gen_all_layer_log2phy,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
@@ -287,7 +287,7 @@ class NPUWorker(WorkerBase):
             raise ValueError("unknown number of experts")
 
         # recalculation of expert distribution
-        enable_d2d_after_failure = self.vllm_config.fault_tolerance.enable_fault_tolerance_rebalance
+        enable_d2d_after_failure = self.vllm_config.fault_tolerance_config.enable_fault_tolerance_rebalance
         if self.model_runner.shared_dict["moe_load"] is None or torch.all(self.model_runner.shared_dict["moe_load"][0] == 0):
             enable_d2d_after_failure = False
         cur_rank_need_load_h2d = get_expert_distribution_after_descale(self.model_runner, exclude_ep_ranks, enable_d2d_after_failure, rank)
@@ -324,7 +324,7 @@ class NPUWorker(WorkerBase):
 
         # allow balanced D2D transmission
         if enable_d2d_after_failure:
-            all_layer_log2phy = d2d_transmission_for_sacling_down(self.model_runner)
+            all_layer_log2phy = d2d_transmission_for_scaling_down(self.model_runner)
         else:
             all_layer_log2phy = gen_all_layer_log2phy(self.model_runner, rank)
 
