@@ -71,18 +71,16 @@ from vllm_ascend.utils import (
     register_ascend_customop,
 )
 from vllm_ascend.worker.descale import (
+    d2d_transmission_for_scaling_down,
     destroy_acl_graph,
     destroy_comm_group,
     expand_expert_weights,
-    gen_expert_backup_map,
-    gen_global_log2phy_map,
-    gen_local_log2phy_map,
+    gen_all_layer_log2phy,
     generate_redundant_expert_ids,
     get_expert_distribution_after_descale,
     init_dp_cpu_group,
     init_elastic_info,
     init_ep2dp_map,
-    init_global_expert_distribution,
     rebuild_acl_graph,
     reconfigure_moe,
     reinit_comm_group,
@@ -90,10 +88,8 @@ from vllm_ascend.worker.descale import (
     save_expert_weights_to_ram,
     update_elastic_info,
     update_ep2dp_map,
-    update_parallel_config,
     update_eplb_adaptor_info,
-    d2d_transmission_for_scaling_down,
-    gen_all_layer_log2phy,
+    update_parallel_config,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
@@ -364,9 +360,13 @@ class NPUWorker(WorkerBase):
 
         # recalculation of expert distribution
         enable_d2d_after_failure = self.vllm_config.fault_tolerance_config.enable_fault_tolerance_rebalance
-        if self.model_runner.shared_dict["moe_load"] is None or torch.all(self.model_runner.shared_dict["moe_load"][0] == 0):
+        if self.model_runner.shared_dict["moe_load"] is None or torch.all(
+            self.model_runner.shared_dict["moe_load"][0] == 0
+        ):
             enable_d2d_after_failure = False
-        cur_rank_need_load_h2d = get_expert_distribution_after_descale(self.model_runner, exclude_ep_ranks, enable_d2d_after_failure, rank)
+        cur_rank_need_load_h2d = get_expert_distribution_after_descale(
+            self.model_runner, exclude_ep_ranks, enable_d2d_after_failure, rank
+        )
         num_add_experts_per_rank = self.model_runner.shared_dict["num_add_experts_per_rank"]
 
         if num_add_experts_per_rank > 0:
@@ -404,7 +404,9 @@ class NPUWorker(WorkerBase):
         else:
             all_layer_log2phy = gen_all_layer_log2phy(self.model_runner, rank)
 
-        self.global_experts_distribution = self.model_runner.eplb_process.worker.local2global(self.model_runner.shared_dict["expert_maps"])
+        self.global_experts_distribution = self.model_runner.eplb_process.worker.local2global(
+            self.model_runner.shared_dict["expert_maps"]
+        )
 
         old_ep_size = len(self.ep2dp_map)
         # update parallel config
