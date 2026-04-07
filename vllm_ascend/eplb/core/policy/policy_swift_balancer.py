@@ -1,8 +1,10 @@
 # Copyright Huawei Technologies Co., Ltd. 2024-2025. All rights reserved.
 # Todo: Once https://github.com/vllm-project/vllm/pull/24069 is merged in vllm. Remove this policy.
 from collections import defaultdict
+
 import numpy as np
 from vllm.logger import logger
+
 from .policy_abstract import DynamicConfig, EplbPolicy
 
 
@@ -116,8 +118,9 @@ class SwiftBalanceEplb(EplbPolicy):
                 expert_id, original_weight = target_expert
                 current_redundancy = len(redundant_assignments[expert_id])
                 if current_redundancy < num_ranks:
-                    new_avg_weight = self.safe_divide(original_weight * (current_redundancy + 1),
-                                                      (current_redundancy + 2))
+                    new_avg_weight = self.safe_divide(
+                        original_weight * (current_redundancy + 1), (current_redundancy + 2)
+                    )
                     redundant_assignments[expert_id].append(num_experts + i)
                     current_weights[index] = (expert_id, new_avg_weight)
                     break
