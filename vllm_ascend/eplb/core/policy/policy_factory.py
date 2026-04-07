@@ -2,10 +2,10 @@
 # Todo: Once https://github.com/vllm-project/vllm/pull/24069 is merged in vllm. Remove this factory.
 from .policy_abstract import EplbPolicy
 from .policy_default_eplb import DefaultEplb
+from .policy_fault_rearrangement import FaultRearrangement
 from .policy_flashlb import FlashLB, warm_up
 from .policy_random import RandomLoadBalance
 from .policy_swift_balancer import SwiftBalanceEplb
-from .policy_fault_rearrangement import FaultRearrangement
 
 
 class PolicyFactory:

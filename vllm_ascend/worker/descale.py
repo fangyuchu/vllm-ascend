@@ -1,12 +1,9 @@
-import copy
 import gc
-import math
-from collections import defaultdict
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
-import torch
 import numpy as np
+import torch
 import torch_npu
 from torch.distributed.distributed_c10d import _set_pg_timeout
 from vllm.compilation.wrapper import reset_compile_wrapper
@@ -24,8 +21,13 @@ from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig, FusedMoE
 from vllm.model_executor.model_loader import get_model_loader
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.distributed.parallel_state import destroy_ascend_model_parallel, get_mc2_group, set_elastic_info, get_dynamic_eplb_group
-from vllm_ascend.eplb.core.eplb_utils import init_eplb_config, generate_log2phy_map
+from vllm_ascend.distributed.parallel_state import (
+    destroy_ascend_model_parallel,
+    get_dynamic_eplb_group,
+    get_mc2_group,
+    set_elastic_info,
+)
+from vllm_ascend.eplb.core.eplb_utils import generate_log2phy_map, init_eplb_config
 from vllm_ascend.ops.fused_moe.fused_moe import setup_moe_comm_method
 
 if TYPE_CHECKING:
@@ -165,10 +167,10 @@ def generate_redundant_expert_ids(num_experts: int, ep_size: int, num_redundant_
 
 
 def get_expert_distribution_after_descale(
-        model_runner,
-        exclued_dp_ranks,
-        enable_d2d_after_failure,
-        rank_id,
+    model_runner,
+    exclued_dp_ranks,
+    enable_d2d_after_failure,
+    rank_id,
 ):
     eplb_updator = model_runner.eplb_updator
     model_runner.shared_dict["descale"] = True
@@ -187,6 +189,7 @@ def get_expert_distribution_after_descale(
         cur_rank_need_load_h2d.append(cur_rank_need_load)
 
     return cur_rank_need_load_h2d
+
 
 def destroy_acl_graph(use_mask_mc2: bool, vllm_config: VllmConfig, model: NPUModelRunner) -> VllmConfig:
     if not use_mask_mc2:
@@ -227,7 +230,7 @@ def init_dp_cpu_group(vllm_config: VllmConfig, group_type="normal") -> None:
             vllm_config.parallel_config.data_parallel_rank,
             vllm_config.parallel_config.data_parallel_size,
             backend="gloo",
-            fault_tolerance_config = vllm_config.fault_tolerance_config,
+            fault_tolerance_config=vllm_config.fault_tolerance_config,
         )
         get_dynamic_eplb_group().group_type = group_type
 
@@ -253,10 +256,10 @@ def reinit_comm_group(use_mask_mc2: bool, vllm_config: VllmConfig, worker: NPUWo
 
 
 def save_expert_weights_to_ram(
-        cur_rank_need_load_h2d,
-        vllm_config,
-        model_runner,
-        quant,
+    cur_rank_need_load_h2d,
+    vllm_config,
+    model_runner,
+    quant,
 ) -> dict[str, torch.Tensor]:
     """
     Load the specified unsaved expert weights and save them to memory (RAM)
@@ -328,9 +331,7 @@ def expand_parameter(old_param, axis: int = 0, extra_lines: int = 1) -> torch.nn
     return torch.nn.Parameter(new_tensor, requires_grad=old_param.requires_grad)
 
 
-def expand_expert_weights(
-    model_runner: NPUModelRunner, expand_lines: int, quant: bool | str
-) -> None:
+def expand_expert_weights(model_runner: NPUModelRunner, expand_lines: int, quant: bool | str) -> None:
     if expand_lines:
         for module in model_runner.model.modules():
             if isinstance(module, FusedMoE) and expand_lines:
@@ -452,6 +453,7 @@ def reload_fault_expert_weights(
                     _load_single_expert(expert_id=expert_id, target_index=slot_pos, quant=quant)
 
             cur_layer_id += 1
+
 
 def update_parallel_config(original_config: VllmConfig, update_config: dict[str, int]) -> None:  # , worker_guard)
     required_keys = {
@@ -646,6 +648,7 @@ def reconfigure_moe(
                 module.quant_method.quant_method = AscendW8A8DynamicFusedMoEMethod()
                 # todo support other quant like w4a4 w4a8 ...
 
+
 def update_eplb_adaptor_info(model_runner, num_add_experts_per_rank, rank):
     model_runner.eplb_adaptor.rank_id = rank
     model_runner.eplb_adaptor.model.clear_all_moe_loads()
@@ -659,6 +662,7 @@ def update_eplb_adaptor_info(model_runner, num_add_experts_per_rank, rank):
     cur_deployment = model_runner.shared_dict["expert_maps"]
     for layer_id in range(cur_deployment.shape[0]):
         model_runner.eplb_adaptor.do_clone_update_expert_map(layer_id, cur_deployment[layer_id][rank])
+
 
 def d2d_transmission_for_scaling_down(model_runner):
     eplb_loader = model_runner.eplb_loader
@@ -692,6 +696,7 @@ def d2d_transmission_for_scaling_down(model_runner):
 
     return all_layer_log2phy_map
 
+
 def gen_all_layer_log2phy(model_runner, rank):
     all_layer_log2phy = []
     cur_deployment = model_runner.shared_dict["expert_maps"]
@@ -700,6 +705,7 @@ def gen_all_layer_log2phy(model_runner, rank):
         all_layer_log2phy.append(cur_layer_log2phy_map)
 
     return all_layer_log2phy
+
 
 def get_global_expert_map(model_runner):
     num_dense_layers = getattr(model_runner.model.config, "first_k_dense_replace", 0)
