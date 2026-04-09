@@ -1,6 +1,7 @@
 from collections import defaultdict
 
 import numpy as np
+import torch
 
 from .policy_abstract import DynamicConfig, EplbPolicy
 
@@ -30,32 +31,34 @@ class FaultRearrangement(EplbPolicy):
         self.max_swap_times = 100
         self.num_max_com = 1
         self.swap_threshold = 0
-        # A3(16), A2(8)
-        self.n_cards_per_nodes = 16
+        self.n_cards_per_nodes = config.num_die_per_host
         self.n_add_expert_per_card = 0
         self.failed_cards = []
         self.enable_d2d_after_failure = False
 
-    def get_original_workload(self):
+    def get_original_workload(self) -> np.ndarray:
         workload_new = np.zeros((self.n_layer, self.n_experts))
         if self.enable_d2d_after_failure:
             for layer_idx in range(self.n_layer):
                 workload_dict: dict[int, int] = defaultdict(int)
 
                 placement_layer = self.org_deployment[layer_idx].copy()
-                workload_layer = self.org_deployment[layer_idx].copy()
+                workload_layer = self.org_workload[layer_idx].copy()
                 for card_idx in range(self.n_org_cards):
                     for index in range(self.n_experts_per_card):
-                        workload_dict[placement_layer[card_idx][index]] += workload_layer[card_idx][index]
+                        workload_dict[int(placement_layer[card_idx][index])] += workload_layer[card_idx][index]
                 for expert_idx in range(self.n_experts):
                     workload_new[layer_idx][expert_idx] = workload_dict[expert_idx]
 
         return workload_new
 
-    def constraint_expert_local_exchange(self, old_deployment, new_deployment):
+    def constraint_expert_local_exchange(self,
+                                         old_deployment: np.ndarray,
+                                         new_deployment: np.ndarray
+                                         ) -> tuple[list[list[int]], list[list[int]]]:
         new_deployment_list = []
         old_deployment_list = []
-        # todo 变量命名
+
         for card_id in range(self.n_remain_cards):
             current_list = [int(x) for x in old_deployment[card_id]]
             new_list = [int(x) for x in new_deployment[card_id]]
@@ -87,18 +90,17 @@ class FaultRearrangement(EplbPolicy):
 
         return new_deployment_list, old_deployment_list
 
-    def get_cur_expert_maps_dict(self, old_placement):
-        all_layer_cur_expert_maps = []
-        n_layer, n_rank, _ = old_placement.shape
-        for layer_id in range(n_layer):
-            cur_expert_maps = defaultdict(list)
-            for rank_id in range(n_rank):
-                cur_expert_maps[rank_id] = old_placement[layer_id][rank_id].tolist()
-            all_layer_cur_expert_maps.append(cur_expert_maps)
+    def rebalance_experts(
+            self,
+            current_expert_table: torch.Tensor,
+            expert_workload: torch.Tensor
+    ) -> tuple[
+        list[list[list[int]]],
+        list[list[list[int]]],
+        list[defaultdict[int, list[tuple[int, int]]]],
+        int
+    ]:
 
-        return all_layer_cur_expert_maps
-
-    def rebalance_experts(self, current_expert_table, expert_workload):
         if expert_workload is not None:
             self.org_workload = expert_workload.numpy()
 
@@ -153,19 +155,20 @@ class FaultRearrangement(EplbPolicy):
         num_com_between_rank: np.ndarray,
         rev_expert_per_rank: defaultdict[int, set[int]],
         updated_weights: np.ndarray,
-    ):
+    ) -> tuple[np.ndarray, float]:
+
         rank_deploy_sets = []
         for rank_id in range(self.n_remain_cards):
             rank_deploy_sets.append(set(rank_assignments[rank_id]))
 
         max_swap_times = self.max_swap_times
-        max_rank_load = 0
+        max_rank_load = 0.0
         exchange = True
         while max_swap_times > 0:
             max_swap_times -= 1
             sorted_rank_idx = np.argsort(rank_loads, kind="stable")
             max_load_rank_id = int(sorted_rank_idx[-1])
-            max_rank_load = rank_loads[max_load_rank_id]
+            max_rank_load = float(rank_loads[max_load_rank_id])
 
             if not exchange:
                 break
@@ -210,18 +213,19 @@ class FaultRearrangement(EplbPolicy):
 
         ranks_deployment_after_swap = [list(s) for s in rank_deploy_sets]
 
-        return ranks_deployment_after_swap, max_rank_load
+        return np.array(ranks_deployment_after_swap), max_rank_load
 
     def swap_experts_between_ranks(
         self,
-        max_rank_deployment_set,
-        swap_rank_deployment_set,
-        max_rank_rev_expert,
-        swap_rank_rev_expert,
-        workload,
-        max_rank_load,
-        swap_rank_load,
-    ):
+        max_rank_deployment_set: set[int],
+        swap_rank_deployment_set: set[int],
+        max_rank_rev_expert: set[int],
+        swap_rank_rev_expert: set[int],
+        workload: np.ndarray,
+        max_rank_load: float,
+        swap_rank_load: float,
+    ) -> tuple[int, int, float]:
+
         max_rank_expert = -1
         swap_rank_expert = -1
         max_weight = max_rank_load
@@ -230,13 +234,13 @@ class FaultRearrangement(EplbPolicy):
             if cur_expert_id in swap_rank_deployment_set or cur_expert_id in max_rank_rev_expert:
                 continue
 
-            cur_weight = workload[cur_expert_id]
+            cur_weight = float(workload[cur_expert_id])
 
             for next_expert_id in swap_rank_deployment_set:
                 if next_expert_id in max_rank_deployment_set or next_expert_id in swap_rank_rev_expert:
                     continue
 
-                next_weight = workload[next_expert_id]
+                next_weight = float(workload[next_expert_id])
 
                 cur_load_after_swap = max_rank_load - cur_weight + next_weight
                 next_load_after_swap = swap_rank_load - next_weight + cur_weight
@@ -248,31 +252,13 @@ class FaultRearrangement(EplbPolicy):
 
         return max_rank_expert, swap_rank_expert, max_weight
 
-    def sort_expert_ids_by_workload(self, expert_ids, workload):
-        expert_ids_np = np.array(expert_ids)
-        sorted_indices = np.argsort(workload[expert_ids_np])
-        sorted_expert_id = expert_ids_np[sorted_indices]
 
-        return sorted_expert_id.tolist()
+    def _load_no_backup_experts(self, old_deployment: np.ndarray,
+                                redundant_expert_pos: list[list[int]],
+                                no_backup_experts: list[int],
+                                expert_from_rank: list[int]
+                                ) -> defaultdict[int, list[tuple[int, int]]]:
 
-    def _swap_two_cards(
-        self,
-        card_selected,
-        card_selected_count,
-        surplus_id,
-        deficit_id,
-        allocate_amount,
-    ):
-        for _ in range(allocate_amount):
-            surplus_card_expert_id = min(card_selected[surplus_id])
-
-            card_selected[surplus_id].remove(surplus_card_expert_id)
-            card_selected[deficit_id].add(surplus_card_expert_id)
-
-            card_selected_count[surplus_id] -= 1
-            card_selected_count[deficit_id] += 1
-
-    def _load_no_backup_experts(self, old_deployment, redundant_expert_pos, no_backup_experts, expert_from_rank):
         sorted_result = []
         for card_id in range(self.n_remain_cards):
             if len(redundant_expert_pos[card_id]) > 0:
@@ -295,11 +281,16 @@ class FaultRearrangement(EplbPolicy):
                 index += 1
             else:
                 sorted_card_id.pop(index)
+
+            assert len(sorted_card_id) > 0, "No available cards left"
             index = index % len(sorted_card_id)
 
         return need_load_h2d
 
-    def recomputing_workload(self, rank_assignments, org_workload):
+    def recomputing_workload(self,
+                             rank_assignments: np.ndarray,
+                             org_workload: np.ndarray
+                             ) -> tuple[np.ndarray, np.ndarray]:
         num_per_existing_expert = np.zeros(self.n_experts, dtype=np.int64)
 
         for rank in rank_assignments:
@@ -315,8 +306,14 @@ class FaultRearrangement(EplbPolicy):
 
         return update_workload, num_per_existing_expert
 
-    def fill_in_undeployed_ranks(self, rank_assignments, org_workload, redundant_expert_pos):
-        update_workload, num_per_existing_expert = self.recomputing_workload(rank_assignments, org_workload)
+    def fill_in_undeployed_ranks(self,
+                                 rank_assignments: np.ndarray,
+                                 org_workload: np.ndarray,
+                                 redundant_expert_pos: list[list[int]]):
+
+        update_workload, num_per_existing_expert = self.recomputing_workload(
+            rank_assignments, org_workload
+        )
 
         for card_id in range(self.n_remain_cards):
             need_redundancy = len(redundant_expert_pos[card_id])
@@ -358,7 +355,11 @@ class FaultRearrangement(EplbPolicy):
 
         return min_rank_id
 
-    def statistics_expert_distribution(self, single_layer_deployment):
+    def statistics_expert_distribution(
+            self,
+            single_layer_deployment: np.ndarray
+    ) -> tuple[list[list[int]], list[int], list[int], int]:
+
         expert_to_rank = defaultdict(list)
         n_exist_experts = np.zeros(self.n_experts, dtype=np.int64)
         for rank_id in range(self.n_remain_cards):
@@ -435,7 +436,12 @@ class FaultRearrangement(EplbPolicy):
         updated_weights: np.ndarray,
         redundant_expert_pos: list[list[int]],
     ) -> tuple[np.ndarray, np.ndarray]:
-        rank_assignments = np.full((self.n_remain_cards, self.n_experts_per_card), fill_value=-1, dtype=np.int64)
+
+        rank_assignments = np.full(
+            (self.n_remain_cards, self.n_experts_per_card),
+            fill_value=-1,
+            dtype=np.int64
+        )
         rank_loads = np.zeros(self.n_remain_cards, dtype=np.float32)
 
         for rank_id in range(self.n_remain_cards):
@@ -449,19 +455,23 @@ class FaultRearrangement(EplbPolicy):
 
     def expand_deployment_table(
         self,
-        deployment,
-        redundant_expert_pos,
-        n_add_expert_per_card,
-    ):
+        deployment: np.ndarray,
+        redundant_expert_pos: list[list[int]],
+        n_add_expert_per_card: int,
+    ) -> np.ndarray:
+        expanded_deployment = deployment.tolist()
         for card_id in range(self.n_remain_cards):
             for _ in range(n_add_expert_per_card):
-                deployment[card_id].append(-1)
+                expanded_deployment[card_id].append(-1)
 
         for rank_id in range(self.n_remain_cards):
             for i in range(n_add_expert_per_card):
                 redundant_expert_pos[rank_id].append(i + self.n_experts_per_card)
 
         self.n_experts_per_card += self.n_add_expert_per_card
+
+        return np.array(expanded_deployment)
+
 
     def distribute_redundant_experts(
         self,
@@ -471,6 +481,7 @@ class FaultRearrangement(EplbPolicy):
         expert_from_rank: list[int],
         redundant_expert_pos: list[list[int]],
     ) -> tuple[np.ndarray, defaultdict[int, set[int]], list[int]]:
+
         rev_expert_per_rank = defaultdict(set)
         num_com_between_rank = np.zeros((self.n_remain_cards, self.n_remain_cards), dtype=np.int64)
 
@@ -506,20 +517,26 @@ class FaultRearrangement(EplbPolicy):
         self,
         cur_layer_deployment: np.ndarray,
         org_workload: np.ndarray,
-    ):
+    ) -> tuple[np.ndarray, np.ndarray, defaultdict[int, list[tuple[int, int]]]]:
+
         redundant_expert_pos, expert_from_rank, no_backup_experts, num_redundant_experts = (
             self.statistics_expert_distribution(cur_layer_deployment)
         )
 
         if self.n_add_expert_per_card > 0:
             raise ValueError("Capacity expansion is not supported.")
-        self.expand_deployment_table(cur_layer_deployment, redundant_expert_pos, self.n_add_expert_per_card)
+            # cur_layer_deployment = self.expand_deployment_table(
+            #     cur_layer_deployment,
+            #     redundant_expert_pos,
+            #     self.n_add_expert_per_card
+            # )
 
         if no_backup_experts:
+            num_no_backup_experts = len(no_backup_experts)
             need_load_h2d = self._load_no_backup_experts(
                 cur_layer_deployment, redundant_expert_pos, no_backup_experts, expert_from_rank
             )
-            num_redundant_experts -= len(no_backup_experts)
+            num_redundant_experts -= num_no_backup_experts
         else:
             need_load_h2d = defaultdict(list)
 
@@ -532,8 +549,14 @@ class FaultRearrangement(EplbPolicy):
                 cur_layer_deployment, update_weight, redundant_expert_pos
             )
 
-            num_com_between_rank, rev_expert_per_rank, undeployed_ranks = self.distribute_redundant_experts(
-                rank_assignments, rank_loads, redundant_expert_list, expert_from_rank, redundant_expert_pos
+            num_com_between_rank, rev_expert_per_rank, undeployed_ranks = (
+                self.distribute_redundant_experts(
+                    rank_assignments,
+                    rank_loads,
+                    redundant_expert_list,
+                    expert_from_rank,
+                    redundant_expert_pos
+                )
             )
 
             if len(undeployed_ranks) > 0:
@@ -541,8 +564,14 @@ class FaultRearrangement(EplbPolicy):
                     rank_assignments, org_workload, redundant_expert_pos
                 )
 
-            new_deployment, after_swap_max_load = self.expert_exchange_between_ranks(
-                rank_assignments, rank_loads, num_com_between_rank, rev_expert_per_rank, update_weight
+            new_deployment, after_swap_max_load = (
+                self.expert_exchange_between_ranks(
+                    rank_assignments,
+                    rank_loads,
+                    num_com_between_rank,
+                    rev_expert_per_rank,
+                    update_weight
+                )
             )
         else:
             new_deployment = cur_layer_deployment
