@@ -300,8 +300,6 @@ class NPUWorker(WorkerBase):
         if not self.model_config.enforce_eager and not self.use_mask_mc2:
             self.vllm_config = destroy_acl_graph(self.use_mask_mc2, self.vllm_config, self.model_runner)
 
-        destroy_comm_group(self.use_mask_mc2)
-
         # reload fault expert weights
         self.experts_saved_weights = save_expert_weights_to_ram(
             cur_rank_need_load_h2d,
