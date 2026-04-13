@@ -298,6 +298,10 @@ class EplbWorker:
         for i in sorted(exclude_dp_ranks, reverse=True):
             self.rank_id_to_initial_global.pop(i)
 
+    def warm_up_shared_dict(self):
+        old_expert_maps = self.get_init_expert_maps()
+        num_local_experts = old_expert_maps.max()
+
     @staticmethod
     def _compute_imbalance(deployment_all_layer, hotness_all_layer: np.ndarray):
         imbalance_list = []
@@ -345,6 +349,8 @@ class EplbProcess:
 
         # Create EplbWorker instance
         self.worker = EplbWorker(self.shared_dict, self.policy_type, self.enable_d2d)
+        warm_maps = torch.zeros((1, 1, 1), dtype=torch.int32)
+        self.shared_dict["expert_maps"] = warm_maps
 
     def worker_process(self, planner_q, block_update_q):
         """
@@ -364,6 +370,7 @@ class EplbProcess:
             from vllm_ascend.eplb.core.policy.policy_flashlb import warm_up
 
             warm_up()
+        self.worker.warm_up_shared_dict()
         while True:
             try:
                 planner_q.get()
