@@ -298,7 +298,7 @@ class EplbWorker:
 
     def warm_up_shared_dict(self):
         old_expert_maps = self.get_init_expert_maps()
-        num_local_experts = old_expert_maps.max()
+        _ = old_expert_maps.max()
 
     @staticmethod
     def _compute_imbalance(deployment_all_layer, hotness_all_layer: np.ndarray):
