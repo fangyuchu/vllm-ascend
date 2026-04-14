@@ -80,7 +80,6 @@ from vllm_ascend.worker.descale import (
     destroy_comm_group,
     expand_expert_weights,
     gen_all_layer_log2phy,
-    generate_redundant_expert_ids,
     get_expert_distribution_after_descale,
     init_dp_cpu_group,
     init_elastic_info,
@@ -207,7 +206,6 @@ class NPUWorker(WorkerBase):
                 raise ValueError("unknown number of experts")
 
             self.use_mask_mc2 = False
-            redundant_expert_list = []
             ep_size = (
                 self.vllm_config.parallel_config.data_parallel_size
                 * self.vllm_config.parallel_config.tensor_parallel_size
@@ -217,9 +215,6 @@ class NPUWorker(WorkerBase):
             num_redundancy_expert = eplb_cfg.get("num_redundant_experts")
             if num_redundancy_expert and get_ascend_device_type() in {AscendDeviceType.A3}:
                 self.use_mask_mc2 = True
-                redundant_expert_list = generate_redundant_expert_ids(
-                    self.num_logical_expert, ep_size, num_redundancy_expert
-                )
 
             self.backup_expert_rank_mapping = False
             init_elastic_info(self.use_mask_mc2, ep_size, (self.num_logical_expert + num_redundancy_expert))
