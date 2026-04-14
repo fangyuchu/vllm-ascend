@@ -344,8 +344,7 @@ class NPUWorker(WorkerBase):
         rank_mapping = vllm_update_config.get("rank_mapping")
         assert rank_mapping is not None
         assert type(rank_mapping) is dict
-        new2old_rank_mapping = {new_rank: old_rank for old_rank, new_rank in rank_mapping.items()}
-        old_rank = int(new2old_rank_mapping[rank])
+
         if hasattr(self.vllm_config.model_config.hf_config, "num_experts"):
             num_logical_expert = self.vllm_config.model_config.hf_config.num_experts
         elif hasattr(self.vllm_config.model_config.hf_config, "n_routed_experts"):
