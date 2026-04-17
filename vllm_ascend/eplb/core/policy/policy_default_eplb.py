@@ -106,16 +106,13 @@ class DefaultEplb(EplbPolicy):
                     if min_box_index == -1 or box_weights[i] < box_weights[min_box_index]:
                         min_box_index = i
 
+            # If no valid box is found, place in the first available box (duplicates will be fixed in Step5)
             if min_box_index == -1:
-                # Try to place in the last box first
-                if box_counts[-1] < items_per_box or (box_counts[-1] == items_per_box and remaining_items > 0):
-                    min_box_index = -1
-                else:
-                    # Find any box with capacity
-                    for i in range(card_num):
-                        if box_counts[i] < items_per_box or (box_counts[i] == items_per_box and remaining_items > 0):
-                            min_box_index = i
-                            break
+                # Find any box with capacity
+                for i in range(card_num):
+                    if box_counts[i] < items_per_box or (box_counts[i] == items_per_box and remaining_items > 0):
+                        min_box_index = i
+                        break
 
             # Place the item (id) into the selected box
             boxes[min_box_index].append(item_id)
@@ -127,25 +124,44 @@ class DefaultEplb(EplbPolicy):
             if box_counts[min_box_index] == (items_per_box + 1) and remaining_items > 0:
                 remaining_items -= 1
 
-        # Step 5: Eliminate duplicate experts within the same NPU through redundancy
-        #         reallocation. Replace duplicates with redundant copies from other
-        #         experts based on minimal weight difference.
+        # ==============================================================================
+        # STEP 5: DEDUPLICATION & REBALANCING
+        # ==============================================================================
+        # CONTEXT: Step 4's fallback logic can force duplicates into a card when no
+        #          valid unique slot exists (e.g., all other cards are full or contain the expert).
+        #
+        # EXAMPLE SCENARIO (4 Cards, 8 Loggical Experts, 8 All Weights = 0.0):
+        # 1. Redundant Phase: Symmetric distribution leads to:
+        #    Box 0: [0, 6] | Box 1: [0, 7] | Box 2: [0, 7] | Box 3: [1, 7]
+        #
+        # 2. Mandatory Phase: Order reverses (7 -> 0).
+        #    - Experts 7..2 fill available slots normally.
+        #    - Placing Expert 1: Box 3 already has '1'. Other boxes are full.
+        #      Fallback triggers -> Force into Box 3.
+        #      Result Box 3: [1, 7, 1] <-- DUPLICATE CREATED
+        #    - Expert 0 fills the remaining slot.
+        #
+        # FINAL STATE BEFORE STEP 5:
+        #   Box 0: [0, 6, 7, 5]
+        #   Box 1: [0, 7, 6, 4]
+        #   Box 2: [0, 7, 3, 2]
+        #   Box 3: [1, 7, 1, 0]  <-- Contains duplicate Expert 1
+        #
+        # ALGORITHM LOGIC:
+        # 1. Identify the duplicate expert in the card (e.g., Expert 1 in Box 3).
+        # 2. Calculate the weight difference: |weight(candidate) - weight(duplicate)|.
+        # 3. SELECT the candidate with the MINIMUM weight difference to replace the duplicate.
+        #    (This minimizes load imbalance while restoring uniqueness).
+        # ==============================================================================
         for i in range(card_num):
-            # Convert the list of experts assigned to the current NPU (card) to a numpy array
             arr = np.asarray(boxes[i])
 
-            # Identify unique expert IDs, their inverse indices, and their occurrence counts
-            # unique: distinct expert IDs in this NPU
-            # inv: mapping from original array to unique array
-            # cnt: count of each unique expert ID
             unique, inv, cnt = np.unique(arr, return_inverse=True, return_counts=True)
 
-            # Create a mask to identify experts that appear more than once (duplicates)
             mask = cnt > 1
             dup_vals = unique[mask]  # The IDs of the duplicated experts
             dup_cnts = cnt[mask]  # How many times each duplicated expert appears
 
-            # Iterate over each duplicated expert and its excess count
             for item_id, counts in zip(dup_vals, dup_cnts):
                 # We need to replace (counts - 1) occurrences to leave only one instance
                 for _ in range(counts - 1):
@@ -154,17 +170,12 @@ class DefaultEplb(EplbPolicy):
                     # Get the current weight associated with this duplicate expert
                     cur_weight = boxes_weights[i][cur_position]
 
-                    # Calculate a "projected weight" for all potential candidate experts to replace the duplicate.
-                    # Formula: weight * (current_redundancy_count + 1) / (current_redundancy_count + 2)
-                    # This estimates the new average weight if one more copy of the expert were added.
-                    # We sort candidates by the absolute difference between this projected weight and the current weight
-                    # being removed.
                     sorted_indices = np.argsort(
                         [
                             abs(
                                 t[1]
-                                * (len(route_expert_redundancy[t[0]]) + 1)
-                                / (len(route_expert_redundancy[t[0]]) + 2)
+                                * (len(route_expert_redundancy[t[0]]) + 1)  # replace before
+                                / (len(route_expert_redundancy[t[0]]) + 2)  # replace after
                                 - cur_weight
                             )
                             for t in origin_weights
@@ -172,18 +183,11 @@ class DefaultEplb(EplbPolicy):
                         kind="stable",
                     )
 
-                    # Reorder the origin_weights list based on the calculated similarity (minimal weight difference)
                     weights = [origin_weights[idx] for idx in sorted_indices]
 
                     index = 0
-                    # Search for the best valid candidate to replace the duplicate
                     while index < len(weights):
                         candidate_id = weights[index][0]
-                        # Validation checks for the candidate:
-                        # 1. The candidate must not have reached the maximum redundancy limit (card_num - 1)
-                        # 2. The candidate cannot be the same expert we are trying to remove (item_id)
-                        # 3. The candidate must not already exist in the current NPU (boxes[i]) to avoid creating
-                        #    new duplicates
                         if (
                             len(route_expert_redundancy[candidate_id]) < card_num - 1
                             and candidate_id != item_id
@@ -192,32 +196,21 @@ class DefaultEplb(EplbPolicy):
                             break
                         index += 1
 
-                    # Perform the replacement
-                    # 1. Update the expert ID in the box
                     boxes[i][cur_position] = weights[index][0]
-
-                    # 2. Update the redundancy tracking for the NEW expert (increment count)
-                    # Calculate the new average weight after adding this copy
                     tmp_raw_weight = weights[index][1] * (len(route_expert_redundancy[weights[index][0]]) + 1)
                     route_expert_redundancy[weights[index][0]].append(0)  # Add a placeholder to track redundancy
                     avg_weight = tmp_raw_weight / (len(route_expert_redundancy[weights[index][0]]) + 1)
                     boxes_weights[i][cur_position] = avg_weight
 
-                    # Update the local weights list to reflect the new average weight for the newly added expert
                     weights[index] = (weights[index][0], avg_weight)
 
-                    # 3. Update the redundancy tracking for the OLD expert (decrement count)
-                    # Remove one instance of the duplicate expert from the redundancy tracker
                     tmp_raw_weight = cur_weight * (len(route_expert_redundancy[item_id]) + 1)
                     avg_weight = tmp_raw_weight / len(route_expert_redundancy[item_id])
                     route_expert_redundancy[item_id].pop()
 
-                    # Update the local weights list to reflect the new average weight for the removed expert
                     for index, (expert_id, expert_weight) in enumerate(weights):
                         if item_id == expert_id:
                             weights[index] = (expert_id, avg_weight)
-
-                    # Refresh the global origin_weights list for the next iteration of the inner loop
                     origin_weights = weights
 
         box_weights = [sum(boxes_weights[i]) for i in range(card_num)]
@@ -366,77 +359,33 @@ class DefaultEplb(EplbPolicy):
 
     @staticmethod
     def constraint_expert_local_exchange(current_expert_table, global_deployment):
-        """
-        Aligns the local expert ranking with the target global deployment plan
-        without moving experts across devices (cards).
-
-        It ensures that the resulting list on each card contains exactly the same
-        set of experts as before, but arranged in the order specified by
-        `global_deployment`.
-
-        Args:
-            current_expert_table: Current expert allocation (list of lists of lists).
-            global_deployment: Target expert allocation plan.
-
-        Returns:
-            Updated global_deployment with locally adjusted expert orders.
-        """
         for layer_id in range(len(global_deployment)):
             # Iterate over available cards, ensuring we don't go out of bounds
             num_cards = min(len(current_expert_table[layer_id]), len(global_deployment[layer_id]))
 
             for card_id in range(num_cards):
-                # Convert lists to numpy arrays for efficient set operations
-                # `local_expert_ids` refers to the experts currently on this card
-                # `target_expert_ids` refers to the desired order from the optimizer
-                local_expert_ids = np.array(current_expert_table[layer_id][card_id])
-                target_expert_ids = np.array(global_deployment[layer_id][card_id])
+                cur_expert_ids = np.array(current_expert_table[layer_id][card_id])
+                new_expert_ids = np.array(global_deployment[layer_id][card_id])
 
-                assert len(local_expert_ids) == len(target_expert_ids), (
-                    "Number of experts must match between current and target deployment."
+                assert len(cur_expert_ids) == len(new_expert_ids), (
+                    "Number of experts must match between current and new deployment."
                 )
 
-                # 1. Identify Expert that are already present in the target list.
-                # These experts will stay on this card, but may need to move positions.
-                mask_common_experts = np.isin(local_expert_ids, target_expert_ids)
-                experts_staying_local = local_expert_ids[mask_common_experts]
+                # 1. Identify experts that are not moved to other NPU.
+                mask_experts_not_move = np.isin(cur_expert_ids, new_expert_ids)
+                experts_not_move = cur_expert_ids[mask_experts_not_move]
 
-                # 2. Identify experts in the target list that need to be placed into the
-                # remaining slots. This step filters out the experts already 'taken' by
-                # `experts_staying_local` conceptualy, or simply identifies the ones
-                # that define the 'new' structure relative to the old one.
-                # Note: In logic, `target_expert_ids` defines the structure.
-                # We need to fill the slots of `target_expert_ids` with items from
-                # `local_expert_ids`.
-                #
-                # Correct Logic: We want to construct a list that is the SAME ORDER as `target_expert_ids`,
-                # but contains ONLY items from `local_expert_ids`.
-                # Since we assume Set(local) == Set(target), we just need to re-order.
-                #
-                # However, preserving the original code's logic (masking based on absolute position):
-                # It treats the array as a set of 'content' and 'structural containers'.
+                # 2. Identify experts in the new list that are moved from other NPU.
+                mask_new_experts = ~np.isin(new_expert_ids, experts_not_move)
+                new_experts = new_expert_ids[mask_new_experts]
 
-                # Extract the experts that are 'newly moved' relative to the comparison.
-                # These are the experts in the target list that were NOT in the 'common' set
-                # (or conceptually, the ones that need to be swapped in).
-                mask_experts_to_move = ~np.isin(target_expert_ids, experts_staying_local)
-                experts_to_relocate = target_expert_ids[mask_experts_to_move]
+                final_expert_list = new_expert_ids.copy()
 
-                # 3. Construct the final list.
-                # We start with a copy of the target structure.
-                final_expert_list = target_expert_ids.copy()
+                # Use mask_experts_not_move to constrain expert local exchange in NPU.
+                final_expert_list[mask_experts_not_move] = experts_not_move
 
-                # Fill the positions occupied by 'common' experts with the actual experts from the local card.
-                # This step maps the intersection back to the target positions.
-                final_expert_list[mask_common_experts] = experts_staying_local
-
-                # Fill the remaining positions (where experts moved) with the 'moved' experts.
-                # Ensure boolean logic aligns (the mask must match the data length).
-                # Note: Original code used mask_common_experts directly on target array, which implies
-                # `target_expert_ids` and `local_expert_ids` have some structural alignment or
-                # it's a specific heuristic.
-                # Assuming the logic aims to preserve as many indices as possible:
-                final_expert_list[~mask_common_experts] = experts_to_relocate
+                # Fill the remaining slot with experts that are moved from other NPUS.
+                final_expert_list[~mask_experts_not_move] = new_experts
 
                 # Update the global deployment plan with the locally constrained list
                 global_deployment[layer_id][card_id] = final_expert_list.tolist()
