@@ -124,35 +124,11 @@ class DefaultEplb(EplbPolicy):
             if box_counts[min_box_index] == (items_per_box + 1) and remaining_items > 0:
                 remaining_items -= 1
 
-        # ==============================================================================
-        # STEP 5: DEDUPLICATION & REBALANCING
-        # ==============================================================================
-        # CONTEXT: Step 4's fallback logic can force duplicates into a card when no
-        #          valid unique slot exists (e.g., all other cards are full or contain the expert).
-        #
-        # EXAMPLE SCENARIO (4 Cards, 8 Loggical Experts, 8 All Weights = 0.0):
-        # 1. Redundant Phase: Symmetric distribution leads to:
-        #    Box 0: [0, 6] | Box 1: [0, 7] | Box 2: [0, 7] | Box 3: [1, 7]
-        #
-        # 2. Mandatory Phase: Order reverses (7 -> 0).
-        #    - Experts 7..2 fill available slots normally.
-        #    - Placing Expert 1: Box 3 already has '1'. Other boxes are full.
-        #      Fallback triggers -> Force into Box 3.
-        #      Result Box 3: [1, 7, 1] <-- DUPLICATE CREATED
-        #    - Expert 0 fills the remaining slot.
-        #
-        # FINAL STATE BEFORE STEP 5:
-        #   Box 0: [0, 6, 7, 5]
-        #   Box 1: [0, 7, 6, 4]
-        #   Box 2: [0, 7, 3, 2]
-        #   Box 3: [1, 7, 1, 0]  <-- Contains duplicate Expert 1
-        #
-        # ALGORITHM LOGIC:
-        # 1. Identify the duplicate expert in the card (e.g., Expert 1 in Box 3).
-        # 2. Calculate the weight difference: |weight(candidate) - weight(duplicate)|.
-        # 3. SELECT the candidate with the MINIMUM weight difference to replace the duplicate.
-        #    (This minimizes load imbalance while restoring uniqueness).
-        # ==============================================================================
+        # Step 5: Deduplication & Rebalancing
+        # Target CASE: Handles the edge case where Step 4's fallback logic forces a duplicate
+        # expert onto a card because all other cards are either full or already contain that expert.
+        # ACTION: Identifies these forced duplicates and replaces them with unique candidates
+        # that minimize weight difference, restoring uniqueness while preserving load balance.
         for i in range(card_num):
             arr = np.asarray(boxes[i])
 
@@ -170,16 +146,14 @@ class DefaultEplb(EplbPolicy):
                     # Get the current weight associated with this duplicate expert
                     cur_weight = boxes_weights[i][cur_position]
 
+                    def score(t):
+                        before = len(route_expert_redundancy[t[0]]) + 1
+                        after = len(route_expert_redundancy[t[0]]) + 2
+                        adjusted = t[1] * before / after
+                        return abs(adjusted - cur_weight)
+
                     sorted_indices = np.argsort(
-                        [
-                            abs(
-                                t[1]
-                                * (len(route_expert_redundancy[t[0]]) + 1)  # replace before
-                                / (len(route_expert_redundancy[t[0]]) + 2)  # replace after
-                                - cur_weight
-                            )
-                            for t in origin_weights
-                        ],
+                        [score(t) for t in origin_weights],
                         kind="stable",
                     )
 
