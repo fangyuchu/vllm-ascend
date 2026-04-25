@@ -174,7 +174,7 @@ def get_expert_distribution_after_descale(
     model_runner.shared_dict["descale"] = True
     model_runner.shared_dict["enable_d2d_after_failure"] = enable_d2d_after_failure
     model_runner.shared_dict["excluded_dp_ranks"] = exclued_dp_ranks
-    if model_runner.shared_dict["expert_maps"] is None:
+    if model_runner.shared_dict["expert_maps"] is None and model_runner.shared_dict["expert_maps"] :
         model_runner.shared_dict["expert_maps"] = get_global_expert_map(model_runner)
 
     eplb_updator.wakeup_eplb_worker()
@@ -646,7 +646,7 @@ def update_eplb_adaptor_info(model_runner, num_add_experts_per_rank, rank):
     model_runner.eplb_adaptor.rank_id = rank
     model_runner.eplb_adaptor.model.clear_all_moe_loads()
     model_runner.shared_dict["moe_load"] = None
-    model_runner.eplb_adaptor.cur_iterations = 0
+    model_runner.eplb_updator.cur_iterations = 0
 
     if num_add_experts_per_rank > 0:
         model_runner.eplb_adaptor.init_buffer_tensor(num_add_experts_per_rank)

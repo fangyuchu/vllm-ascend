@@ -74,7 +74,7 @@ def init_eplb_config(eplb_config, layer_id, moe_config, mix_placement=False, num
     if expert_map_path:
         if not (os.path.exists(expert_map_path) and os.access(expert_map_path, os.R_OK)):
             raise ValueError("Invalid EPLB path")
-        eplb_enable = True
+
         global_placement, physical_count = expert_file_to_tensor(expert_map_path, layer_id)
         if physical_count is not None:
             n_redundant = physical_count - n_experts

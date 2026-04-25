@@ -35,7 +35,6 @@ class EplbUpdator:
         self.eplb_loader = loader
         self.eplb_process = eplb_process
         self.shared_dict = self.eplb_process.shared_dict
-        self.comm_group = get_dynamic_eplb_group()
 
     def set_adaptor(self, adaptor: VllmEplbAdaptor):
         self.adaptor = adaptor
@@ -143,7 +142,7 @@ class EplbUpdator:
         self.world_size = dist.get_world_size(group=self.comm_group.cpu_group)
         gather_list = [torch.empty_like(local_load) for _ in range(self.world_size)]
         dist.all_gather(
-            tensor_lsit=gather_list,
+            tensor_list=gather_list,
             tensor=local_load,
             group=self.comm_group.cpu_group,
         )

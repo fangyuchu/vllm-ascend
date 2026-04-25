@@ -303,7 +303,7 @@ class NPUWorker(WorkerBase):
         destroy_comm_group(self.use_mask_mc2)
 
         # reload fault expert weights
-        self.experts_saved_ids, self.experts_saved_weights = save_expert_weights_to_ram(
+        self.experts_saved_weights = save_expert_weights_to_ram(
             cur_rank_need_load_h2d,
             self.vllm_config,
             self.model_runner,
