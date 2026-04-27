@@ -62,7 +62,7 @@ class EplbWorker:
         # Get the updated expert table based on the workload information
         old_placement = self.global2local(self.old_expert_maps, self.num_local_experts)
         if self.shared_dict["descale"]:
-            exclude_dp_ranks = self.shared_dict["exclude_dp_ranks"]
+            exclude_dp_ranks = self.shared_dict["excluded_dp_ranks"]
             enable_d2d_after_failure = self.shared_dict["enable_d2d_after_failure"]
             self.update_rank_id(exclude_dp_ranks)
             new_placement, old_deployment, need_load_h2d, num_add_experts_per_rank = self.trigger_fault_redeployment(
@@ -77,7 +77,6 @@ class EplbWorker:
         else:
             num_add_experts_per_rank = 0
             _, _, new_placement = self.calculate_rebalance_experts(load_info, old_placement)
-
 
         if not torch.is_tensor(new_placement):
             new_placement = torch.tensor(new_placement)
@@ -276,7 +275,7 @@ class EplbWorker:
         return list(zip(send_all, recv_all, maps, log2phy_all, layer_ids))
 
     def trigger_fault_redeployment(self, load_info, old_placement, exclude_dp_ranks, enable_d2d_after_failure):
-        policy = PolicyFactory.generate_policy(4, DynamicConfig())
+        policy = PolicyFactory.generate_policy(4)
         policy.failed_cards = exclude_dp_ranks
         policy.enable_d2d_after_failure = enable_d2d_after_failure
 

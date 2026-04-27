@@ -3,7 +3,7 @@ from collections import defaultdict
 import numpy as np
 import torch
 
-from .policy_abstract import DynamicConfig, EplbPolicy
+from .policy_abstract import EplbPolicy
 
 
 class DynamicTable:
@@ -23,15 +23,15 @@ class DynamicTable:
 
 
 class FaultRearrangement(EplbPolicy):
-    def __init__(self, config: DynamicConfig):
-        super().__init__(config)
+    def __init__(self):
+        super().__init__()
 
         self.n_experts = None
         self.k_replicas = None
         self.max_swap_times = 100
         self.num_max_com = 1
         self.swap_threshold = 0
-        self.n_cards_per_nodes = config.num_die_per_host
+        self.n_cards_per_nodes = 8
         self.n_add_expert_per_card = 0
         self.failed_cards = []
         self.enable_d2d_after_failure = False

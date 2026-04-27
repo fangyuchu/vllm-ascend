@@ -365,7 +365,7 @@ class NPUModelRunner(GPUModelRunner):
         eplb_config = self.ascend_config.eplb_config
         self.dynamic_eplb = eplb_config.dynamic_eplb
         self.eplb_enable = self.dynamic_eplb or (eplb_config.expert_map_path is not None)
-        self.fault_tolerance = vllm_config.fault_tolerance_config.enable_fault_tolerance
+        self.fault_tolerance = vllm_config.parallel_config.enable_fault_tolerance
         if self.dynamic_eplb or self.fault_tolerance:
             self.is_eplb_warmuped = False
             self.policy_type = eplb_config.eplb_policy_type
@@ -373,9 +373,6 @@ class NPUModelRunner(GPUModelRunner):
             self.manager = Manager()
             self.shared_dict = self.manager.dict(
                 {"expert_map": None, "moe_load": None, "expert_maps": None, "descale": False})
-            self.shared_dict = self.manager.dict(
-                {"expert_map": None, "moe_load": None, "expert_maps": None, "descale": False}
-            )
             self.eplb_process = EplbProcess(shared_dict=self.shared_dict, policy_type=self.policy_type, enable_d2d=True)
             self.process = self.eplb_process._launch_process()
             self.eplb_updator = EplbUpdator(eplb_config, self.eplb_loader, self.eplb_process, self.process)

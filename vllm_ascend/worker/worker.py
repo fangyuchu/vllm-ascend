@@ -19,8 +19,6 @@
 
 import copy
 import gc
-import threading
-from collections.abc import Callable
 from datetime import timedelta
 from types import NoneType
 
@@ -28,7 +26,6 @@ import torch
 import torch.nn as nn
 import torch_npu
 import vllm.envs as envs_vllm
-import zmq
 from torch.distributed.distributed_c10d import _set_pg_timeout
 from torch_npu.op_plugin.atb._atb_ops import _register_atb_extensions
 from torch_npu.profiler import dynamic_profile as dp
@@ -36,14 +33,13 @@ from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.distributed import ensure_model_parallel_initialized, init_distributed_environment
 from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
 from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized, get_kv_transfer_group, has_kv_transfer_group
-from vllm.distributed.parallel_state import Handle, get_pp_group, get_tp_group
 from vllm.distributed.parallel_state import (
-    get_all_model_groups,
+    Handle,
     get_dp_group,
     get_pp_group,
     get_tp_group,
-    stateless_init_torch_distributed_process_group,
 )
+from vllm.distributed.utils import stateless_init_torch_distributed_process_group
 from vllm.logger import logger
 from vllm.lora.request import LoRARequest
 from vllm.sequence import IntermediateTensors
@@ -52,7 +48,6 @@ from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, memory_profiling
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.engine.base_sentinel import BaseSentinel
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
@@ -66,7 +61,6 @@ from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.distributed.parallel_state import get_elastic_info, init_ascend_model_parallel
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
-from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.utils import (
     AscendDeviceType,
     check_ascend_device_type,
@@ -81,7 +75,6 @@ from vllm_ascend.worker.descale import (
     expand_expert_weights,
     gen_all_layer_log2phy,
     get_expert_distribution_after_descale,
-    init_dp_cpu_group,
     init_elastic_info,
     init_ep2dp_map,
     rebuild_acl_graph,
@@ -95,6 +88,7 @@ from vllm_ascend.worker.descale import (
     update_parallel_config,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+from vllm_ascend.worker.sentinel.npu_worker_sentinel import NPUWorkerSentinel
 
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
 from torch._dynamo.variables import TorchInGraphFunctionVariable  # noqa: E402
@@ -142,7 +136,6 @@ class NPUWorker(WorkerBase):
         # init ascend config and soc version
         init_ascend_config(vllm_config)
         check_ascend_device_type()
-        self.worker_sentinel: WorkerSentinel | None = None
 
         super().__init__(
             vllm_config=vllm_config,
@@ -169,7 +162,7 @@ class NPUWorker(WorkerBase):
 
         if "UnquantizedLinearMethod" in WEIGHT_LOADER_V2_SUPPORTED:
             WEIGHT_LOADER_V2_SUPPORTED.remove("UnquantizedLinearMethod")
-
+        self.worker_sentinel: NPUWorkerSentinel | None = None
         self.use_v2_model_runner = envs_vllm.VLLM_USE_V2_MODEL_RUNNER
         self._pp_send_work: list[Handle] = []
 
@@ -190,7 +183,7 @@ class NPUWorker(WorkerBase):
 
             signal.signal(signal.SIGTERM, signal_handler)
             signal.signal(signal.SIGINT, signal_handler)
-        if self.vllm_config.fault_tolerance_config.enable_fault_tolerance:
+        if self.vllm_config.parallel_config.enable_fault_tolerance:
             self.ep2dp_map = init_ep2dp_map(
                 self.vllm_config.parallel_config.data_parallel_size,
                 self.vllm_config.parallel_config.tensor_parallel_size,
@@ -259,13 +252,14 @@ class NPUWorker(WorkerBase):
           metadata are valid.
         """
         # pre-verification and basic configuration
-        assert self.vllm_config.fault_tolerance_config.enable_fault_tolerance is True, "enable_fault_tolerance is False"
+        assert self.vllm_config.parallel_config.enable_fault_tolerance is True, "enable_fault_tolerance is False"
         if not self.backup_expert_rank_mapping:
             raise RuntimeError("not load model yet")
 
         self.cache_config.gpu_memory_utilization = FAULT_TOLERANCE_MEM_UTILIZATION
-        rank = self.vllm_config.parallel_config.data_parallel_rank
+        # rank = self.vllm_config.parallel_config.data_parallel_rank
         rank_mapping = vllm_update_config.get("rank_mapping")
+        rank = rank_mapping[self.parallel_config.data_parallel_rank]
         assert rank_mapping is not None
         assert type(rank_mapping) is dict
 
@@ -277,7 +271,9 @@ class NPUWorker(WorkerBase):
             raise ValueError("unknown number of experts")
 
         # recalculation of expert distribution
-        enable_d2d_after_failure = self.vllm_config.fault_tolerance_config.enable_fault_tolerance_rebalance
+        enable_d2d_after_failure = (
+            self.vllm_config.parallel_config.fault_tolerance_config.enable_fault_tolerance_rebalance
+        )
         if self.model_runner.shared_dict["moe_load"] is None or torch.all(
             self.model_runner.shared_dict["moe_load"][0] == 0
         ):
@@ -329,6 +325,9 @@ class NPUWorker(WorkerBase):
         update_parallel_config(self.vllm_config, vllm_update_config)
         self.model_runner.dp_size = self.vllm_config.parallel_config.data_parallel_size
         self.model_runner.dp_rank = self.vllm_config.parallel_config.data_parallel_rank
+        logger.info(
+            f"self.ep2dp_map is {self.ep2dp_map} exclude_ep_ranks is {exclude_ep_ranks} rank_mapping is {rank_mapping}"
+        )
         self.ep2dp_map = update_ep2dp_map(self.ep2dp_map, exclude_ep_ranks, rank_mapping)
         elastic_info = get_elastic_info()
         num_new_phy_experts = (self.model_runner.shared_dict["expert_maps"][0] != -1).sum().item()
@@ -352,7 +351,7 @@ class NPUWorker(WorkerBase):
         if not self.model_config.enforce_eager:
             rebuild_acl_graph(self.use_mask_mc2, self)
 
-    def init_dp_device_group(self,vllm_config: VllmConfig) -> None:
+    def init_dp_device_group(self, vllm_config: VllmConfig) -> None:
         # TODO: Temporarily hardcode the port value for debugging. Will replace with get_open_port().
         get_dp_group().cpu_group = stateless_init_torch_distributed_process_group(
             vllm_config.parallel_config.data_parallel_master_ip,
@@ -360,9 +359,8 @@ class NPUWorker(WorkerBase):
             vllm_config.parallel_config.data_parallel_rank,
             vllm_config.parallel_config.data_parallel_size,
             backend="gloo",
-            fault_tolerance_config=vllm_config.fault_tolerance_config,
         )
-        timeout = timedelta(seconds=vllm_config.fault_tolerance_config.gloo_comm_timeout)
+        timeout = timedelta(seconds=vllm_config.parallel_config.fault_tolerance_config.gloo_comm_timeout)
         dp_cpu_group = get_dp_group()
         _set_pg_timeout(timeout=timeout, group=dp_cpu_group.cpu_group)
 
@@ -457,6 +455,21 @@ class NPUWorker(WorkerBase):
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
+    def create_worker_sentinel(self, worker_cmd_addr: str):
+        def clear_input_batch_callback():
+            input_batch = self.model_runner.input_batch
+            cached_req_ids = input_batch.req_id_to_index.keys()
+            for req_id in list(cached_req_ids):
+                input_batch.remove_request(req_id)
+
+        self.worker_sentinel = NPUWorkerSentinel(
+            self.parallel_config,
+            clear_input_batch_callback,
+            self.device,
+            worker_cmd_addr,
+            self,
+        )
+
     def _init_device(self):
         device = torch.device(f"npu:{self.local_rank}")
         torch.npu.set_device(device)
@@ -527,21 +540,6 @@ class NPUWorker(WorkerBase):
             self.model_runner = NPUModelRunnerV2(self.vllm_config, self.device)
         else:
             self.model_runner = NPUModelRunner(self.vllm_config, self.device)
-
-        if self.vllm_config.fault_tolerance_config.enable_fault_tolerance:
-
-            def clear_input_batch_callback():
-                input_batch = self.model_runner.input_batch
-                cached_req_ids = input_batch.req_id_to_index.keys()
-                for req_id in list(cached_req_ids):
-                    input_batch.remove_request(req_id)
-
-            self.worker_sentinel = WorkerSentinel(
-                self.vllm_config,
-                clear_input_batch_callback,
-                self.device,
-                self,
-            )
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
@@ -658,7 +656,7 @@ class NPUWorker(WorkerBase):
 
         with context, set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()
-        if self.vllm_config.fault_tolerance_config.enable_fault_tolerance:
+        if self.vllm_config.parallel_config.enable_fault_tolerance:
             self.backup_expert_rank_mapping = True
             # todo Hot backup-related code has not yet been ported here.
 
@@ -878,8 +876,8 @@ class NPUWorker(WorkerBase):
         )
         init_ascend_model_parallel(self.parallel_config)
         ensure_ec_transfer_initialized(self.vllm_config)
-        if self.vllm_config.fault_tolerance_config.enable_fault_tolerance:
-            timeout = timedelta(seconds=self.vllm_config.fault_tolerance_config.gloo_comm_timeout)
+        if self.vllm_config.parallel_config.enable_fault_tolerance:
+            timeout = timedelta(seconds=self.vllm_config.parallel_config.fault_tolerance_config.gloo_comm_timeout)
             dp_cpu_group = get_dp_group()
             _set_pg_timeout(timeout=timeout, group=dp_cpu_group.cpu_group)
 

@@ -176,7 +176,7 @@ def get_expert_distribution_after_descale(
     model_runner.shared_dict["descale"] = True
     model_runner.shared_dict["enable_d2d_after_failure"] = enable_d2d_after_failure
     model_runner.shared_dict["excluded_dp_ranks"] = exclued_dp_ranks
-    if model_runner.shared_dict["expert_maps"] is None and model_runner.shared_dict["expert_maps"] :
+    if model_runner.shared_dict["expert_maps"] is None and model_runner.shared_dict["expert_maps"]:
         model_runner.shared_dict["expert_maps"] = get_global_expert_map(model_runner)
 
     eplb_updator.wakeup_eplb_worker()
@@ -230,7 +230,7 @@ def init_dp_cpu_group(vllm_config: VllmConfig, group_type="normal") -> None:
             vllm_config.parallel_config.data_parallel_rank,
             vllm_config.parallel_config.data_parallel_size,
             backend="gloo",
-            fault_tolerance_config=vllm_config.fault_tolerance_config,
+            gloo_timeout_seconds=vllm_config.parallel_config.fault_tolerance_config.gloo_comm_timeout,
         )
         get_dynamic_eplb_group().group_type = group_type
 
@@ -241,10 +241,9 @@ def init_dp_cpu_group(vllm_config: VllmConfig, group_type="normal") -> None:
         vllm_config.parallel_config.data_parallel_rank,
         vllm_config.parallel_config.data_parallel_size,
         backend="gloo",
-        fault_tolerance_config=vllm_config.fault_tolerance_config,
     )
     get_dp_group().group_type = group_type
-    timeout = timedelta(seconds=vllm_config.fault_tolerance_config.gloo_comm_timeout)
+    timeout = timedelta(seconds=vllm_config.parallel_config.fault_tolerance_config.gloo_comm_timeout)
     _set_pg_timeout(timeout=timeout, group=get_dp_group().cpu_group)
 
 
@@ -485,14 +484,14 @@ def init_ep2dp_map(dp_size: int, tp_size: int) -> dict[int, int]:
 def update_ep2dp_map(
     ep2dp_map: dict[int, int],
     exclude_dp_ranks: list[int],
-    rank_mapping: dict[str, int],
+    rank_mapping: dict[int, int],
 ) -> dict[int, int]:
     for old_ep_rank, dp_rank in ep2dp_map.items():
         if dp_rank != -1:
             if dp_rank in exclude_dp_ranks:
                 ep2dp_map[old_ep_rank] = -1
             else:
-                ep2dp_map[old_ep_rank] = rank_mapping[str(dp_rank)]
+                ep2dp_map[old_ep_rank] = rank_mapping[dp_rank]
     return ep2dp_map
 
 
@@ -600,11 +599,13 @@ def reconfigure_moe(
         module.local_num_experts = num_global_new_phy_experts // new_ep_size
         module.global_num_experts = num_global_new_phy_experts
         module.global_redundant_expert_num = num_global_new_phy_experts - num_global_logical_experts
+        sp_size = module.sp_size
         module.moe_parallel_config = FusedMoEParallelConfig.make(
             tp_size_=get_tp_group().world_size,
             pcp_size_=get_pcp_group().world_size,
             dp_size_=get_dp_group().world_size,
             vllm_parallel_config=parallel_config,
+            sp_size_=sp_size,
         )
         module.moe_config = FusedMoEConfig(
             num_experts=module.global_num_experts,
@@ -612,6 +613,7 @@ def reconfigure_moe(
             hidden_dim=module.hidden_size,
             intermediate_size_per_partition=module.intermediate_size_per_partition,
             num_local_experts=module.local_num_experts,
+            num_logical_experts=num_global_logical_experts,
             moe_parallel_config=module.moe_parallel_config,
             in_dtype=module.vllm_config.model_config.dtype,
             router_logits_dtype=None,
