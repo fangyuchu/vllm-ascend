@@ -14,44 +14,45 @@
  * \brief
  */
 
-#include "causal_conv1d_fn.h"
-#include "causal_conv1d_update.h"
+#include "causal_conv1d.h"
 
 namespace {
 
-template <typename T, uint32_t runModeKey, uint32_t widthKey, uint32_t fnPlanKey>
+    template <typename T>
 __aicore__ inline void RunCausalConv1d(GM_ADDR x, GM_ADDR weight, GM_ADDR bias, GM_ADDR convStates,
-                                       GM_ADDR queryStartLoc, GM_ADDR cacheIndices, GM_ADDR initialStateMode,
-                                       GM_ADDR numAcceptedTokens, GM_ADDR y, GM_ADDR workspace,
-                                       const CausalConv1dTilingData *tilingData)
+                                      GM_ADDR queryStartLoc, GM_ADDR cacheIndices, GM_ADDR hasInitialState,
+                                      GM_ADDR y, const  NsCausalConv1d::CausalConv1dTilingData* tilingData)
 {
-    if constexpr (runModeKey == CAUSAL_CONV1D_TPL_RUN_MODE_FN) {
-        NsCausalConv1d::RunCausalConv1dFn<T, widthKey, fnPlanKey>(
-            x, weight, bias, convStates, queryStartLoc, cacheIndices, initialStateMode, numAcceptedTokens, y, workspace,
-            tilingData);
-    } else {
-        NsCausalConv1d::RunCausalConv1dUpdate<T>(
-            x, weight, bias, convStates, queryStartLoc, cacheIndices, initialStateMode, numAcceptedTokens, y, workspace,
-            tilingData);
-    }
+    NsCausalConv1d::CausalConv1d<T> op;
+    op.Init(x, weight, bias, convStates, queryStartLoc, cacheIndices, hasInitialState, y, tilingData);
+    op.Process();
 }
 
 } // namespace
 
-template <uint32_t runModeKey, uint32_t widthKey, uint32_t fnPlanKey>
+template <uint32_t schMode>
 __global__ __aicore__ void causal_conv1d(GM_ADDR x, GM_ADDR weight, GM_ADDR bias, GM_ADDR convStates,
-                                         GM_ADDR queryStartLoc, GM_ADDR cacheIndices, GM_ADDR initialStateMode,
-                                         GM_ADDR numAcceptedTokens, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+                                        GM_ADDR queryStartLoc, GM_ADDR cacheIndices, GM_ADDR hasInitialState,
+                                        GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
 {
-    REGISTER_TILING_DEFAULT(CausalConv1dTilingData);
+    REGISTER_TILING_DEFAULT( NsCausalConv1d::CausalConv1dTilingData);
+    // GET_TILING_DATA_WITH_STRUCT( NsCausalConv1d::CausalConv1dTilingData, tilingData, tiling);
     GET_TILING_DATA(tilingData, tiling);
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0);
-    GM_ADDR userWorkspace = workspace;
-    if (workspace != nullptr) {
-        userWorkspace = AscendC::GetUserWorkspace(workspace);
-    }
-
-    RunCausalConv1d<DTYPE_X, runModeKey, widthKey, fnPlanKey>(
-        x, weight, bias, convStates, queryStartLoc, cacheIndices, initialStateMode, numAcceptedTokens, y,
-        userWorkspace, &tilingData);
+    #if defined(ORIG_DTYPE_X)
+        #if (ORIG_DTYPE_X == DT_FLOAT16)
+            RunCausalConv1d<half>(x, weight, bias, convStates, queryStartLoc, cacheIndices, hasInitialState, y, &tilingData);
+        #elif (ORIG_DTYPE_X == DT_BF16)
+            RunCausalConv1d<bfloat16_t>(x, weight, bias, convStates, queryStartLoc, cacheIndices, hasInitialState, y, &tilingData);
+        #elif (ORIG_DTYPE_X == DT_FLOAT)
+            RunCausalConv1d<float>(x, weight, bias, convStates, queryStartLoc, cacheIndices, hasInitialState, y, &tilingData);
+        #endif
+    #else
+        #if (DTYPE_X == DT_FLOAT16)
+            RunCausalConv1d<half>(x, weight, bias, convStates, queryStartLoc, cacheIndices, hasInitialState, y, &tilingData);
+        #elif (DTYPE_X == DT_BF16)
+            RunCausalConv1d<bfloat16_t>(x, weight, bias, convStates, queryStartLoc, cacheIndices, hasInitialState, y, &tilingData);
+        #elif (DTYPE_X == DT_FLOAT)
+            RunCausalConv1d<float>(x, weight, bias, convStates, queryStartLoc, cacheIndices, hasInitialState, y, &tilingData);
+        #endif
+    #endif
 }

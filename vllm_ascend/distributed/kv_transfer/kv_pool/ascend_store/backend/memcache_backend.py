@@ -3,7 +3,6 @@ from enum import Enum
 
 import torch
 from vllm.config import ParallelConfig
-from vllm.distributed.parallel_state import get_world_group
 from vllm.logger import logger
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import Backend
@@ -30,13 +29,21 @@ class MemcacheBackend(Backend):
         try:
             soc_version = get_ascend_device_type()
             if soc_version in {AscendDeviceType.A2}:
+                import torch
+                from vllm.distributed import get_world_group
+
                 tmp_tensor = torch.zeros(1, device="npu")
                 output_tensor_list = [torch.empty_like(tmp_tensor) for _ in range(torch.distributed.get_world_size())]
                 torch.distributed.all_gather(output_tensor_list, tmp_tensor, group=get_world_group().device_group)
-            self.local_rank = get_world_group().local_rank
-            self.store = DistributedObjectStore()
-            res = self.store.init(self.local_rank)
-            assert res == 0
+                self.rank = parallel_config.rank
+                self.store = DistributedObjectStore()
+                res = self.store.init(self.rank)
+                assert res == 0
+            else:
+                self.rank = parallel_config.rank
+                self.store = DistributedObjectStore()
+                res = self.store.init(self.rank)
+                assert res == 0
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
             raise
@@ -45,7 +52,7 @@ class MemcacheBackend(Backend):
             raise
 
     def set_device(self):
-        device = torch.device(f"npu:{self.local_rank}")
+        device = torch.device(f"npu:{self.rank}")
         torch.npu.set_device(device)
 
     def register_buffer(self, ptrs: list[int], sizes: list[int]):
@@ -64,15 +71,15 @@ class MemcacheBackend(Backend):
             res = self.store.batch_get_into_layers(key, addr, size, MmcDirect.COPY_G2L.value)
             for value in res:
                 if value != 0:
-                    logger.error("Failed to get key %s,res:%s", key, res)
+                    logger.error(f"Failed to get key {key},res:{res}")
         except Exception as e:
-            logger.error("Failed to get key %s. %s", key, e)
+            logger.error(f"Failed to get key {key}. {e}")
 
     def put(self, key: list[str], addr: list[list[int]], size: list[list[int]]):
         try:
             res = self.store.batch_put_from_layers(key, addr, size, MmcDirect.COPY_L2G.value)
             for value in res:
                 if value != 0:
-                    logger.error("Failed to get key %s,res:%s", key, res)
+                    logger.error(f"Failed to get key {key},res:{res}")
         except Exception as e:
-            logger.error("Failed to put key %s,error:%s", key, e)
+            logger.error(f"Failed to put key {key},error:{e}")

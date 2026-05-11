@@ -320,9 +320,6 @@ class FusionOp(DecodeMoeOps):
                 self.gmm2_weight_scale_fp32 = [
                     weight.clone() for weight in gmm2_weight_scale.unbind(dim=0)
                 ]
-            else:
-                self.gmm1_weight_scale_fp32 = [torch.ones(1).npu().to(gmm1_weight.dtype)]
-                self.gmm2_weight_scale_fp32 = [torch.ones(1).npu().to(gmm2_weight.dtype)]
         else:
             self.gmm1_weight = [gmm1_weight.clone()]
             self.gmm2_weight = [gmm2_weight.clone()]
@@ -527,7 +524,7 @@ def run_once(local_rank_id,
 
 @torch.inference_mode()
 def test_dispatch_gmm_combine_decode_base():
-    custom_kwargs = BASE_KWARGS.copy()
+    custom_kwargs = BASE_KWARGS
     custom_kwargs["batch_size"] = 32
     custom_kwargs["ep_world_size"] = 8
     custom_kwargs["moe_expert_num"] = 32
@@ -542,7 +539,7 @@ def test_dispatch_gmm_combine_decode_base():
 
 @torch.inference_mode()
 def test_dispatch_gmm_combine_decode_with_mc2_mask():
-    custom_kwargs = BASE_KWARGS.copy()
+    custom_kwargs = BASE_KWARGS
     custom_kwargs["with_mc2_mask"] = True
     ep_world_size = custom_kwargs["ep_world_size"]
     custom_args = tuple(custom_kwargs.values())
@@ -551,7 +548,7 @@ def test_dispatch_gmm_combine_decode_with_mc2_mask():
 
 @torch.inference_mode()
 def test_dispatch_gmm_combine_decode_dynamic_eplb():
-    custom_kwargs = BASE_KWARGS.copy()
+    custom_kwargs = BASE_KWARGS
     custom_kwargs["dynamic_eplb"] = True
     ep_world_size = custom_kwargs["ep_world_size"]
     custom_args = tuple(custom_kwargs.values())

@@ -40,10 +40,10 @@ Row parallel op follows a similar approach - inherit from RowColumnParallelOp an
 get_row_parallel_op.
 """
 
+import re
 from functools import lru_cache
 from types import SimpleNamespace
 
-import regex as re
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -57,10 +57,9 @@ from vllm.distributed import (
     tensor_model_parallel_reduce_scatter,
 )
 from vllm.distributed.parallel_state import get_tp_group
-from vllm.model_executor.models.utils import extract_layer_index
+from vllm.forward_context import get_forward_context
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.distributed.parallel_state import (
     get_flashcomm2_odp_group,
     get_flashcomm2_otp_group,
@@ -75,7 +74,6 @@ from vllm_ascend.utils import (
     flashcomm2_enable,
     get_flashcomm2_reorgnized_batch_ids,
     get_weight_prefetch_method,
-    is_vl_model,
     matmul_allreduce_enable,
     mlp_tp_enable,
     oproj_tp_enable,
@@ -159,13 +157,6 @@ class CustomRowParallelOp(CustomLinearOp):
             return output
         return output, output_bias
 
-    def get_input_parallel(self, input_: torch.Tensor) -> torch.Tensor:
-        if self.input_is_parallel:
-            return input_
-
-        split_input = split_tensor_along_last_dim(input_, num_partitions=self.tp_size)
-        return split_input[self.tp_rank].contiguous()
-
 
 class CustomReplicatedOp(CustomLinearOp):
     def apply_impl(self, input_):
@@ -209,7 +200,11 @@ class MLPRowParallelOp(CustomRowParallelOp):
         return get_mlp_tp_group()
 
     def apply_impl(self, input_: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
-        input_parallel = self.get_input_parallel(input_)
+        if self.input_is_parallel:
+            input_parallel = input_
+        else:
+            splitted_input = split_tensor_along_last_dim(input_, num_partitions=self.tp_size)
+            input_parallel = splitted_input[self.tp_rank].contiguous()
 
         assert self.quant_method is not None
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.layer.bias
@@ -232,7 +227,11 @@ class OProjRowParallelOp(CustomRowParallelOp):
         self,
         input_: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
-        input_parallel = self.get_input_parallel(input_)
+        if self.input_is_parallel:
+            input_parallel = input_
+        else:
+            splitted_input = split_tensor_along_last_dim(input_, num_partitions=self.tp_size)
+            input_parallel = splitted_input[self.tp_rank].contiguous()
 
         # Prepare tensors for all-to-all communication
         local_batch_size = input_parallel.size(0)
@@ -304,10 +303,16 @@ class Flashcomm2OProjRowParallelOp(CustomRowParallelOp):
         Output.shape = [(batchsize*seqlength+padsize)/TP, hiddensize]
         """
         # Handle input parallelism - split or use as-is
-        input_parallel = self.get_input_parallel(input_)
+        if self.input_is_parallel:
+            input_parallel = input_
+        else:
+            tp_rank = self.tp_rank
+            splitted_input = split_tensor_along_last_dim(input_, num_partitions=self.tp_size)
+            input_parallel = splitted_input[tp_rank].contiguous()
 
         # padding for all-to-all
-        num_padding_tokens = _EXTRA_CTX.pad_size
+        forward_context = get_forward_context()
+        num_padding_tokens = forward_context.pad_size
         if num_padding_tokens > 0:
             input_parallel = nn.functional.pad(input_parallel, (0, 0, 0, num_padding_tokens))
 
@@ -363,7 +368,7 @@ class Flashcomm2OProjRowParallelOp(CustomRowParallelOp):
         else:
             output = output_parallel
 
-        if not _EXTRA_CTX.flash_comm_v1_enabled:
+        if not forward_context.flash_comm_v1_enabled:
             # flashcomm1 not enabled
             output = get_tp_group().all_gather(output, 0)
             if num_padding_tokens > 0:
@@ -390,7 +395,11 @@ class MatmulAllreduceRowParallelOp(CustomRowParallelOp):
         self.hcomm_info = self.get_hcomm_info(self.comm_group.device_group)
 
     def apply_impl(self, input_: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
-        input_parallel = self.get_input_parallel(input_)
+        if self.input_is_parallel:
+            input_parallel = input_
+        else:
+            splitted_input = split_tensor_along_last_dim(input_, num_partitions=self.tp_size)
+            input_parallel = splitted_input[self.tp_rank].contiguous()
         """Calculate the output tensor of forward by considering
         fusing communication and computation."""
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
@@ -432,8 +441,8 @@ class SequenceColumnParallelOp(CustomColumnParallelOp):
 
         # Matrix multiply.
         assert self.quant_method is not None
-        need_all_gather = not (extract_layer_index(self.layer.prefix) == 0 and is_vl_model() and "attn" in self.prefix)
-        input_ = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(input_, label=need_all_gather)
+
+        input_ = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(input_, True)
         output_parallel = self.quant_method.apply(self.layer, input_, bias)
 
         if self.gather_output:
@@ -484,7 +493,12 @@ class SequenceRowParallelOp(CustomRowParallelOp):
         Implemented multiple optimization projects for dense models, such as FlashComm and
         communication-computation fusion.
         """
-        input_parallel = self.get_input_parallel(input_)
+
+        if self.input_is_parallel:
+            input_parallel = input_
+        else:
+            splitted_input = split_tensor_along_last_dim(input_, num_partitions=self.tp_size)
+            input_parallel = splitted_input[self.tp_rank].contiguous()
 
         assert self.quant_method is not None
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
@@ -500,8 +514,9 @@ class SequenceRowParallelOp(CustomRowParallelOp):
     def matmul_and_reduce(self, input_parallel: torch.Tensor, bias_: Parameter | None) -> torch.Tensor:
         assert self.quant_method is not None
         try:
-            flash_comm_v1_enabled = _EXTRA_CTX.flash_comm_v1_enabled
-            mmrs_fusion = _EXTRA_CTX.mmrs_fusion
+            forward_context = get_forward_context()
+            flash_comm_v1_enabled = forward_context.flash_comm_v1_enabled
+            mmrs_fusion = forward_context.mmrs_fusion
         except AssertionError:
             flash_comm_v1_enabled = False
             mmrs_fusion = False
@@ -512,7 +527,7 @@ class SequenceRowParallelOp(CustomRowParallelOp):
             output_parallel = self.layer.quant_method.apply(self.layer, x, bias=bias_)
             return tensor_model_parallel_all_reduce(output_parallel)
 
-        pad_size = _EXTRA_CTX.pad_size
+        pad_size = forward_context.pad_size
         if pad_size > 0 and not (enable_dsa_cp() and "o_proj" in self.layer.prefix):
             x = F.pad(x, (0, 0, 0, pad_size))
 
@@ -721,12 +736,11 @@ def get_parallel_op(disable_tp, prefix, layer, direct):
     return None, get_tp_group().rank_in_group, get_tp_group().world_size
 
 
-def get_replicated_op(disable_tp, prefix, layer) -> tuple[CustomReplicatedOp | None, int | None, int | None]:
+def get_replicated_op(disable_tp, prefix, layer) -> CustomReplicatedOp | None:
     if disable_tp:
-        return None, None, None
+        return None
 
-    custom_op = CustomReplicatedOp(layer)
-    return custom_op, custom_op.tp_rank, custom_op.tp_size
+    return CustomReplicatedOp(layer)
 
 
 def is_moe_layer(prefix: str) -> bool:

@@ -1,7 +1,4 @@
 #pragma once
-#ifndef ASCENDC_DISPATCH_FFN_COMBINE_INIT_ROUTING_QUANT_TILING_H
-#define ASCENDC_DISPATCH_FFN_COMBINE_INIT_ROUTING_QUANT_TILING_H
-
 #include "moe_init_routing_v2_tiling.h"
 
 namespace optiling {
@@ -430,5 +427,3 @@ void MoeInitRoutingQuantV2TilingBase::Tiling4GatherOutCompute() {
 
 
 }
-
-#endif

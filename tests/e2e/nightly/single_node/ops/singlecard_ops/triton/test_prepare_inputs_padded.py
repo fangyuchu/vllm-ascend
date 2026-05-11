@@ -1,4 +1,3 @@
-import gc
 import pytest
 import torch
 from vllm.triton_utils import triton
@@ -79,6 +78,3 @@ def test_prepare_inputs_padded(num_reqs):
     )
 
     torch.testing.assert_close(out_tri, out_ref)
-    gc.collect()
-    torch.npu.empty_cache()
-    torch.npu.reset_peak_memory_stats()

@@ -1,5 +1,4 @@
 import importlib
-import logging
 import math
 import threading
 from collections.abc import Generator
@@ -21,7 +20,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     AscendConnectorMetadata,
     ChunkedTokenDatabase,
     KeyMetadata,
-    LayerMultiBlockReqMeta,
+    LasyerMultiBlockReqMeta,
     ReqMeta,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
@@ -40,10 +39,6 @@ backend_map = {
     "memcache": {
         "name": "MemcacheBackend",
         "path": "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.memcache_backend",
-    },
-    "yuanrong": {
-        "name": "YuanrongBackend",
-        "path": "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.yuanrong_backend",
     },
 }
 
@@ -304,7 +299,7 @@ class KVPoolWorker:
             if self.current_layer == self.num_layers - 1:
                 assert ret_token_mask is not None
                 num_retrieved_tokens = ret_token_mask.sum().item()
-                logger.debug("Retrieved %s tokens", num_retrieved_tokens)
+                logger.debug(f"Retrieved {num_retrieved_tokens} tokens")
 
     def save_kv_layer(self, connector_metadata: AscendConnectorMetadata) -> None:
         if self.current_layer == 0:
@@ -404,7 +399,7 @@ class KVPoolWorker:
                     if not is_finish:
                         logger.info("Layerwise get failed")
                 self.get_event.clear()
-                req_meta = LayerMultiBlockReqMeta(
+                req_meta = LasyerMultiBlockReqMeta(
                     request.req_id, keys_multi_chunk, starts, ends, request.block_ids, layer_id
                 )
                 self.kv_recv_thread.add_request(  # type: ignore[union-attr, call-arg]
@@ -419,7 +414,7 @@ class KVPoolWorker:
                 yield None
 
         retrieved_tokens = torch.sum(ret_mask)
-        logger.debug("Retrieved %s out of %s out of total %s tokens", retrieved_tokens, num_required_tokens, token_len)
+        logger.debug(f"Retrieved {retrieved_tokens} out of {num_required_tokens} out of total {token_len} tokens")
 
         yield ret_mask
 
@@ -460,7 +455,7 @@ class KVPoolWorker:
         if keys:
             keys = [list(row) for row in zip(*keys)]  # [layer_num,block_num]
             for layer_id, keys_multi_chunk in enumerate(keys):
-                req_meta = LayerMultiBlockReqMeta(
+                req_meta = LasyerMultiBlockReqMeta(
                     request.req_id,
                     keys_multi_chunk,
                     starts,
@@ -495,13 +490,12 @@ class KVPoolWorker:
             else set()
         )
 
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "Number of completed KV cache send requests: %d, receive requests: %d, tp_rank:%d",
-                len(done_sending),
-                len(done_recving),
-                self.tp_rank,
-            )
+        logger.debug(
+            "Number of completed KV cache send requests: %d, receive requests: %d, tp_rank:%d",
+            len(done_sending),
+            len(done_recving),
+            self.tp_rank,
+        )
         return done_sending, done_recving
 
     def get_and_clear_finished_requests(self, finished_req_ids, meta: AscendConnectorMetadata) -> set[str]:
@@ -572,7 +566,7 @@ class KVPoolWorker:
                     return starts[index]
             # all tokens where found, return the maximal end
         except Exception as e:
-            logger.error("Remote connection failed in contains: %s", e)
+            logger.error(f"Remote connection failed in contains: {e}")
             return 0
         return end
 
@@ -608,9 +602,8 @@ class KVPoolWorker:
                     )
                     multi_tp_keys.append(new_str)
 
-            pp_base_keys = multi_tp_keys.copy()
             for i in range(1, self.pp_size):
-                for item in pp_base_keys:
+                for item in keys:
                     new_str = item.replace(  # type: ignore[attr-defined]
                         "@pp_rank:0", f"@pp_rank:{i}", 1
                     )
@@ -630,7 +623,7 @@ class KVPoolWorker:
                 return starts[index]
         # all tokens where found, return the maximal end
         except Exception as e:
-            logger.error("Remote connection failed in contains: %s", e)
+            logger.error(f"Remote connection failed in contains: {e}")
             return 0
         return end
 

@@ -86,8 +86,7 @@ docker run --rm \
 -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
 -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
 -v /etc/ascend_install.info:/etc/ascend_install.info \
-# IMPORTANT: This must be a shared directory accessible by all nodes
--v /path/to/shared/cache:/root/.cache \ 
+-v /path/to/shared/cache:/root/.cache \ # IMPORTANT: This must be a shared directory accessible by all nodes
 -it $IMAGE bash
 ```
 

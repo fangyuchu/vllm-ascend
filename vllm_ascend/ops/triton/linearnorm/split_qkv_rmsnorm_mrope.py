@@ -17,7 +17,8 @@
 
 
 import torch
-from vllm.triton_utils import tl, triton
+import triton  # type: ignore
+import triton.language as tl  # type: ignore
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
@@ -47,9 +48,9 @@ def split_qkv_rmsnorm_mrope_kernel(
     q_size: tl.constexpr,
     kv_size: tl.constexpr,
     eps: tl.constexpr,
-    mrope_section_t,
-    mrope_section_h,
-    mrope_section_w,
+    mrope_section_t: tl.constexpr,
+    mrope_section_h: tl.constexpr,
+    mrope_section_w: tl.constexpr,
     has_bias: tl.constexpr,
     is_interleaved: tl.constexpr,
     rope_dim: tl.constexpr,

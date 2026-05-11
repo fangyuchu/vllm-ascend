@@ -373,7 +373,7 @@ class ProxyState:
             return False
 
         if self.request_num > 0:
-            logger.warning("Start to taint prefill instances %s.", instances)
+            logger.warning(f"Start to taint prefill instances {instances}.")
             self._taint_prefillers(instances)
             return True
 
@@ -399,7 +399,7 @@ class ProxyState:
             return False
 
         if self.request_num > 0:
-            logger.warning("Start to taint decode instances %s.", instances)
+            logger.warning(f"Start to taint decode instances {instances}.")
             self._taint_decoders(instances)
             return True
 
@@ -608,12 +608,12 @@ async def send_request_to_service(
             response.raise_for_status()
             return response
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
-            logger.warning("Attempt %s failed for %s: %s", attempt, endpoint, e)
+            logger.warning(f"Attempt {attempt} failed for {endpoint}: {str(e)}")
             last_exc = e
             if attempt < max_retries:
                 await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
             else:
-                logger.error("All %s attempts failed for %s.", max_retries, endpoint)
+                logger.error(f"All {max_retries} attempts failed for {endpoint}.")
                 raise last_exc
 
 
@@ -637,28 +637,28 @@ async def stream_service_response_with_retry(
                 return  # Success, exit after streaming
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
             if attempt < max_retries:
-                logger.warning("Attempt %s failed for streaming %s: %s", attempt, endpoint, e)
+                logger.warning(f"Attempt {attempt} failed for streaming {endpoint}: {str(e)}")
                 await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
             else:
-                logger.error("All %s attempts failed for streaming %s.", max_retries, endpoint)
+                logger.error(f"All {max_retries} attempts failed for streaming {endpoint}.")
                 raise e
         except Exception as e:
             # If any chunk has been sent, do not retry, just log and drop
             if "first_chunk_sent" in locals() and first_chunk_sent:
-                logger.error("Streaming to client interrupted after response started: %s", e)
+                logger.error(f"Streaming to client interrupted after response started: {str(e)}")
                 return
             else:
                 if attempt < max_retries:
-                    logger.warning("Attempt %s failed for streaming %s: %s", attempt, endpoint, e)
+                    logger.warning(f"Attempt {attempt} failed for streaming {endpoint}: {str(e)}")
                     await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
                 else:
-                    logger.error("All %s attempts failed for streaming %s.", max_retries, endpoint)
+                    logger.error(f"All {max_retries} attempts failed for streaming {endpoint}.")
                     raise e
 
 
 async def _handle_select_instance(api: str, req_data: Any, request_length: int):
     prefiller_score = proxy_state.calculate_prefill_scores(request_length)
-    logger.debug("Request length: %s, Prefiller score: %s", request_length, prefiller_score)
+    logger.debug(f"Request length: {request_length}, Prefiller score: {prefiller_score}")
     request_id = await proxy_state.next_req_id()
     # Select prefiller
     prefiller_idx = proxy_state.select_prefiller(prefiller_score)
@@ -734,13 +734,6 @@ async def _handle_completions(api: str, request: Request):
             retry_count = 0
             retry = True
             completion_tokens = 0
-
-            def release_prefiller_kv_once():
-                nonlocal released_kv
-                if not released_kv:
-                    proxy_state.release_prefiller_kv(instance_info.prefiller_idx, instance_info.prefiller_score)
-                    released_kv = True
-
             # Only one await per chunk, minimal logic in loop
             try:
                 while retry:
@@ -754,11 +747,12 @@ async def _handle_completions(api: str, request: Request):
                         base_delay=global_args.retry_delay,
                     ):
                         if not released_kv and chunk:
-                            release_prefiller_kv_once()
+                            proxy_state.release_prefiller_kv(instance_info.prefiller_idx, instance_info.prefiller_score)
+                            released_kv = True
                         try:
                             chunk_str = chunk.decode("utf-8").strip()
                         except UnicodeDecodeError:
-                            logger.debug("Skipping chunk: %s", chunk)
+                            logger.debug(f"Skipping chunk: {chunk}")
                             yield chunk
                             continue
                         if not chunk_str:
@@ -769,7 +763,7 @@ async def _handle_completions(api: str, request: Request):
                             chunk_json = json.loads(chunk_str)
                         except json.JSONDecodeError:
                             # if chunk is [done], skip it.
-                            logger.debug("Skipping chunk: %s", chunk_str)
+                            logger.debug(f"Skipping chunk: {chunk_str}")
                             yield chunk
                             continue
                         choices = chunk_json.get("choices", [])
@@ -808,23 +802,17 @@ async def _handle_completions(api: str, request: Request):
                                 choice["text"] = generated_token
                             chunk = json.dumps(chunk_json).encode("utf-8")
                         yield chunk
-            except asyncio.CancelledError:
-                raise
             except Exception as e:
                 logger.error(
-                    "Error during streaming from decoder %s: %s the aborted request %s "
-                    "will be routing to the target prefiller when new request is ready to dispatch to it",
-                    instance_info.decoder.url,
-                    e,
-                    instance_info.request_id,
+                    f"Error during streaming from decoder {instance_info.decoder.url}: {str(e)} "
+                    f"the aborted request {instance_info.request_id} will be routing to the target "
+                    "prefiller when new request is ready to dispatch to it"
                 )
                 proxy_state.abort_prefiller_request(instance_info.prefiller_idx, instance_info.request_id)
-                release_prefiller_kv_once()
-            finally:
-                # After streaming is done or cancelled, release tokens.
-                release_prefiller_kv_once()
-                proxy_state.release_decoder(instance_info.decoder_idx, instance_info.decoder_score)
-                proxy_state.request_num -= 1
+                proxy_state.release_prefiller_kv(instance_info.prefiller_idx, instance_info.prefiller_score)
+
+            # After streaming done, release tokens
+            proxy_state.release_decoder(instance_info.decoder_idx, instance_info.decoder_score)
 
         # Determine the correct media type based on stream flag
         media_type = "text/event-stream; charset=utf-8" if stream_flag else "application/json"
@@ -836,8 +824,9 @@ async def _handle_completions(api: str, request: Request):
         print(f"Error occurred in disagg prefill proxy server - {api} endpoint")
         print(e)
         print("".join(traceback.format_exception(*exc_info)))
-        proxy_state.request_num -= 1
         raise
+    finally:
+        proxy_state.request_num -= 1
 
 
 async def _handle_adjust_instances(adjust_mode: str, request: Request):
@@ -877,7 +866,7 @@ async def _handle_adjust_instances(adjust_mode: str, request: Request):
             "current_decode_instances": [str(decoder) for decoder in proxy_state.decoders],
         }
     except Exception as e:
-        logger.error("Failed to %s instances: %s", adjust_mode, e)
+        logger.error(f"Failed to {adjust_mode} instances: {e}")
         raise e
 
 

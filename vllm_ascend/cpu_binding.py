@@ -32,22 +32,13 @@ def is_arm_cpu() -> bool:
         return False
     if arch in {"aarch64", "arm64"} or arch.startswith("arm"):
         return True
-    logger.warning("Unknown CPU architecture '%s', CPU binding will be disabled.", arch)
+    logger.warning(f"Unknown CPU architecture '{arch}', CPU binding will be disabled.")
     return False
 
 
 def execute_command(cmd: list[str]) -> tuple[str, int]:
-    # Force a C locale so subprocess output remains parseable on localized OSes.
-    env = os.environ.copy()
-    env["LC_ALL"] = "C"
-    env["LANG"] = "C"
-    env["LC_MESSAGES"] = "C"
-    with subprocess.Popen(cmd, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env) as p:
-        try:
-            out, _ = p.communicate(timeout=1000)
-        except subprocess.TimeoutExpired:
-            p.kill()
-            out, _ = p.communicate()
+    with subprocess.Popen(cmd, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as p:
+        out, _ = p.communicate(timeout=1000)
     return out.decode(), p.returncode
 
 
@@ -274,22 +265,17 @@ class CpuAlloc:
         else:
             total_npus = len(running)
 
+        if total_npus <= 0:
+            return
+
         # Compute global per-NPU slicing
         base = total_cpu // total_npus
         extra = total_cpu % total_npus
 
         logger.debug(
-            "[cpu_global_slice] rank:%s ASCEND_RT_VISIBLE_DEVICES=%s running_npu_list:%s total_npus:%s "
-            "allowed_cpus:%s base:%s extra:%s allowed_cpus_head:%s allowed_cpus_tail:%s",
-            self.rank_id,
-            ASCEND_RT_VISIBLE_DEVICES,
-            running,
-            total_npus,
-            total_cpu,
-            base,
-            extra,
-            allowed[:16],
-            allowed[-16:],
+            f"[cpu_global_slice] rank:{self.rank_id} ASCEND_RT_VISIBLE_DEVICES={ASCEND_RT_VISIBLE_DEVICES} "
+            f"running_npu_list:{running} total_npus:{total_npus} allowed_cpus:{total_cpu} "
+            f"base:{base} extra:{extra} allowed_cpus_head:{allowed[:16]} allowed_cpus_tail:{allowed[-16:]}"
         )
 
         # Enforce per-NPU slice length >= 5.
@@ -314,6 +300,12 @@ class CpuAlloc:
             if npu < 0 or npu >= total_npus:
                 raise RuntimeError(f"Invalid NPU id {npu}, total_npus={total_npus}.")
             cpus = _slice_for_npu(npu)
+            # Extra safety: should always be >= base >= 5
+            if len(cpus) < MIN_CPUS_PER_NPU:
+                raise RuntimeError(
+                    f"NPU{npu} got too few CPUs: {len(cpus)} (<5). "
+                    f"total_allowed={total_cpu}, total_npus={total_npus}, base={base}, extra={extra}"
+                )
             self.npu_cpu_pool[npu] = cpus
 
     @staticmethod
@@ -325,9 +317,7 @@ class CpuAlloc:
         self.build_cpu_node_map()
 
         mode = self._binding_mode()
-        logger.info(
-            "[cpu_bind_mode] mode=%s rank=%s visible_npus=%s", mode, self.rank_id, self.device_info.running_npu_list
-        )
+        logger.info(f"[cpu_bind_mode] mode={mode} rank={self.rank_id} visible_npus={self.device_info.running_npu_list}")
         if mode == GLOBAL_SLICE_MODE:
             self.build_global_slice_cpu_pool()
             return
@@ -338,17 +328,7 @@ class CpuAlloc:
             self.build_global_slice_cpu_pool()
             return
 
-        allowed_cpu_set = set(self.device_info.allowed_cpus)
-        # Consider all logical NPUs to avoid CPU distribution overlap across worker processes.
-        candidate_npus = [
-            npu
-            for npu in self.device_info.all_logic_npus
-            # Always keep visible NPUs for strict conflict checks; include
-            # non-visible NPUs only when they overlap this process's cpuset.
-            if npu in self.device_info.running_npu_list
-            or any(cpu in allowed_cpu_set for cpu in self.device_info.npu_affinity.get(npu, []))
-        ]
-        for npu in candidate_npus:
+        for npu in self.device_info.running_npu_list:
             base_cpu_list = [
                 cpu for cpu in self.device_info.npu_affinity.get(npu, []) if cpu in self.device_info.allowed_cpus
             ]
@@ -367,8 +347,7 @@ class CpuAlloc:
                 final[npu_list[0]] = self.npu_cpu_pool[npu_list[0]]
             else:
                 final.update(self.average_distribute({key: npu_list}))
-        # Keep only visible NPUs in the final binding pool. Non-visible NPUs are used only to avoid overlap.
-        self.npu_cpu_pool = {npu: final[npu] for npu in self.device_info.running_npu_list}
+        self.npu_cpu_pool = final
 
     def allocate(self) -> None:
         for npu, pool in self.npu_cpu_pool.items():
@@ -390,7 +369,7 @@ class CpuAlloc:
         main = " ".join(map(str, self.assign_main[current_npu]))
         acl = " ".join(map(str, self.assign_acl[current_npu]))
         rel = str(self.assign_rel[current_npu]) if self.assign_rel[current_npu] else ""
-        logger.info("NPU%s: main=[%s]  acl=[%s]  release=[%s]", current_npu, main, acl, rel)
+        logger.info(f"NPU{current_npu}: main=[{main}]  acl=[{acl}]  release=[{rel}]")
 
     def bind_memory(self, pid: str, npu: int) -> None:
         def _get_npu_numa_node(npu_id: int) -> int | None:
@@ -405,14 +384,14 @@ class CpuAlloc:
             return
         target_numa = _get_npu_numa_node(npu)
         if target_numa is None:
-            logger.warning("[migrate] rank:%s -> NPU%s has no CPU pool, skip memory binding.", self.rank_id, npu)
+            logger.warning(f"[migrate] rank:{self.rank_id} -> NPU{npu} has no CPU pool, skip memory binding.")
             return
         all_numa_nodes = sorted(self.numa_to_cpu_map.keys())
         if target_numa not in all_numa_nodes:
-            logger.warning("[migrate] NPU:%s -> NUMA %s not found, skip memory binding.", npu, target_numa)
+            logger.warning(f"[migrate] NPU:{npu} -> NUMA {target_numa} not found, skip memory binding.")
             return
         # Bind memory to the NPU's NUMA node only to minimize cross-NUMA traffic.
-        logger.info("[migrate] NPU:%s -> NUMA [%s]", npu, target_numa)
+        logger.info(f"[migrate] NPU:{npu} -> NUMA [{target_numa}]")
         execute_command(
             [
                 "migratepages",
@@ -430,10 +409,9 @@ class CpuAlloc:
         self.bind(main_pid, self.assign_main[current_npu], True)
         for acl_thread in threads_map.get(main_pid, {}).get("acl_thread", []):
             self.bind(acl_thread, self.assign_acl[current_npu], False)
+            self.bind_memory(acl_thread, current_npu)
         for release_thread in threads_map.get(main_pid, {}).get("release_thread", []):
             self.bind(release_thread, self.assign_rel[current_npu], False)
-        # Migrate memory once for the whole process, after all threads are pinned.
-        self.bind_memory(main_pid, current_npu)
 
     def bind_npu_irq(self) -> None:
         if not os.access("/proc/irq", os.W_OK):
@@ -442,7 +420,7 @@ class CpuAlloc:
         # Only bind IRQ for current rank's NPU to avoid multi-process overwrite.
         current_npu = self.device_info.running_npu_list[self.rank_id]
         if current_npu not in self.npu_cpu_pool:
-            logger.warning("[irq] rank:%s -> NPU%s has no cpu pool, skip irq binding.", self.rank_id, current_npu)
+            logger.warning(f"[irq] rank:{self.rank_id} -> NPU{current_npu} has no cpu pool, skip irq binding.")
             return
 
         if shutil.which("systemctl"):
@@ -466,7 +444,7 @@ class CpuAlloc:
         npu = current_npu
         cpus = self.npu_cpu_pool[npu]
         if len(cpus) < 2:
-            logger.warning("[irq] NPU%s cpu pool too small (<2), skip irq binding.", npu)
+            logger.warning(f"[irq] NPU{npu} cpu pool too small (<2), skip irq binding.")
             return
 
         sq_cpu, cq_cpu = cpus[0], cpus[1]  # Reserved for IRQ binding
@@ -488,13 +466,13 @@ class CpuAlloc:
                 break
 
         if not pci_addr:
-            logger.warning("Can't find pci address of NPU%s .", npu)
+            logger.warning(f"Can't find pci address of NPU{npu} .")
             return
 
         try:
             npu_irq_list = sorted(os.listdir(f"/sys/bus/pci/devices/{pci_addr}/msi_irqs/"), key=lambda x: int(x))
         except FileNotFoundError:
-            logger.warning("The msi_irqs folder cannot be found under /sys/bus/pci/devices/%s .", pci_addr)
+            logger.warning(f"The msi_irqs folder cannot be found under /sys/bus/pci/devices/{pci_addr} .")
             return
 
         sq_irq, cq_irq = "", ""
@@ -504,17 +482,12 @@ class CpuAlloc:
                 cq_irq = str(int(irq) + 1)
                 break
         if not sq_irq:
-            logger.warning("The sq_send_trigger_irq of NPU%s is not found.", npu)
+            logger.warning(f"The sq_send_trigger_irq of NPU{npu} is not found.")
             return
 
         logger.info(
-            "NPU%s(PCI %s): sq_send_trigger_irq IRQ_ID=%s -> CPU%s, cq_update_irq IRQ_ID=%s -> CPU%s",
-            npu,
-            pci_addr,
-            sq_irq,
-            sq_cpu,
-            cq_irq,
-            cq_cpu,
+            f"NPU{npu}(PCI {pci_addr}): sq_send_trigger_irq IRQ_ID={sq_irq} -> CPU{sq_cpu}, "
+            f"cq_update_irq IRQ_ID={cq_irq} -> CPU{cq_cpu}"
         )
         with open(f"/proc/irq/{sq_irq}/smp_affinity", "w") as f:
             f.write(self.cpu_to_mask(sq_cpu))

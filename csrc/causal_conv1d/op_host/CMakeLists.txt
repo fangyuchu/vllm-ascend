@@ -9,7 +9,7 @@
 
 add_ops_compile_options(
         OP_NAME CausalConv1d
-        OPTIONS --cce-auto-sync=on
+        OPTIONS --cce-auto-sync=off
                 -Wno-deprecated-declarations
                 -Werror
 )
@@ -17,6 +17,20 @@ add_ops_compile_options(
 target_sources(op_host_aclnn PRIVATE
         causal_conv1d_def.cpp
 )
+
+# target_sources(opapi PRIVATE
+#         aclnn_causal_conv1d.cpp
+# )
+
+# if (NOT BUILD_OPEN_PROJECT)
+#     target_sources(aclnn_ops_train PRIVATE
+#         aclnn_causal_conv1d.cpp
+#     )
+
+#     target_sources(aclnn_ops_infer PRIVATE
+#         aclnn_causal_conv1d.cpp
+#     )
+# endif ()
 
 target_sources(optiling PRIVATE
         causal_conv1d_tiling.cpp

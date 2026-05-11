@@ -11,162 +11,355 @@
 
 /*!
  * \file causal_conv1d_tiling.cpp
+ * \brief
  */
 
- #include "../tiling_base/tiling_templates_registry.h"
- #include "causal_conv1d_tiling_utils.h"
- #include "causal_conv1d_tiling_planner.h"
- #include "causal_conv1d_tiling_validation.h"
- 
- namespace optiling {
- 
- using namespace Ops::Transformer::OpTiling;
- using namespace causal_conv1d_host;
- 
- static ge::graphStatus CausalConv1dTilingFunc(gert::TilingContext *context)
- {
-     uint64_t ubSize = 0;
-     uint32_t coreNum = 0;
-     OP_CHECK_IF(GetPlatformInfo(context, ubSize, coreNum) != ge::GRAPH_SUCCESS,
-                 OP_LOGE(context, "GetPlatformInfo error"), return ge::GRAPH_FAILED);
- 
-     CausalConv1dTilingData *tiling = context->GetTilingData<CausalConv1dTilingData>();
-     OP_CHECK_NULL_WITH_CONTEXT(context, tiling);
-     OP_CHECK_IF(memset_s(tiling, sizeof(CausalConv1dTilingData), 0, sizeof(CausalConv1dTilingData)) != EOK,
-                 OP_LOGE(context, "set tiling data error"), return ge::GRAPH_FAILED);
- 
-     CausalConv1dAttrInfo attrInfo;
-     OP_CHECK_IF(GetAttrsInfo(context, attrInfo) != ge::GRAPH_SUCCESS, OP_LOGE(context, "GetAttrsInfo error"),
-                 return ge::GRAPH_FAILED);
-     bool hasBias = false;
-     OP_CHECK_IF(GetShapeDtypeInfo(context, attrInfo, *tiling, hasBias) != ge::GRAPH_SUCCESS,
-                 OP_LOGE(context, "GetShapeDtypeInfo error"), return ge::GRAPH_FAILED);
- 
-     const int64_t &dim = tiling->dim;
-     const int64_t &batch = tiling->batch;
-     OP_CHECK_IF(dim <= 0 || batch <= 0, OP_LOGE(context, "dim/batch must be positive"), return ge::GRAPH_FAILED);
- 
-     const uint32_t runModeKey = static_cast<uint32_t>(attrInfo.runMode);
-     const bool &isFn = (runModeKey == CAUSAL_CONV1D_TPL_RUN_MODE_FN);
-     const bool &hasActivation = (attrInfo.activationMode != 0);
-     const char *plannerModeTag = "update";
-     DimTileChoice baseDimChoice;
-     FnExecutionPlan fnExecutionPlan = FN_EXECUTION_PLAN_INVALID;
-     FnHostPlan fnHostPlan;
-     const int64_t *qslData = nullptr;
-     if (isFn && tiling->inputMode == 0) {
-         const gert::Tensor *qslTensor = context->GetOptionalInputTensor(QUERY_START_LOC_INDEX);
-         qslData = (qslTensor != nullptr) ? qslTensor->GetData<int64_t>() : nullptr;
-     }
- 
-     if (isFn) {
-         fnHostPlan = ChooseFnHostPlan(context, *tiling, ubSize, coreNum);
-         plannerModeTag = GetFnTilingCaseName(fnHostPlan.caseKind);
-         baseDimChoice = fnHostPlan.baseDimChoice;
-         fnExecutionPlan = fnHostPlan.executionPlan;
-     } else {
-         baseDimChoice = ChooseCanonicalUpdateBaseDimChoice(context, tiling->batch, tiling->dim, coreNum);
-     }
- 
-     OP_CHECK_IF(baseDimChoice.baseDim <= 0 || baseDimChoice.baseDimCnt <= 0 || baseDimChoice.gridSize <= 0,
-                 OP_LOGE(context, "invalid dim tile size selection"), return ge::GRAPH_FAILED);
- 
-     int64_t effectiveGridSize = baseDimChoice.gridSize;
- 
-     if (isFn) {
-         OP_CHECK_IF(fnHostPlan.caseKind == FN_TILING_CASE_INVALID || fnExecutionPlan == FN_EXECUTION_PLAN_INVALID ||
-                         !fnHostPlan.tokenBlockChoice.enabled || fnHostPlan.tokenBlockChoice.tokenBlockSize <= 0 ||
-                         fnHostPlan.tokenBlockChoice.tokenBlockCnt <= 0 || fnHostPlan.tokenBlockChoice.gridSize <= 0 ||
-                         fnHostPlan.tokenCoreMapping.tokenCoreBudget <= 0 || fnHostPlan.tokenCoreMapping.blockDim <= 0,
-                     OP_LOGE(context, "runMode=0 must resolve a valid unified token tiling plan"),
-                     return ge::GRAPH_FAILED);
- 
-         tiling->tokenBlockSize = fnHostPlan.tokenBlockChoice.tokenBlockSize;
-         tiling->tokenBlockCnt = fnHostPlan.tokenBlockChoice.tokenBlockCnt;
-         effectiveGridSize = fnHostPlan.tokenBlockChoice.gridSize;
-         if (tiling->inputMode == 0) {
-             fnHostPlan.tokenSeqRangePlan =
-                 BuildFnTokenSeqRangePlan(qslData, tiling->batch, tiling->tokenBlockSize, tiling->tokenBlockCnt);
-             if (fnHostPlan.tokenSeqRangePlan.enabled) {
-                 tiling->hasExplicitTokenSeqRanges = 1;
-                 tiling->explicitTokenSeqRangeCount = fnHostPlan.tokenSeqRangePlan.rangeCount;
-                 for (int64_t i = 0; i < fnHostPlan.tokenSeqRangePlan.rangeCount; ++i) {
-                     tiling->tokenTileStartSeq[i] = fnHostPlan.tokenSeqRangePlan.tokenTileStartSeq[i];
-                     tiling->tokenTileEndSeq[i] = fnHostPlan.tokenSeqRangePlan.tokenTileEndSeq[i];
-                 }
-             } else if (qslData != nullptr && tiling->tokenBlockCnt > MAX_FN_TOKEN_SEQ_RANGE_COUNT) {
-                 OP_LOGD(context,
-                         "FnTokenSeqRanges disabled: tokenBlockCnt[%ld] exceeds fixed tiling capacity[%ld].",
-                         tiling->tokenBlockCnt, MAX_FN_TOKEN_SEQ_RANGE_COUNT);
-             }
-         }
-         OP_LOGD(context,
-                 "FnHostPlan(case=%s): inputMode[%ld], dim[%ld], cuSeqlen[%ld], baseDim[%ld], baseDimCnt[%ld], "
-                 "tokenCoreBudget[%ld], tokenBlockSize[%ld], tokenBlockCnt[%ld], tokenBlocksPerCore[%ld], "
-                 "tokenCoreTailCnt[%ld], explicitSeqRanges[%ld], baseGrid[%ld], phase1Grid[%ld], mappedBlockDim[%ld].",
-                 plannerModeTag, tiling->inputMode, tiling->dim, tiling->cuSeqlen, baseDimChoice.baseDim,
-                 baseDimChoice.baseDimCnt, fnHostPlan.tokenCoreMapping.tokenCoreBudget,
-                 fnHostPlan.tokenBlockChoice.tokenBlockSize, fnHostPlan.tokenBlockChoice.tokenBlockCnt,
-                 fnHostPlan.tokenCoreMapping.tokenBlocksPerCore, fnHostPlan.tokenCoreMapping.tokenCoreTailCnt,
-                 tiling->hasExplicitTokenSeqRanges,
-                 baseDimChoice.gridSize, fnHostPlan.tokenBlockChoice.gridSize, fnHostPlan.tokenCoreMapping.blockDim);
-     }
- 
-     uint32_t blockDim =
-         (effectiveGridSize < static_cast<int64_t>(coreNum)) ? static_cast<uint32_t>(effectiveGridSize) : coreNum;
-     if (isFn) {
-         const int64_t mappedBlockDim = (effectiveGridSize < fnHostPlan.tokenCoreMapping.blockDim) ? effectiveGridSize : fnHostPlan.tokenCoreMapping.blockDim;
-         OP_CHECK_IF(mappedBlockDim <= 0, OP_LOGE(context, "invalid mapped blockDim for runMode=0"),
-                     return ge::GRAPH_FAILED);
-         blockDim = static_cast<uint32_t>(mappedBlockDim);
-     }
- 
-     OP_LOGD(context,
-             "Tiling result: mode[%s], batch[%ld], dim[%ld], baseDim[%ld], baseDimCnt[%ld], gridSize[%ld], "
-             "effectiveGrid[%ld], blockDim[%u], coreNum[%u], tokenTiling[%ld,%ld], hasActivation[%d], hasBias[%d], "
-             "fnPlan[%ld].",
-             plannerModeTag, batch, dim, baseDimChoice.baseDim, baseDimChoice.baseDimCnt, baseDimChoice.gridSize,
-             effectiveGridSize, blockDim, coreNum, tiling->tokenBlockSize, tiling->tokenBlockCnt,
-             static_cast<int32_t>(hasActivation), static_cast<int32_t>(hasBias), static_cast<int64_t>(fnExecutionPlan));
- 
-     context->SetBlockDim(blockDim);
-     tiling->baseDim = baseDimChoice.baseDim;
-     tiling->baseDimCnt = baseDimChoice.baseDimCnt;
-     const uint32_t fnPlanKey = NormalizeFnPlanTilingKey(runModeKey, fnExecutionPlan);
-     const uint32_t widthKey = NormalizeWidthTilingKey(runModeKey, static_cast<int32_t>(tiling->width));
-     if (isFn && tiling->hasInitialStateMode != 0) {
-         constexpr int64_t kDtypeSize = 2;
-         constexpr int64_t kSyncBytesPerBlock = 32;
-         const int64_t historyCount = (tiling->width - 1 > 0) ? tiling->width - 1 : 0;
-         const int64_t syncWorkspaceSize = static_cast<int64_t>(blockDim) * kSyncBytesPerBlock;
-         const int64_t snapshotWorkspaceSize = tiling->batch * historyCount * tiling->dim * kDtypeSize;
-         const int64_t workspaceSize =
-             ASCENDC_RESERVED_WORKSPACE_SIZE + syncWorkspaceSize + snapshotWorkspaceSize;
-         OP_CHECK_IF(SetWorkspaceSize(context, static_cast<size_t>(workspaceSize)) != ge::GRAPH_SUCCESS,
-                     OP_LOGE(context, "SetWorkspaceSize error"), return ge::GRAPH_FAILED);
-         OP_CHECK_IF(context->SetScheduleMode(1) != ge::GRAPH_SUCCESS,
-                     OP_LOGE(context, "SetScheduleMode(1) error"), return ge::GRAPH_FAILED);
-         tiling->hasInitStateWorkspace = 1;
-     } else {
-         OP_CHECK_IF(SetWorkspaceSize(context, 0) != ge::GRAPH_SUCCESS, OP_LOGE(context, "SetWorkspaceSize error"),
-                     return ge::GRAPH_FAILED);
-         tiling->hasInitStateWorkspace = 0;
-     }
- 
-     const uint64_t tilingKey = GET_TPL_TILING_KEY(runModeKey, widthKey, fnPlanKey);
-     context->SetTilingKey(tilingKey);
+// #include "error_log.h"
+#include "log/ops_log.h"
+#include "../tiling_base/tiling_templates_registry.h"
+#include "../tiling_base/tiling_util.h"
+#include "math_util.h"
+#include "causal_conv1d_tiling.h"
+#include "../op_kernel/causal_conv1d_tiling_key.h"
+
+#include <set>
+#include <limits>
+
+namespace optiling {
+
+using namespace Ops::Transformer::OpTiling;
+
+constexpr uint32_t X_INDEX = 0;
+constexpr uint32_t WEIGHT_INDEX = 1;
+constexpr uint32_t BIAS_INDEX = 2;
+constexpr uint32_t CONV_STATES_INDEX = 3;
+constexpr uint32_t QUERY_START_LOC_INDEX = 4;
+constexpr uint32_t CACHE_INDICES_INDEX = 5;
+constexpr uint32_t HAS_INITIAL_STATE_INDEX = 6;
+
+constexpr int32_t ATTR_ACTIVATION_MODE_INDEX = 0;
+constexpr int32_t ATTR_PAD_SLOT_ID_INDEX = 1;
+
+
+
+struct DimTileChoice {
+    int64_t dimTileSize = 0;
+    int64_t blocksPerSeq = 0;
+    int64_t gridSize = 0;
+};
+
+static inline DimTileChoice ChooseDimTileSize(gert::TilingContext* context, int64_t batch, int64_t dim, uint32_t coreNum)
+{
+
+    const int64_t candidates[] = {4096, 2048, 1024, 512,384};
+    DimTileChoice bestOver;
+    int64_t bestOverGap = std::numeric_limits<int64_t>::max();
+    DimTileChoice bestUnder;
+
+    for (int64_t dimTileSize : candidates) {
+        if (dim % dimTileSize != 0) {
+            continue;
+        }
+        const int64_t blocksPerSeq = dim / dimTileSize;
+        const int64_t gridSize = batch * blocksPerSeq;
+        if (gridSize <= 0) {
+            continue;
+        }
+
+        if (gridSize >= static_cast<int64_t>(coreNum)) {
+            const int64_t gap = gridSize - static_cast<int64_t>(coreNum);
+            if (gap < bestOverGap) {
+                bestOver.dimTileSize = dimTileSize;
+                bestOver.blocksPerSeq = blocksPerSeq;
+                bestOver.gridSize = gridSize;
+                bestOverGap = gap;
+            }
+        } else if (gridSize > bestUnder.gridSize ||
+                   (gridSize == bestUnder.gridSize && dimTileSize < bestUnder.dimTileSize)) {
+                bestUnder.dimTileSize = dimTileSize;
+                bestUnder.blocksPerSeq = blocksPerSeq;
+                bestUnder.gridSize = gridSize;
+        }
+    }
+    DimTileChoice result = (bestOver.dimTileSize != 0) ? bestOver : bestUnder;
+
+    return result;
+}
+
+static ge::graphStatus GetPlatformInfo(gert::TilingContext* context, uint64_t& ubSize, uint32_t& coreNum)
+{
+    auto compileInfoPtr = context->GetCompileInfo<CausalConv1dCompileInfo>();
+    if (compileInfoPtr != nullptr && compileInfoPtr->coreNum != 0 && compileInfoPtr->ubSize != 0) {
+        ubSize = compileInfoPtr->ubSize;
+        coreNum = compileInfoPtr->coreNum;
+        return ge::GRAPH_SUCCESS;
+    }
+    fe::PlatFormInfos* platformInfoPtr = context->GetPlatformInfo();
+    OP_CHECK_NULL_WITH_CONTEXT(context, platformInfoPtr);
+    auto ascendcPlatform = platform_ascendc::PlatformAscendC(platformInfoPtr);
+    coreNum = ascendcPlatform.GetCoreNumAiv();
+    if(coreNum == 0) {
+        return ge::GRAPH_FAILED;
+    }
+    ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
+    if(ubSize == 0) {
+         return ge::GRAPH_FAILED;
+    }
      return ge::GRAPH_SUCCESS;
- }
- 
- static ge::graphStatus TilingParseForCausalConv1d(gert::TilingParseContext *context)
- {
-     OP_LOGD(context, "Enter TilingParseForCausalConv1d.");
-     return ge::GRAPH_SUCCESS;
- }
- 
- IMPL_OP_OPTILING(CausalConv1d)
-     .Tiling(CausalConv1dTilingFunc)
-     .TilingParse<CausalConv1dCompileInfo>(TilingParseForCausalConv1d);
- 
- }
- 
+}
+
+static ge::graphStatus GetWorkspaceSize(gert::TilingContext* context)
+{
+    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
+    OP_CHECK_NULL_WITH_CONTEXT(context, currentWorkspace);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+static ge::graphStatus GetAttrsInfo(gert::TilingContext* context, int64_t& activationMode, int64_t& padSlotId)
+{
+    auto attrs = context->GetAttrs();
+    OP_CHECK_NULL_WITH_CONTEXT(context, attrs);
+
+    const int64_t* activationModePtr = attrs->GetAttrPointer<int64_t>(ATTR_ACTIVATION_MODE_INDEX);
+    OP_CHECK_NULL_WITH_CONTEXT(context, activationModePtr);
+    activationMode = *activationModePtr;
+    if(activationMode != 0 && activationMode != 1){
+        return ge::GRAPH_FAILED;
+    }
+    const int64_t* padSlotIdPtr = attrs->GetAttrPointer<int64_t>(ATTR_PAD_SLOT_ID_INDEX);
+    OP_CHECK_NULL_WITH_CONTEXT(context, padSlotIdPtr);
+    padSlotId = *padSlotIdPtr;
+
+    return ge::GRAPH_SUCCESS;
+}
+static ge::graphStatus GetShapeDtypeInfo(gert::TilingContext* context, CausalConv1dTilingData& tiling)
+{
+    auto xShapePtr = context->GetInputShape(X_INDEX);
+    OP_CHECK_NULL_WITH_CONTEXT(context, xShapePtr);
+    auto xShape = EnsureNotScalar(xShapePtr->GetStorageShape());
+
+    int64_t dim = 0;
+    int64_t cuSeqlen = 0;
+    int64_t seqLen = 0;
+    int64_t batch = 0;
+    int64_t inputMode = 0;
+
+    if (xShape.GetDimNum() == 2) {
+        inputMode = 0;
+        cuSeqlen = xShape.GetDim(0);
+        dim = xShape.GetDim(1);
+        seqLen = 0;
+        if(dim <= 0 || cuSeqlen < 0){
+            return ge::GRAPH_FAILED;
+        }
+         
+    } else if (xShape.GetDimNum() == 3) {
+        inputMode = 1;
+        batch = xShape.GetDim(0);
+        seqLen = xShape.GetDim(1);
+        dim = xShape.GetDim(2);
+        cuSeqlen = batch * seqLen;
+        if(batch <= 0 || dim <= 0 || seqLen <= 0){
+            return ge::GRAPH_FAILED;
+        }
+    } else {
+        return ge::GRAPH_FAILED;
+    }
+
+    auto wShapePtr = context->GetInputShape(WEIGHT_INDEX);
+    OP_CHECK_NULL_WITH_CONTEXT(context, wShapePtr);
+    auto wShape = EnsureNotScalar(wShapePtr->GetStorageShape());
+    if(wShape.GetDimNum() != 2){
+        return ge::GRAPH_FAILED;
+    } 
+    const int64_t width = wShape.GetDim(0);
+    const int64_t wDim = wShape.GetDim(1);
+    if(wDim != dim){
+        return ge::GRAPH_FAILED;
+    }
+    if(width != 4){
+        return ge::GRAPH_FAILED;
+    }                
+
+    auto sShapePtr = context->GetInputShape(CONV_STATES_INDEX);
+    OP_CHECK_NULL_WITH_CONTEXT(context, sShapePtr);
+    auto sShape = EnsureNotScalar(sShapePtr->GetStorageShape());
+    if(sShape.GetDimNum() != 3){
+       return ge::GRAPH_FAILED;
+    }
+    const int64_t numCacheLines = sShape.GetDim(0);
+    const int64_t stateLen = sShape.GetDim(1);
+    const int64_t sDim = sShape.GetDim(2);
+    if(numCacheLines <= 0){
+         return ge::GRAPH_FAILED;}
+    if(sDim != dim){
+        return ge::GRAPH_FAILED;}
+    if(stateLen < (width - 1)){
+        return ge::GRAPH_FAILED;}
+
+    auto qslShapePtr = context->GetInputShape(QUERY_START_LOC_INDEX);
+    OP_CHECK_NULL_WITH_CONTEXT(context, qslShapePtr);
+    auto qslShape = EnsureNotScalar(qslShapePtr->GetStorageShape());
+    if(qslShape.GetDimNum() != 1){
+        return ge::GRAPH_FAILED;}
+    const int64_t qslSize = qslShape.GetDim(0);
+    if(qslSize < 1){
+        return ge::GRAPH_FAILED;}
+
+    if (inputMode == 0) {
+        batch = qslSize - 1;
+    }
+
+    if (inputMode == 1) {
+        if(qslSize != batch + 1){
+            return ge::GRAPH_FAILED;
+        }
+    }
+
+    auto ciShapePtr = context->GetInputShape(CACHE_INDICES_INDEX);
+    OP_CHECK_NULL_WITH_CONTEXT(context, ciShapePtr);
+    auto ciShape = EnsureNotScalar(ciShapePtr->GetStorageShape());
+    if(ciShape.GetDimNum() != 1){return ge::GRAPH_FAILED;}
+    if(ciShape.GetDim(0) != batch){return ge::GRAPH_FAILED;}
+    
+    auto hisShapePtr = context->GetInputShape(HAS_INITIAL_STATE_INDEX);
+    OP_CHECK_NULL_WITH_CONTEXT(context, hisShapePtr);
+    auto hisShape = EnsureNotScalar(hisShapePtr->GetStorageShape());
+    if(hisShape.GetDimNum() != 1){
+        return ge::GRAPH_FAILED;}
+    if(hisShape.GetDim(0) != batch){
+        return ge::GRAPH_FAILED;}
+
+    tiling.set_hasBias(0);
+    auto biasShapePtr = context->GetOptionalInputShape(BIAS_INDEX);
+    if (biasShapePtr != nullptr && biasShapePtr->GetStorageShape().GetDimNum() != 0) {
+        auto biasShape = EnsureNotScalar(biasShapePtr->GetStorageShape());
+        if(biasShape.GetDimNum() != 1){
+            return ge::GRAPH_FAILED;}
+        if(biasShape.GetDim(0) != dim){
+            return ge::GRAPH_FAILED;}
+        tiling.set_hasBias(1);
+    }
+
+    const std::set<ge::DataType> supportedXDtype = {ge::DT_BF16, ge::DT_FLOAT16};
+    auto xDesc = context->GetInputDesc(X_INDEX);
+    OP_CHECK_NULL_WITH_CONTEXT(context, xDesc);
+    const ge::DataType xDtype = xDesc->GetDataType();
+    if(supportedXDtype.count(xDtype) == 0){
+        return ge::GRAPH_FAILED;}
+
+    auto wDesc = context->GetInputDesc(WEIGHT_INDEX);
+    OP_CHECK_NULL_WITH_CONTEXT(context, wDesc);
+    if(wDesc->GetDataType() != xDtype){ 
+        return ge::GRAPH_FAILED;}
+
+    if (tiling.get_hasBias() == 1) {
+        auto biasDesc = context->GetOptionalInputDesc(BIAS_INDEX);
+        OP_CHECK_NULL_WITH_CONTEXT(context, biasDesc);
+        if(biasDesc->GetDataType() != xDtype){
+            return ge::GRAPH_FAILED;}
+    }
+
+    auto sDesc = context->GetInputDesc(CONV_STATES_INDEX);
+    OP_CHECK_NULL_WITH_CONTEXT(context, sDesc);
+    if(sDesc->GetDataType() != xDtype){
+        return ge::GRAPH_FAILED;}
+
+    auto qslDesc = context->GetInputDesc(QUERY_START_LOC_INDEX);
+    OP_CHECK_NULL_WITH_CONTEXT(context, qslDesc);
+    if(qslDesc->GetDataType() != ge::DT_INT32){
+        return ge::GRAPH_FAILED;}
+
+    auto ciDesc = context->GetInputDesc(CACHE_INDICES_INDEX);
+    OP_CHECK_NULL_WITH_CONTEXT(context, ciDesc);
+    if(ciDesc->GetDataType() != ge::DT_INT32){
+        return ge::GRAPH_FAILED;}
+
+    auto hisDesc = context->GetInputDesc(HAS_INITIAL_STATE_INDEX);
+    OP_CHECK_NULL_WITH_CONTEXT(context, hisDesc);
+    if(hisDesc->GetDataType() != ge::DT_BOOL){
+        return ge::GRAPH_FAILED;}
+
+    tiling.set_dim(dim);
+    tiling.set_cuSeqlen(cuSeqlen);
+    tiling.set_seqLen(seqLen);
+    tiling.set_inputMode(inputMode);
+    tiling.set_width(width);
+    tiling.set_stateLen(stateLen);
+    tiling.set_numCacheLines(numCacheLines);
+    tiling.set_batch(batch);
+    return ge::GRAPH_SUCCESS;
+}
+
+static ge::graphStatus CausalConv1dTilingFunc(gert::TilingContext* context)
+{
+    uint64_t ubSize;
+    uint32_t coreNum;
+    if( GetPlatformInfo(context, ubSize, coreNum) != ge::GRAPH_SUCCESS){
+        return ge::GRAPH_FAILED;
+    }
+
+    if(GetWorkspaceSize(context) != ge::GRAPH_SUCCESS){
+        return ge::GRAPH_FAILED;
+    }
+    CausalConv1dTilingData tilingData;
+
+    int64_t activationMode = 0;
+    int64_t padSlotId = -1;
+    if(GetAttrsInfo(context, activationMode, padSlotId) != ge::GRAPH_SUCCESS){
+        return ge::GRAPH_FAILED;
+    }
+    tilingData.set_activationMode(activationMode);
+    tilingData.set_padSlotId(padSlotId);
+
+    if( GetShapeDtypeInfo(context, tilingData) != ge::GRAPH_SUCCESS){
+        return ge::GRAPH_FAILED;
+    }
+
+    const int64_t dim = tilingData.get_dim();
+    const int64_t batch = tilingData.get_batch();
+    if(dim <= 0 || batch <= 0){
+        return ge::GRAPH_FAILED;
+    }
+    const DimTileChoice choice = ChooseDimTileSize(context, batch, dim, coreNum);
+    const uint32_t blockDim = (choice.gridSize < static_cast<int64_t>(coreNum))
+                                  ? static_cast<uint32_t>(choice.gridSize)
+                                  : coreNum;
+    context->SetBlockDim(blockDim);
+    tilingData.set_dimTileSize(choice.dimTileSize);
+    tilingData.set_blocksPerSeq(choice.blocksPerSeq);
+
+    const uint64_t tilingKey = GET_TPL_TILING_KEY(CAUSAL_CONV1D_TPL_SCH_MODE_DEFAULT);
+    context->SetTilingKey(tilingKey);
+
+    tilingData.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tilingData.GetDataSize());
+    return ge::GRAPH_SUCCESS;
+}
+
+
+
+static ge::graphStatus TilingParseForCausalConv1d(gert::TilingParseContext* context)
+{
+    auto platformInfoPtr = context->GetPlatformInfo();
+    OP_CHECK_NULL_WITH_CONTEXT(context, platformInfoPtr);
+    auto compileInfoPtr = context->GetCompiledInfo<CausalConv1dCompileInfo>();
+    OP_CHECK_NULL_WITH_CONTEXT(context, compileInfoPtr);
+
+    auto ascendcPlatform = platform_ascendc::PlatformAscendC(platformInfoPtr);
+    compileInfoPtr->coreNum = static_cast<uint32_t>(ascendcPlatform.GetCoreNumAiv());
+    if(compileInfoPtr->coreNum == 0){
+      return ge::GRAPH_FAILED;
+    }
+    ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, compileInfoPtr->ubSize);
+    if(compileInfoPtr->ubSize == 0){
+          return ge::GRAPH_FAILED;
+    }
+    return ge::GRAPH_SUCCESS;
+}
+
+IMPL_OP_OPTILING(CausalConv1d)
+    .Tiling(CausalConv1dTilingFunc)
+    .TilingParse<CausalConv1dCompileInfo>(TilingParseForCausalConv1d);
+} // namespace optiling

@@ -332,6 +332,7 @@ An L0 `dump.json` contains forward I/O for modules together with parameters. Usi
      "data_name": "Module.conv2.Conv2d.forward.0.parameters.bias.pt"
     }
    }
+  },
   }
  }
 }
@@ -388,6 +389,7 @@ An L1 `dump.json` records forward I/O for APIs. Using PyTorch's `relu` function 
      "data_name": "Functional.relu.0.forward.output.0.pt"
     }
    ]
+  },
   }
  }
 }  

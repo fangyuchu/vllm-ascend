@@ -1,4 +1,3 @@
-import gc
 import random
 
 import numpy
@@ -204,9 +203,6 @@ def test_npu_moe_gating_topk_compare(group_select_mode: int,
                           expert_idx_npu.cpu().numpy(),
                           rtol=RTOL_TOLERANCE,
                           atol=ATOL_TOLERANCE)
-    gc.collect()
-    torch.npu.empty_cache()
-    torch.npu.reset_peak_memory_stats()
 
 
 if __name__ == "__main__":

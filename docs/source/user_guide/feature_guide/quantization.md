@@ -151,11 +151,12 @@ python -m vllm.entrypoints.api_server \
     --tensor-parallel-size 2 \
     --data-parallel-size 1 \
     --served-model-name quantized_model \
-    --trust-remote-code 
+    --trust-remote-code \
+    --quantization ascend
 ```
 
 ## References
 
 - [ModelSlim Documentation](https://gitcode.com/Ascend/msit/blob/master/msmodelslim/README.md)
 - [LLM-Compressor GitHub](https://github.com/vllm-project/llm-compressor)
-- [vLLM Quantization Guide](https://docs.vllm.ai/en/latest/features/quantization/)
+- [vLLM Quantization Guide](https://docs.vllm.ai/en/latest/quantization/)

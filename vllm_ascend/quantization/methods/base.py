@@ -18,25 +18,19 @@
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from enum import Enum
 from typing import Any
 
 import torch
 
-from vllm_ascend.quantization.quant_type import QuantType
 
+class QuantType(Enum):
+    """Quantization type enum for MoE schemes."""
 
-def get_moe_num_logical_experts(
-    layer: torch.nn.Module,
-    num_experts: int,
-    global_redundant_expert_num: int = 0,
-    num_shared_experts: int = 0,
-) -> int:
-    moe_config = getattr(layer, "moe_config", None)
-    num_logical_experts = getattr(moe_config, "num_logical_experts", None)
-    if num_logical_experts is not None:
-        return int(num_logical_experts)
-
-    return int(num_experts - global_redundant_expert_num - num_shared_experts)
+    NONE = 0
+    W8A8 = 1
+    W4A8 = 2
+    MXFP8 = 3
 
 
 class AscendLinearScheme(ABC):
@@ -239,7 +233,7 @@ class AscendMoEScheme(ABC):
         top_k: int,
         renormalize: bool,
         use_grouped_topk: bool = False,
-        num_experts: int = -1,
+        global_num_experts: int = -1,
         expert_map: torch.Tensor | None = None,
         topk_group: int | None = None,
         num_expert_group: int | None = None,
@@ -251,10 +245,7 @@ class AscendMoEScheme(ABC):
         enable_force_load_balance: bool = False,
         log2phy: torch.Tensor | None = None,
         global_redundant_expert_num: int = 0,
-        pertoken_scale: Any | None = None,
-        activation: str = "silu",
-        apply_router_weight_on_input: bool = False,
-        mc2_mask: torch.Tensor | None = None,
+        **kwargs,
     ) -> torch.Tensor:
         """Forward computation for MoE layer.
 
@@ -265,7 +256,7 @@ class AscendMoEScheme(ABC):
             top_k: Number of experts to select per token.
             renormalize: Whether to renormalize expert weights.
             use_grouped_topk: Whether to use grouped top-k selection.
-            num_experts: Number of experts.
+            global_num_experts: Total number of experts globally.
             expert_map: Mapping from local to global expert indices.
             topk_group: Group size for grouped top-k.
             num_expert_group: Number of expert groups.
@@ -277,10 +268,7 @@ class AscendMoEScheme(ABC):
             enable_force_load_balance: Whether to force load balancing.
             log2phy: Logical to physical expert mapping.
             global_redundant_expert_num: Number of redundant experts.
-            pertoken_scale: Optional per-token activation scale from prepare stage.
-            activation: Expert MLP activation type.
-            apply_router_weight_on_input: Whether to pre-scale hidden states by router weights.
-            mc2_mask: Optional mask used by MC2 dispatch.
+            **kwargs: Additional keyword arguments.
 
         Returns:
             Output tensor after MoE computation.

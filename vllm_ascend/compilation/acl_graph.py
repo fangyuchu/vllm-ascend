@@ -19,8 +19,6 @@ from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import logger
 from vllm.platforms import current_platform
 
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-
 from ..utils import weak_ref_tensors
 
 
@@ -66,9 +64,6 @@ class ACLGraphWrapper:
         vllm_config: VllmConfig,
         runtime_mode: CUDAGraphMode,
         cudagraph_options: CUDAGraphOptions | None = None,
-        *,
-        use_eagle: bool = False,
-        enable_enpu: bool = False,
     ):
         self.runnable = runnable
         self.vllm_config = vllm_config
@@ -77,7 +72,6 @@ class ACLGraphWrapper:
 
         self.first_run_finished = False
         self.is_debugging_mode = envs.VLLM_LOGGING_LEVEL == "DEBUG"
-        self._runnable_str = str(runnable) if self.is_debugging_mode else None
 
         # assert runtime_mode is not NONE(no aclgraph), otherwise, we don't
         # need to initialize a ACLGraphWrapper.
@@ -90,18 +84,16 @@ class ACLGraphWrapper:
         # the entries for different batch descriptors that we need to capture
         # aclgraphs for.
         self.concrete_aclgraph_entries: dict[BatchDescriptor, ACLGraphEntry] = {}
-        self.enable_enpu = enable_enpu
-        self.use_eagle = use_eagle
+
+        if not hasattr(self.vllm_config.compilation_config, "concrete_aclgraph_entry_list"):
+            self.vllm_config.compilation_config.concrete_aclgraph_entry_list = []
+        self.vllm_config.compilation_config.concrete_aclgraph_entry_list.append(self.concrete_aclgraph_entries)
 
     def __getattr__(self, key: str):
         # allow accessing the attributes of the runnable.
         if hasattr(self.runnable, key):
             return getattr(self.runnable, key)
-        if self.is_debugging_mode:
-            raise AttributeError(
-                f"Attribute {key} not exists in the runnable of aclgraph wrapper: {self._runnable_str}"
-            )
-        raise AttributeError(f"Attribute {key} not found. Set VLLM_LOGGING_LEVEL=DEBUG for more details.")
+        raise AttributeError(f"Attribute {key} not exists in the runnable of aclgraph wrapper: {self.runnable}")
 
     def unwrap(self) -> Callable:
         # in case we need to access the original runnable.
@@ -170,10 +162,8 @@ class ACLGraphWrapper:
             # to save memory
             global _graph_params
             global _draft_graph_params
-            global _draft_graph_prefill_params
             weak_ref_workspaces(_graph_params)
             weak_ref_workspaces(_draft_graph_params)
-            weak_ref_workspaces(_draft_graph_prefill_params)
 
             # here we always use weak ref for the output
             # to save memory
@@ -204,10 +194,12 @@ class ACLGraphWrapper:
         # so that update_attn_params only executes after the previous graph replay has fully completed.
         # If we do not in main model and in full-graph mode when using merge-eagle-graph,
         # we do not need to synchronize.
-        # When enable_enpu is on, model_runner orders update vs replay; skip here.
-        # When EAGLE draft (merge path), replay does not need this barrier.
-        is_draft_eagle = _EXTRA_CTX.is_draft_model and self.use_eagle
-        if not self.enable_enpu and not is_draft_eagle:
+        use_eagle = (
+            self.vllm_config.speculative_config.method in ("eagle", "eagle3")
+            if self.vllm_config.speculative_config
+            else False
+        )
+        if self.runtime_mode != CUDAGraphMode.FULL or not forward_context.is_draft_model or not use_eagle:
             torch.npu.current_stream().synchronize()
         entry.aclgraph.replay()
         return entry.output
@@ -300,28 +292,3 @@ def update_draft_graph_params_workspaces(num_tokens: int, workspace: Any):
 
 def get_draft_graph_params():
     return _draft_graph_params
-
-
-_draft_graph_prefill_params: GraphParams | None = None
-
-
-def set_draft_graph_prefill_params(aclgraph_capture_sizes: list[int]):
-    global _draft_graph_prefill_params
-    if _draft_graph_prefill_params is not None:
-        raise ValueError("DraftGraph preill parameters have already been set!")
-    _draft_graph_prefill_params = GraphParams(
-        {size: [] for size in aclgraph_capture_sizes},
-        {size: None for size in aclgraph_capture_sizes},
-        {size: [] for size in aclgraph_capture_sizes},
-        {size: [] for size in aclgraph_capture_sizes},
-    )
-
-
-def update_draft_graph_prefill_params_workspaces(num_tokens: int, workspace: Any):
-    global _draft_graph_prefill_params
-    if _draft_graph_prefill_params is not None:
-        _draft_graph_prefill_params.workspaces[num_tokens] = workspace
-
-
-def get_draft_graph_prefill_params():
-    return _draft_graph_prefill_params

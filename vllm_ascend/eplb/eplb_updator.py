@@ -30,12 +30,10 @@ from vllm_ascend.eplb.core.eplb_worker import EplbProcess
 class EplbUpdator:
     def __init__(self, eplb_config, loader: D2DExpertWeightLoader, eplb_process: EplbProcess, process):
         self.eplb_config = eplb_config
-        self.multi_stage = eplb_config.eplb_policy_type == 3
         self.init_eplb(self.eplb_config.expert_map_path, process)
         self.eplb_loader = loader
         self.eplb_process = eplb_process
         self.shared_dict = self.eplb_process.shared_dict
-        self.comm_group = get_dynamic_eplb_group()
 
     def set_adaptor(self, adaptor: VllmEplbAdaptor):
         self.adaptor = adaptor
@@ -70,7 +68,7 @@ class EplbUpdator:
 
         self.process = process
 
-        logger.info("[ModelRunner] Launched EPLB process (pid=%s)", self.process.pid)
+        logger.info(f"[ModelRunner] Launched EPLB process (pid={self.process.pid})")
 
     def update_iteration(self):
         self.cur_iterations += 1
@@ -131,14 +129,18 @@ class EplbUpdator:
         self.update_iteration()
 
     def compute_and_set_moe_load(self):
-        local_load = self.adaptor.get_rank_expert_workload().unsqueeze(1)
-        moe_load = self.comm_group.all_gather(local_load, dim=1).cpu()
-
-        if self.multi_stage:
-            moe_load = moe_load.permute(2, 0, 1, 3)
-
+        local_load = self.adaptor.get_rank_expert_workload().cpu()
+        self.comm_group = get_dynamic_eplb_group()
+        self.world_size = dist.get_world_size(group=self.comm_group.cpu_group)
+        gather_list = [torch.empty_like(local_load) for _ in range(self.world_size)]
+        dist.all_gather(
+            tensor_list=gather_list,
+            tensor=local_load,
+            group=self.comm_group.cpu_group,
+        )
+        moe_load = torch.stack(gather_list, dim=0).permute(1, 0, 2)
         self.shared_dict["moe_load"] = moe_load
-        logger.debug("[ModelRunner] Updated shared_dict['moe_load'] shape=%s", moe_load.shape)
+        logger.debug(f"[ModelRunner] Updated shared_dict['moe_load'] shape={moe_load.shape}")
 
         return moe_load
 
@@ -153,12 +155,12 @@ class EplbUpdator:
         for dst_rank in range(self.world_size):
             if dst_rank == self.rank_id:
                 continue
-            comm_op_list.append(dist.P2POp(dist.isend, src_tensor, dst_rank, group=self.comm_group.device_group))
+            comm_op_list.append(dist.P2POp(dist.isend, src_tensor, dst_rank))
 
         for src_rank in range(self.world_size):
             if src_rank == self.rank_id:
                 continue
-            comm_op_list.append(dist.P2POp(dist.irecv, src_tensor, src_rank, group=self.comm_group.device_group))
+            comm_op_list.append(dist.P2POp(dist.irecv, src_tensor, src_rank))
         if comm_op_list:
             reqs = dist.batch_isend_irecv(comm_op_list)
 

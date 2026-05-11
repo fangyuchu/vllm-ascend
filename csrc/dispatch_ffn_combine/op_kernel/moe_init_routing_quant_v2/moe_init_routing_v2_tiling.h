@@ -1,8 +1,5 @@
 #pragma once
 
-#ifndef ASCENDC_DISPATCH_FFN_COMBINE_INIT_ROUTING_TILING_H
-#define ASCENDC_DISPATCH_FFN_COMBINE_INIT_ROUTING_TILING_H
-
 #include "tiling_base.h"
 
 
@@ -411,5 +408,3 @@ void InnerMoeInitRoutingV2TilingBase::Tiling4SrcToDstCapacityCompute() {
 }
 
 }
-
-#endif
