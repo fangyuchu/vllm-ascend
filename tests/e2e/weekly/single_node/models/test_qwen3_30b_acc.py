@@ -45,6 +45,7 @@ mooncake_json = {
     "metadata_server": "P2PHANDSHAKE",
     "protocol": "ascend",
     "device_name": "",
+    "use_ascend_direct": True,
     "master_server_address": "",
     "global_segment_size": 30000000000
 }

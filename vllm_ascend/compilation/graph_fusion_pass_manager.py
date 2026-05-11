@@ -70,8 +70,6 @@ class GraphFusionPassManager:
             self.passes.append(MulsAddFusionPass(config))
 
         if config.compilation_config.pass_config.enable_sp:
-            from .passes.sequence_parallelism import SequenceParallelismPass
-            from .passes.sequence_parallelism_moe import SequenceParallelismMoePass
+            from .passes.sequence_parallelism import AscendSequenceParallelismPass
 
-            self.passes.append(SequenceParallelismPass(config))
-            self.passes.append(SequenceParallelismMoePass(config))
+            self.passes.append(AscendSequenceParallelismPass(config))

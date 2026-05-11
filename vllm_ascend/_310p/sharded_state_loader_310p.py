@@ -20,7 +20,6 @@ from pathlib import Path
 
 import torch
 from vllm.config.load import LoadConfig
-from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.model_loader import ShardedStateLoader
 
 
@@ -49,20 +48,10 @@ class ShardedStateLoader310(ShardedStateLoader):
         )
 
     @staticmethod
-    def generate_quant_description(
-        model: torch.nn.Module,
-        path: str,
-        quant_config: QuantizationConfig | None = None,
-    ) -> None:
+    def generate_quant_description(model: torch.nn.Module, path: str):
         """Generate a mapping of parameter names to their corresponding quantization types."""
         quant_description = {}
-        if quant_config is None:
-            quantize_type = "FLOAT"
-        else:
-            try:
-                quantize_type = quant_config.quant_description.get("model_quant_type", "FLOAT")
-            except AttributeError:
-                quantize_type = "FLOAT"
+        quantize_type = model.quant_config.quant_description.get("model_quant_type", "FLOAT")
         quant_description["model_quant_type"] = quantize_type
         quant_description["version"] = "1.0.0"
         state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())

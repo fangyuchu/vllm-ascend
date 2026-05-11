@@ -13,21 +13,21 @@ from vllm.distributed import (
 from vllm.forward_context import get_forward_context
 from vllm.utils.torch_utils import direct_register_custom_op
 
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
+from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.ops.rotary_embedding import rope_forward_oot
 from vllm_ascend.ops.triton.muls_add import muls_add_triton
 from vllm_ascend.ops.weight_prefetch import maybe_npu_prefetch
-from vllm_ascend.utils import enable_sp_by_pass, is_vl_model, npu_stream_switch, prefetch_stream
+from vllm_ascend.utils import npu_stream_switch, prefetch_stream
 
 
 def _maybe_chunk_residual_impl(x: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
     try:
-        get_forward_context()
+        forward_context = get_forward_context()
     except AssertionError:
         return residual
 
     if x.size(0) != residual.size(0):
-        pad_size = _EXTRA_CTX.pad_size
+        pad_size = forward_context.pad_size
         if pad_size > 0:
             residual = F.pad(residual, (0, 0, 0, pad_size))
         tp_size = get_tensor_model_parallel_world_size()
@@ -43,23 +43,21 @@ def _maybe_all_gather_and_maybe_unpad_impl(x: torch.Tensor, label: bool, is_ep_c
     except AssertionError:
         return x
 
-    flash_comm_v1_enabled = _EXTRA_CTX.flash_comm_v1_enabled or (enable_sp_by_pass() and is_ep_comm)
+    flash_comm_v1_enabled = forward_context.flash_comm_v1_enabled
     if flash_comm_v1_enabled and label:
         dp_metadata = forward_context.dp_metadata
         if dp_metadata is None or not is_ep_comm:
             x = tensor_model_parallel_all_gather(x, 0)
-            pad_size = _EXTRA_CTX.pad_size
+            pad_size = forward_context.pad_size
             if pad_size > 0:
                 x = x[:-pad_size]
         else:
             x = get_ep_group().all_gather(x, 0)
-            if enable_sp_by_pass():  # TODO: do unpad
-                return x
             # unpad
             num_tokens_across_dp_cpu = dp_metadata.num_tokens_across_dp_cpu
             result = torch.empty((num_tokens_across_dp_cpu.sum(), *x.shape[1:]), device=x.device, dtype=x.dtype)
             dp_size = get_dp_group().world_size
-            x = x.view(dp_size, _EXTRA_CTX.padded_length, *x.shape[1:])
+            x = x.view(dp_size, forward_context.padded_length, *x.shape[1:])
             offset = 0
             for idx in range(dp_size):
                 num_tokens_dp = num_tokens_across_dp_cpu[idx]
@@ -76,26 +74,20 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor, is_ep_comm: bool = False) -> tor
     except AssertionError:
         return tensor_model_parallel_all_reduce(x)
 
-    flash_comm_v1_enabled = getattr(forward_context, "flash_comm_v1_enabled", False) or (
-        enable_sp_by_pass() and is_ep_comm
-    )
-
-    if not flash_comm_v1_enabled or (forward_context.is_draft_model and is_vl_model() and not is_ep_comm):
+    if not getattr(forward_context, "flash_comm_v1_enabled", False):
         return tensor_model_parallel_all_reduce(x)
 
     dp_metadata = forward_context.dp_metadata
     if dp_metadata is None or not is_ep_comm:
-        pad_size = _EXTRA_CTX.pad_size
+        pad_size = forward_context.pad_size
         if pad_size > 0:
             x = F.pad(x, (0, 0, 0, pad_size))
         return tensor_model_parallel_reduce_scatter(x, 0)
     else:
-        if enable_sp_by_pass():
-            return get_ep_group().reduce_scatter(x.view(-1, *x.shape[1:]), 0)
         # padding
         dp_size = get_dp_group().world_size
         num_tokens_across_dp_cpu = get_forward_context().dp_metadata.num_tokens_across_dp_cpu
-        padded_x = torch.empty((dp_size, _EXTRA_CTX.padded_length, *x.shape[1:]), device=x.device, dtype=x.dtype)
+        padded_x = torch.empty((dp_size, forward_context.padded_length, *x.shape[1:]), device=x.device, dtype=x.dtype)
         offset = 0
         for idx in range(dp_size):
             num_tokens_dp = num_tokens_across_dp_cpu[idx]
@@ -106,7 +98,7 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor, is_ep_comm: bool = False) -> tor
 
 
 def _maybe_all_gather_and_maybe_unpad_fake(x: torch.Tensor, label: bool, is_ep_comm: bool = False) -> torch.Tensor:
-    if _EXTRA_CTX.flash_comm_v1_enabled and label:
+    if get_forward_context().flash_comm_v1_enabled and label:
         return torch.empty(
             (x.shape[0] * get_tensor_model_parallel_world_size(), *x.shape[1:]), device=x.device, dtype=x.dtype
         )
@@ -115,7 +107,7 @@ def _maybe_all_gather_and_maybe_unpad_fake(x: torch.Tensor, label: bool, is_ep_c
 
 
 def _maybe_pad_and_reduce_fake(x: torch.Tensor, is_ep_comm: bool = False) -> torch.Tensor:
-    if _EXTRA_CTX.flash_comm_v1_enabled or enable_sp_by_pass():
+    if get_forward_context().flash_comm_v1_enabled:
         return torch.empty(
             (x.shape[0] // get_tensor_model_parallel_world_size(), *x.shape[1:]), device=x.device, dtype=x.dtype
         )
@@ -146,10 +138,11 @@ def _prefetch_postprocess_impl_fake(stop_flag: torch.Tensor) -> None:
 
 
 def _maybe_all_reduce_tensor_model_parallel_impl(final_hidden_states: torch.Tensor) -> torch.Tensor:
-    moe_comm_type = _EXTRA_CTX.moe_comm_type
+    forward_context = get_forward_context()
+    moe_comm_type = forward_context.moe_comm_type
     if (
         moe_comm_type in {MoECommType.ALLTOALL, MoECommType.MC2, MoECommType.FUSED_MC2}
-        or _EXTRA_CTX.flash_comm_v1_enabled
+        or forward_context.flash_comm_v1_enabled
     ):
         return final_hidden_states
     else:
@@ -170,7 +163,7 @@ def _matmul_and_reduce_impl_fake(input_parallel: torch.Tensor, layer_name: str) 
     forward_context = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
     num_tokens = input_parallel.size(0)
-    if _EXTRA_CTX.flash_comm_v1_enabled:
+    if forward_context.flash_comm_v1_enabled:
         num_tokens = num_tokens // self.tp_size
     output = torch.empty(
         size=(num_tokens, self.output_size_per_partition), device=input_parallel.device, dtype=input_parallel.dtype

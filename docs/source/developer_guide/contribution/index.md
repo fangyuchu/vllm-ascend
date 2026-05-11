@@ -34,13 +34,14 @@ bash format.sh
 
 #### Run CI locally
 
-After completing "Run lint" setup, you can run CI (Continuous integration) locally:
+After completing "Run lint" setup, you can run CI locally:
 
 ```{code-block} bash
    :substitutions:
+
 cd ~/vllm-project/
 
-# Run CI needs vLLM installed
+# Run CI need vLLM installed
 git clone --branch |vllm_version| https://github.com/vllm-project/vllm.git
 cd vllm
 pip install -r requirements/build.txt
@@ -51,7 +52,7 @@ cd ..
 cd vllm-ascend
 # For Linux:
 pip install -r requirements-dev.txt
-# For non-Linux:
+# For non Linux:
 cat requirements-dev.txt | grep -Ev '^#|^--|^$|^-r' | while read PACKAGE; do pip install "$PACKAGE"; done
 cat requirements.txt | grep -Ev '^#|^--|^$|^-r' | while read PACKAGE; do pip install "$PACKAGE"; done
 
@@ -74,7 +75,7 @@ You can refer to [Testing](./testing.md)  to set up a testing environment and ru
 
 ## DCO and Signed-off-by
 
-When contributing changes to this project, you must agree to the DCO. Commits must include a `Signed-off-by:` header which certifies agreement with the terms of the DCO (Developer Certificate of Origin).
+When contributing changes to this project, you must agree to the DCO. Commits must include a `Signed-off-by:` header which certifies agreement with the terms of the DCO.
 
 Using `-s` with `git commit` will automatically add this header.
 
@@ -101,7 +102,7 @@ If the PR spans more than one category, please include all relevant prefixes.
 
 ## Others
 
-You may find more information about contributing to vLLM Ascend backend plugin on [<u>docs.vllm.ai</u>](https://docs.vllm.ai/en/latest/contributing).
+You may find more information about contributing to vLLM Ascend backend plugin on [<u>docs.vllm.ai</u>](https://docs.vllm.ai/en/latest/contributing/overview.html).
 If you encounter any problems while contributing, feel free to submit a PR to improve the documentation to help other developers.
 
 :::{toctree}
@@ -109,7 +110,4 @@ If you encounter any problems while contributing, feel free to submit a PR to im
 :maxdepth: 1
 testing
 multi_node_test
-nightly_ci_test
-e2e_ci_test
-doc_writing
 :::

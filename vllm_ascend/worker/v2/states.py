@@ -56,13 +56,13 @@ class AscendRequestState(RequestState):
         self,
         req_id,
         prompt_len,
-        all_token_ids,
+        prefill_token_ids,
         num_computed_tokens,
     ):
         super().add_request(
             req_id,
             prompt_len,
-            all_token_ids,
+            prefill_token_ids,
             num_computed_tokens,
         )
         req_idx = self.req_id_to_index[req_id]

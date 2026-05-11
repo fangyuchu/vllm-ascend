@@ -19,6 +19,8 @@
 
 import copy
 import gc
+import threading
+from collections.abc import Callable
 from datetime import timedelta
 from types import NoneType
 
@@ -34,12 +36,11 @@ from vllm.distributed import ensure_model_parallel_initialized, init_distributed
 from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
 from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized, get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.parallel_state import (
-    Handle,
+    get_all_model_groups,
     get_dp_group,
     get_pp_group,
     get_tp_group,
 )
-from vllm.distributed.utils import stateless_init_torch_distributed_process_group
 from vllm.logger import logger
 from vllm.lora.request import LoRARequest
 from vllm.sequence import IntermediateTensors
@@ -48,9 +49,9 @@ from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, memory_profiling
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+from vllm.v1.engine.base_sentinel import BaseSentinel
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
-from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
 from vllm.v1.worker.worker_base import WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
 
@@ -61,6 +62,7 @@ from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.distributed.parallel_state import get_elastic_info, init_ascend_model_parallel
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
+from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.utils import (
     AscendDeviceType,
     check_ascend_device_type,
@@ -75,6 +77,7 @@ from vllm_ascend.worker.descale import (
     expand_expert_weights,
     gen_all_layer_log2phy,
     get_expert_distribution_after_descale,
+    init_dp_cpu_group,
     init_elastic_info,
     init_ep2dp_map,
     rebuild_acl_graph,
@@ -88,7 +91,6 @@ from vllm_ascend.worker.descale import (
     update_parallel_config,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
-from vllm_ascend.worker.sentinel.npu_worker_sentinel import NPUWorkerSentinel
 
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
 from torch._dynamo.variables import TorchInGraphFunctionVariable  # noqa: E402
@@ -101,6 +103,82 @@ torch_non_c_binding_in_graph_functions_npu = dict.fromkeys(
 torch_non_c_binding_in_graph_functions_npu["torch.npu.stream"] = TorchInGraphFunctionVariable  # noqa: E402
 torch._dynamo.trace_rules.torch_name_rule_map.append(torch_non_c_binding_in_graph_functions_npu)  # noqa: E402
 FAULT_TOLERANCE_MEM_UTILIZATION = 0.95
+
+
+class WorkerSentinel(BaseSentinel):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        clear_input_batch_callback: Callable,
+        device: torch.device,
+        worker: WorkerBase,
+    ):
+        self.dp_rank = vllm_config.parallel_config.data_parallel_rank
+        self.tp_rank = get_tp_group().rank_in_group
+        self.pp_rank = get_pp_group().rank_in_group
+        self.worker = worker
+        identity = f"PP{self.pp_rank}_TP{self.tp_rank}"
+        super().__init__(
+            upstream_cmd_addr=vllm_config.fault_tolerance_config.worker_cmd_addr,
+            downstream_cmd_addr=None,
+            dealer_socket_identity=identity.encode(),
+            sentinel_tag=f"{self.dp_rank}_{identity}",
+            fault_tolerance_config=vllm_config.fault_tolerance_config,
+        )
+        self.vllm_config = vllm_config
+        self.clear_input_batch_callback = clear_input_batch_callback
+        self.device = device
+
+        torch.npu.set_device(self.device)
+
+        threading.Thread(target=self.run, daemon=True, name="WorkerSentinelMonitorThread").start()
+
+    def run(self):
+        # Wait for fault tolerance instructions from EngineCoreSentinel
+        while not self.sentinel_dead:
+            has_msg, cmd_str = self.receive_upstream_cmd()
+            if has_msg:
+                assert cmd_str is not None
+                success, method_uuid, reason = self._execute_cmd(cmd_str)
+                self._send_execution_result(success, method_uuid, reason)
+
+    def pause(self, timeout: int = 1, **kwargs) -> bool:
+        NPUPlatform.set_device(self.device)
+        result = torch_npu.npu.stop_device(self.device.index)
+        if result == 0:
+            self.logger("npu stop device %s succeeded", self.device.index)
+            return True
+        elif result == 1:
+            self.logger("npu stop device %s failed", self.device.index)
+            return False
+        else:
+            raise ValueError(f"Unexpected return value from stop_device: {result}")
+
+    def retry(self, **kwargs) -> bool:
+        NPUPlatform.set_device(self.device)
+        torch_npu.npu.restart_device(self.device.index)
+        self.logger("npu restart device %s", self.device.index)
+        dp_group = get_dp_group()
+        dp_group.destroy_cpu_group()
+        init_dp_cpu_group(self.vllm_config)
+        comm_groups = get_all_model_groups()
+        for group in comm_groups:
+            torch_npu.distributed.reinit_process_group(group.device_group, False)
+        torch.npu.synchronize()
+        self.clear_input_batch_callback()
+        return True
+
+    def descale(self, vllm_config_update_dict: dict, exclude_ep_ranks: list[int], **kwargs) -> bool:
+        NPUPlatform.set_device(self.device)
+        torch_npu.npu.restart_device(self.device.index)
+        self.clear_input_batch_callback()
+        comm_groups = get_all_model_groups()
+        for group in comm_groups:
+            torch_npu.distributed.reinit_process_group(group.device_group, False)
+        torch.npu.synchronize()
+        self.worker.dp_descale(exclude_ep_ranks, vllm_config_update_dict)
+        self.worker.execute_dummy_batch()
+        return True
 
 
 class NPUWorker(WorkerBase):
@@ -125,7 +203,12 @@ class NPUWorker(WorkerBase):
         from vllm_ascend.utils import adapt_patch
 
         adapt_patch()
+        # Import _inductor for graph mode execution with triton
+        # This lazy import avoids torch_npu re-initialization in patch
+        from vllm.triton_utils import HAS_TRITON
 
+        if HAS_TRITON:
+            import torch_npu._inductor  # noqa: F401
         # Register ops when worker init.
         from vllm_ascend import ops
 
@@ -136,6 +219,7 @@ class NPUWorker(WorkerBase):
         # init ascend config and soc version
         init_ascend_config(vllm_config)
         check_ascend_device_type()
+        self.worker_sentinel: WorkerSentinel | None = None
 
         super().__init__(
             vllm_config=vllm_config,
@@ -162,9 +246,8 @@ class NPUWorker(WorkerBase):
 
         if "UnquantizedLinearMethod" in WEIGHT_LOADER_V2_SUPPORTED:
             WEIGHT_LOADER_V2_SUPPORTED.remove("UnquantizedLinearMethod")
-        self.worker_sentinel: NPUWorkerSentinel | None = None
+
         self.use_v2_model_runner = envs_vllm.VLLM_USE_V2_MODEL_RUNNER
-        self._pp_send_work: list[Handle] = []
 
         ascend_compilation_config = get_ascend_config().ascend_compilation_config
         if ascend_compilation_config.enable_npugraph_ex and ascend_compilation_config.enable_static_kernel:
@@ -183,7 +266,7 @@ class NPUWorker(WorkerBase):
 
             signal.signal(signal.SIGTERM, signal_handler)
             signal.signal(signal.SIGINT, signal_handler)
-        if self.vllm_config.parallel_config.enable_fault_tolerance:
+        if self.vllm_config.fault_tolerance_config.enable_fault_tolerance:
             self.ep2dp_map = init_ep2dp_map(
                 self.vllm_config.parallel_config.data_parallel_size,
                 self.vllm_config.parallel_config.tensor_parallel_size,
@@ -252,14 +335,13 @@ class NPUWorker(WorkerBase):
           metadata are valid.
         """
         # pre-verification and basic configuration
-        assert self.vllm_config.parallel_config.enable_fault_tolerance is True, "enable_fault_tolerance is False"
+        assert self.vllm_config.fault_tolerance_config.enable_fault_tolerance is True, "enable_fault_tolerance is False"
         if not self.backup_expert_rank_mapping:
             raise RuntimeError("not load model yet")
 
         self.cache_config.gpu_memory_utilization = FAULT_TOLERANCE_MEM_UTILIZATION
-        # rank = self.vllm_config.parallel_config.data_parallel_rank
+        rank = self.vllm_config.parallel_config.data_parallel_rank
         rank_mapping = vllm_update_config.get("rank_mapping")
-        rank = rank_mapping[self.parallel_config.data_parallel_rank]
         assert rank_mapping is not None
         assert type(rank_mapping) is dict
 
@@ -271,9 +353,7 @@ class NPUWorker(WorkerBase):
             raise ValueError("unknown number of experts")
 
         # recalculation of expert distribution
-        enable_d2d_after_failure = (
-            self.vllm_config.parallel_config.fault_tolerance_config.enable_fault_tolerance_rebalance
-        )
+        enable_d2d_after_failure = self.vllm_config.fault_tolerance_config.enable_fault_tolerance_rebalance
         if self.model_runner.shared_dict["moe_load"] is None or torch.all(
             self.model_runner.shared_dict["moe_load"][0] == 0
         ):
@@ -325,9 +405,6 @@ class NPUWorker(WorkerBase):
         update_parallel_config(self.vllm_config, vllm_update_config)
         self.model_runner.dp_size = self.vllm_config.parallel_config.data_parallel_size
         self.model_runner.dp_rank = self.vllm_config.parallel_config.data_parallel_rank
-        logger.info(
-            f"self.ep2dp_map is {self.ep2dp_map} exclude_ep_ranks is {exclude_ep_ranks} rank_mapping is {rank_mapping}"
-        )
         self.ep2dp_map = update_ep2dp_map(self.ep2dp_map, exclude_ep_ranks, rank_mapping)
         elastic_info = get_elastic_info()
         num_new_phy_experts = (self.model_runner.shared_dict["expert_maps"][0] != -1).sum().item()
@@ -350,19 +427,6 @@ class NPUWorker(WorkerBase):
         # rebuild acl_graph
         if not self.model_config.enforce_eager:
             rebuild_acl_graph(self.use_mask_mc2, self)
-
-    def init_dp_device_group(self, vllm_config: VllmConfig) -> None:
-        # TODO: Temporarily hardcode the port value for debugging. Will replace with get_open_port().
-        get_dp_group().cpu_group = stateless_init_torch_distributed_process_group(
-            vllm_config.parallel_config.data_parallel_master_ip,
-            vllm_config.parallel_config.data_parallel_master_port + 100,
-            vllm_config.parallel_config.data_parallel_rank,
-            vllm_config.parallel_config.data_parallel_size,
-            backend="gloo",
-        )
-        timeout = timedelta(seconds=vllm_config.parallel_config.fault_tolerance_config.gloo_comm_timeout)
-        dp_cpu_group = get_dp_group()
-        _set_pg_timeout(timeout=timeout, group=dp_cpu_group.cpu_group)
 
     def uninstall_static_kernel(self):
         import fcntl
@@ -425,7 +489,7 @@ class NPUWorker(WorkerBase):
 
         hidden_size = self.vllm_config.model_config.hf_text_config.hidden_size
         model = self.model_runner.model
-        if self.vllm_config.quant_config is None and (tags is None or "weights" in tags):
+        if tags is None or "weights" in tags:
             for name, param in model.named_parameters():
                 if "w2_weight" in name and param.shape[2] == hidden_size:
                     parts = name.split(".")
@@ -455,33 +519,9 @@ class NPUWorker(WorkerBase):
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
-    def create_worker_sentinel(self, worker_cmd_addr: str):
-        def clear_input_batch_callback():
-            input_batch = self.model_runner.input_batch
-            cached_req_ids = input_batch.req_id_to_index.keys()
-            for req_id in list(cached_req_ids):
-                input_batch.remove_request(req_id)
-
-        self.worker_sentinel = NPUWorkerSentinel(
-            self.parallel_config,
-            clear_input_batch_callback,
-            self.device,
-            worker_cmd_addr,
-            self,
-        )
-
     def _init_device(self):
         device = torch.device(f"npu:{self.local_rank}")
         torch.npu.set_device(device)
-
-        # Import _inductor for graph mode execution with triton
-        # This lazy import avoids torch_npu re-initialization in patch
-        # Note that this should be imported after torch.npu.set_device
-        # to avoid repeated set_device in extra processes
-        from vllm.triton_utils import HAS_TRITON
-
-        if HAS_TRITON:
-            import torch_npu._inductor  # noqa: F401
 
         gc.collect()
         torch.npu.empty_cache()
@@ -522,6 +562,12 @@ class NPUWorker(WorkerBase):
         # Initialize device properties used by triton kernels.
         init_device_properties_triton()
 
+        # binding cpu
+        if get_ascend_config().enable_cpu_binding:
+            try:
+                bind_cpus(self.local_rank)
+            except Exception as e:
+                logger.warning(f"Bind cpus failed in rank{self.local_rank}: {e} Skip binding cpu.")
         return device
 
     def init_device(self):
@@ -541,6 +587,21 @@ class NPUWorker(WorkerBase):
         else:
             self.model_runner = NPUModelRunner(self.vllm_config, self.device)
 
+        if self.vllm_config.fault_tolerance_config.enable_fault_tolerance:
+
+            def clear_input_batch_callback():
+                input_batch = self.model_runner.input_batch
+                cached_req_ids = input_batch.req_id_to_index.keys()
+                for req_id in list(cached_req_ids):
+                    input_batch.remove_request(req_id)
+
+            self.worker_sentinel = WorkerSentinel(
+                self.vllm_config,
+                clear_input_batch_callback,
+                self.device,
+                self,
+            )
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
@@ -559,6 +620,13 @@ class NPUWorker(WorkerBase):
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
             self.model_runner.profile_run()
+            free_memory, total_memory = torch.npu.mem_get_info()
+            torch_memory = torch.npu.memory_reserved()
+            non_torch_memory_before_empty_cache = total_memory - free_memory - torch_memory
+
+        self.non_torch_memory = profile_result.non_torch_increase
+        self.peak_activation_memory = profile_result.torch_peak_increase
+        non_torch_memory_cleared_by_empty_cache = non_torch_memory_before_empty_cache - self.non_torch_memory
 
         free_gpu_memory = profile_result.after_profile.free_memory
         assert self.init_snapshot.free_memory > free_gpu_memory, (
@@ -570,12 +638,16 @@ class NPUWorker(WorkerBase):
             "To fix this, ensure consistent GPU memory allocation or "
             "isolate vLLM in its own container."
         )
-        self.available_kv_cache_memory_bytes = self.requested_memory - profile_result.non_kv_cache_memory
-        logger.debug(profile_result)
-        logger.info_once(
-            "Available KV cache memory: %.2f GiB", GiB(self.available_kv_cache_memory_bytes), scope="local"
+        self.available_kv_cache_memory_bytes = (
+            self.requested_memory - profile_result.non_kv_cache_memory - non_torch_memory_cleared_by_empty_cache
         )
 
+        logger.debug(profile_result)
+        logger.info_once(
+            "Available KV cache memory: %.2f GiB",
+            GiB(self.available_kv_cache_memory_bytes),
+            scope="local",
+        )
         return int(self.available_kv_cache_memory_bytes)
 
     def execute_model(
@@ -586,11 +658,6 @@ class NPUWorker(WorkerBase):
         if envs_ascend.MSMONITOR_USE_DAEMON:
             dp.step()
 
-        if self._pp_send_work:
-            for handle in self._pp_send_work:
-                handle.wait()
-            self._pp_send_work = []
-
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         if forward_pass and not get_pp_group().is_first_rank:
@@ -600,14 +667,8 @@ class NPUWorker(WorkerBase):
                 all_gather_group = None
             else:
                 all_gather_group = get_tp_group()
-            tensor_dict, comm_handles, comm_postprocess = get_pp_group().irecv_tensor_dict(
-                all_gather_group=all_gather_group
-            )
-            assert tensor_dict is not None
-            intermediate_tensors = AsyncIntermediateTensors(
-                tensor_dict,
-                comm_handles=comm_handles,
-                comm_postprocess=comm_postprocess,
+            intermediate_tensors = IntermediateTensors(
+                get_pp_group().recv_tensor_dict(all_gather_group=all_gather_group)
             )
 
         output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
@@ -623,10 +684,7 @@ class NPUWorker(WorkerBase):
             all_gather_group = None
         else:
             all_gather_group = get_tp_group()
-        self._pp_send_work = get_pp_group().isend_tensor_dict(
-            output.tensors,
-            all_gather_group=all_gather_group,
-        )
+        get_pp_group().send_tensor_dict(output.tensors, all_gather_group=all_gather_group)
 
         kv_connector_output = output.kv_connector_output
         if not kv_connector_output:
@@ -656,7 +714,7 @@ class NPUWorker(WorkerBase):
 
         with context, set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()
-        if self.vllm_config.parallel_config.enable_fault_tolerance:
+        if self.vllm_config.fault_tolerance_config.enable_fault_tolerance:
             self.backup_expert_rank_mapping = True
             # todo Hot backup-related code has not yet been ported here.
 
@@ -689,13 +747,6 @@ class NPUWorker(WorkerBase):
         # may cause performance degradation at runtime.
         if get_ascend_device_type() != AscendDeviceType.A5:
             self._warm_up_atb()
-        # Bind after warmup so hot allocations are already materialized on the
-        # worker process before migratepages/taskset run.
-        if get_ascend_config().enable_cpu_binding:
-            try:
-                bind_cpus(self.local_rank)
-            except Exception as e:
-                logger.warning(f"Bind cpus failed in rank{self.local_rank}: {e} Skip binding cpu.")
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
@@ -709,68 +760,6 @@ class NPUWorker(WorkerBase):
 
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
-
-    @torch.inference_mode()
-    def profile_prefill_latency(self, num_tokens: int) -> float:
-        """
-        Profile prefill latency for a given number of tokens.
-
-        This runs a real model forward pass and measures the execution time.
-        Used for profiling-based dynamic chunk sizing.
-
-        In PP (Pipeline Parallelism) mode:
-        - All workers execute the forward pass to stay synchronized
-        - Only the timing from PP0 (first rank) is meaningful for scheduling
-        - PP0 includes all the pipeline stages' latency when using async scheduling
-
-        Args:
-            num_tokens: Number of tokens to profile
-
-        Returns:
-            Latency in milliseconds
-        """
-        import time
-
-        # Clamp to valid range
-        num_tokens = min(num_tokens, self.scheduler_config.max_num_batched_tokens)
-        num_tokens = max(num_tokens, 1)
-
-        # Synchronize all devices before timing
-        # This ensures clean measurement in PP/TP scenarios
-        torch.npu.synchronize()
-
-        # In PP mode, we still run on all ranks to keep them synchronized
-        # but only the first rank's timing is used for scheduling decisions
-        is_first_pp_rank = get_pp_group().is_first_rank
-
-        start = time.perf_counter()
-
-        # Run real model forward with force_attention=True
-        # This ensures attention is actually executed, not skipped.
-        # Without force_attention, attn_metadata may be None and attention
-        # won't run, making profiling results inaccurate.
-        # _dummy_run handles PP internally (intermediate tensors, etc.)
-        self.model_runner._dummy_run(
-            num_tokens=num_tokens,
-            force_attention=True,  # Critical: ensure attention is executed
-            profile_cpp=True,
-        )
-
-        # Synchronize after forward to ensure NPU operations complete
-        torch.npu.synchronize()
-
-        latency_ms = (time.perf_counter() - start) * 1000
-
-        # Log for debugging in PP mode
-        if not is_first_pp_rank:
-            logger.debug(
-                "[ProfilingChunk] PP rank %d: profiled %d tokens, latency=%.2f ms (not used)",
-                get_pp_group().rank_in_group,
-                num_tokens,
-                latency_ms,
-            )
-
-        return latency_ms
 
     def get_kv_connector_handshake_metadata(self) -> dict | None:
         """Get KV connector metadata from this worker if available."""
@@ -876,8 +865,8 @@ class NPUWorker(WorkerBase):
         )
         init_ascend_model_parallel(self.parallel_config)
         ensure_ec_transfer_initialized(self.vllm_config)
-        if self.vllm_config.parallel_config.enable_fault_tolerance:
-            timeout = timedelta(seconds=self.vllm_config.parallel_config.fault_tolerance_config.gloo_comm_timeout)
+        if self.vllm_config.fault_tolerance_config.enable_fault_tolerance:
+            timeout = timedelta(seconds=self.vllm_config.fault_tolerance_config.gloo_comm_timeout)
             dp_cpu_group = get_dp_group()
             _set_pg_timeout(timeout=timeout, group=dp_cpu_group.cpu_group)
 
@@ -896,7 +885,7 @@ class NPUWorker(WorkerBase):
             export_type=torch_npu.profiler.ExportType.Text,
             profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
             msprof_tx=False,
-            aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+            aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
             l2_cache=False,
             op_attr=False,
             data_simplification=True,

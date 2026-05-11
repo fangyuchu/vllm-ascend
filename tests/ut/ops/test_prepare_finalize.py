@@ -32,7 +32,7 @@ class TestPrepareAndFinalize(unittest.TestCase):
     @patch(
         "vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_rank",
         return_value=0)
-    @patch('vllm_ascend.ascend_forward_context.get_forward_context')
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_forward_context")
     def test_mc2_prepare_finalize(self, mock_get_forward_context, mock_tp_rank,
                                   mock_tp_size):
         mock_context = MagicMock()
@@ -45,22 +45,18 @@ class TestPrepareAndFinalize(unittest.TestCase):
         hidden_states = torch.randn(3, 8)
         router_logits = torch.randn(3, 2)
 
-        prepare_output = layer.prepare(hidden_states, router_logits)
-        h_out = prepare_output.hidden_states
-        r_out = prepare_output.router_logits
-        mask = prepare_output.mc2_mask
-        padded_hidden_states_shape = prepare_output.padded_hidden_states_shape
+        h_out, r_out, mask, context_metadata = layer.prepare(
+            hidden_states, router_logits)
 
         # Check padding and split
         self.assertEqual(h_out.shape[0], 4)
         self.assertEqual(r_out.shape[0], 4)
         self.assertEqual(mask.tolist(), [1, 0, 1])
-        self.assertEqual(padded_hidden_states_shape, torch.Size([4, 8]))
 
         # Finalize
         result = layer.finalize(h_out,
                                 reduce_results=False,
-                                padded_hidden_states_shape=padded_hidden_states_shape)
+                                context_metadata=context_metadata)
         self.assertEqual(result.shape[0], 3)
 
     @patch(
@@ -69,7 +65,7 @@ class TestPrepareAndFinalize(unittest.TestCase):
     @patch(
         "vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_rank",
         return_value=0)
-    @patch('vllm_ascend.ascend_forward_context.get_forward_context')
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_forward_context")
     @patch("torch.distributed.all_gather")
     def test_mc2_tp_split_allgather(self, mock_all_gather,
                                     mock_get_forward_context, mock_tp_rank,
@@ -83,19 +79,14 @@ class TestPrepareAndFinalize(unittest.TestCase):
         hidden_states = torch.randn(4, 8)
         router_logits = torch.randn(4, 2)
 
-        prepare_output = layer.prepare(
+        h_out, r_out, mask, context_metadata = layer.prepare(
             hidden_states,
             router_logits,
             enable_shared_expert_dp=False,
             replace_allreduce=False)
-        h_out = prepare_output.hidden_states
-        r_out = prepare_output.router_logits
-        mask = prepare_output.mc2_mask
-        padded_hidden_states_shape = prepare_output.padded_hidden_states_shape
 
         # With TP=2, should split into 2 parts
         self.assertEqual(h_out.shape[0], 2)
-        self.assertEqual(padded_hidden_states_shape, torch.Size([4, 8]))
 
         # Mock all_gather behavior
         def mock_all_gather_func(tensor_list, tensor, group=None):
@@ -110,7 +101,7 @@ class TestPrepareAndFinalize(unittest.TestCase):
         ]
         final_result = layer.finalize(h_out,
                                       reduce_results=False,
-                                      padded_hidden_states_shape=padded_hidden_states_shape)
+                                      context_metadata=context_metadata)
 
         # Should concat back to original size
         self.assertEqual(final_result.shape[0], 4)
@@ -126,18 +117,15 @@ class TestPrepareAndFinalize(unittest.TestCase):
         hidden_states = torch.randn(3, 8)
         router_logits = torch.randn(3, 2)
 
-        prepare_output = layer.prepare(hidden_states, router_logits)
-        h_out = prepare_output.hidden_states
-        r_out = prepare_output.router_logits
-        padded_hidden_states_shape = prepare_output.padded_hidden_states_shape
+        h_out, r_out, _, context_metadata = layer.prepare(
+            hidden_states, router_logits)
 
         # Pad to tp_size=1, so no change
         self.assertEqual(h_out.shape[0], 3)
-        self.assertEqual(padded_hidden_states_shape, torch.Size([3, 8]))
 
         result = layer.finalize(h_out,
                                 reduce_results=False,
-                                padded_hidden_states_shape=padded_hidden_states_shape)
+                                context_metadata=context_metadata)
         self.assertEqual(result.shape[0], 3)
 
     @patch(
@@ -153,18 +141,14 @@ class TestPrepareAndFinalize(unittest.TestCase):
         hidden_states = torch.randn(2, 8)
         router_logits = torch.randn(2, 2)
 
-        prepare_output = layer.prepare(
+        h_out, r_out, _, context_metadata = layer.prepare(
             hidden_states,
             router_logits,
             enable_shared_expert_dp=False,
             replace_allreduce=False)
-        h_out = prepare_output.hidden_states
-        r_out = prepare_output.router_logits
-        padded_hidden_states_shape = prepare_output.padded_hidden_states_shape
 
         # Split due to TP=2
         self.assertEqual(h_out.shape[0], 1)
-        self.assertEqual(padded_hidden_states_shape, torch.Size([2, 8]))
 
         # Mock all_gather
         def mock_all_gather_func(tensor_list, tensor, group=None):
@@ -179,19 +163,16 @@ class TestPrepareAndFinalize(unittest.TestCase):
         ]
         final_result = layer.finalize(h_out,
                                       reduce_results=False,
-                                      padded_hidden_states_shape=padded_hidden_states_shape)
+                                      context_metadata=context_metadata)
 
         # Should concat back
         self.assertEqual(final_result.shape[0], 2)
 
     @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_dp_group")
-    @patch('vllm_ascend.ascend_forward_context.get_forward_context')
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_forward_context")
     @patch("vllm_ascend.ops.fused_moe.prepare_finalize.enable_sp",
            return_value=False)
-    @patch("vllm_ascend.ops.fused_moe.prepare_finalize.enable_sp_by_pass",
-        return_value=False)
-    def test_allgather_prepare_finalize(self, mock_enable_sp_by_pass,
-                                        mock_enable_sp,
+    def test_allgather_prepare_finalize(self, mock_enable_sp,
                                         mock_get_forward_context,
                                         mock_get_dp_group):
         # Mock forward context
@@ -219,15 +200,12 @@ class TestPrepareAndFinalize(unittest.TestCase):
         hidden_states = torch.randn(3, 8)
         router_logits = torch.randn(3, 2)
 
-        prepare_output = layer.prepare(hidden_states, router_logits)
-        h_out = prepare_output.hidden_states
-        r_out = prepare_output.router_logits
-        padded_hidden_states_shape = prepare_output.padded_hidden_states_shape
+        h_out, r_out, _, context_metadata = layer.prepare(
+            hidden_states, router_logits)
 
         # After all-gather with DP=2, should double the batch size
         self.assertEqual(h_out.shape[0], 12)
         self.assertEqual(r_out.shape[0], 12)
-        self.assertIsNone(padded_hidden_states_shape)
 
         # Finalize with reduce_scatter
         def mock_reduce_scatter_func(tensor, dim):
@@ -237,7 +215,7 @@ class TestPrepareAndFinalize(unittest.TestCase):
         mock_dp_group.reduce_scatter = mock_reduce_scatter_func
         result = layer.finalize(h_out,
                                 reduce_results=False,
-                                padded_hidden_states_shape=padded_hidden_states_shape)
+                                context_metadata=context_metadata)
 
         self.assertEqual(result.shape[0], 3)
 

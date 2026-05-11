@@ -22,7 +22,7 @@ from .utils import prepare_chunk_offsets, safe_exp
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@triton.jit(do_not_specialize=["chunk_offsets", "scale", "T", "H", "Hg", "K", "V"])
+@triton.jit(do_not_specialize=["T"])
 def chunk_fwd_kernel_o(
     q,
     k,
@@ -34,10 +34,10 @@ def chunk_fwd_kernel_o(
     chunk_offsets,
     scale,
     T,
-    H,
-    Hg,
-    K,
-    V,
+    H: tl.constexpr,
+    Hg: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
     BT: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
@@ -118,7 +118,6 @@ def chunk_fwd_o(
     scale: float | None = None,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
-    chunk_offsets: torch.Tensor | None = None,
 ) -> torch.Tensor:
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
@@ -131,9 +130,10 @@ def chunk_fwd_o(
     if cu_seqlens is None:
         N, chunk_offsets = B, None
     else:
-        N = len(cu_seqlens) - 1
-        if chunk_offsets is None:
-            chunk_offsets = prepare_chunk_offsets(cu_seqlens, BT)
+        N, chunk_offsets = (
+            len(cu_seqlens) - 1,
+            prepare_chunk_offsets(cu_seqlens, BT),
+        )
 
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)

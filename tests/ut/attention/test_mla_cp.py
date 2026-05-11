@@ -130,10 +130,6 @@ def get_chunk_metadata(pcp_size, dcp_size, num_prefills, num_decodes,
             out=padded_local_cu_chunk_seq_lens_cpu[:, 1:],
             dtype=torch.int32,
         )
-        chunk_actual_seq_lengths_kv_list = [
-            torch.cumsum(chunk_seq_lens[i], dim=0).tolist()
-            for i in range(num_chunks)
-        ]
         chunked_context_metadata = CPChunkedContextMetadata(
             cu_seq_lens=cu_seq_lens_cpu.to(non_blocking=True),
             starts=local_chunk_starts.to(non_blocking=True),
@@ -141,7 +137,6 @@ def get_chunk_metadata(pcp_size, dcp_size, num_prefills, num_decodes,
             max_seq_lens=chunk_seq_lens.max(dim=1).values.tolist(),
             chunk_seq_lens=chunk_seq_lens,
             chunk_seq_lens_npu=chunk_seq_lens,
-            chunk_actual_seq_lengths_kv_list=chunk_actual_seq_lengths_kv_list,
             workspace=None,
             padded_chunk_seq_lens_npu=padded_local_chunk_seq_lens,
             padded_local_chunk_seq_lens=padded_local_chunk_seq_lens.tolist(),
@@ -454,7 +449,7 @@ class TestAscendMLAImpl(TestBase):
         self.assertEqual(result.shape[1], N)
         self.assertEqual(result.shape[2], self.impl.kv_lora_rank + 1)
 
-    @patch('vllm_ascend.ascend_forward_context.get_forward_context')
+    @patch('vllm_ascend.attention.context_parallel.mla_cp.get_forward_context')
     @patch("torch_npu.npu_fused_infer_attention_score")
     @patch('torch_npu.npu_attention_update')
     @patch_distributed_groups(dcp_size=2, pcp_size=2, needs_mocks=False)
@@ -505,23 +500,19 @@ class TestAscendMLAImpl(TestBase):
         self.assertEqual(result.shape[1], self.impl.v_head_dim)
 
     @patch("torch_npu.atb.npu_paged_cache_load")
-    @patch("torch_npu.npu_attention_update")
-    @patch("torch_npu.npu_fused_infer_attention_score")
+    @patch("torch_npu.atb.npu_ring_mla")
     @patch_distributed_groups(dcp_size=2, pcp_size=2)
     def test_compute_prefill_context_with_dcp_pcp(self, mock_all2all, mock_dcp,
-                                                  mock_pcp, mock_fia,
-                                                  mock_update, mock_load):
+                                                  mock_pcp, mock_ring,
+                                                  mock_load):
 
-        def mock_fia_attn(*args, **kwargs):
-            q = args[0]
-            v = args[2]
-            return (torch.randn(q.shape[0],
-                                v.shape[1],
-                                v.shape[2],
-                                dtype=torch.float16),
-                    torch.randn(v.shape[1], q.shape[0], dtype=torch.float16))
+        def mock_ring_attn(q_nope, q_rope, k_nope, k_rope, value, mask, seqlen,
+                           head_num, kv_head_num, pre_out, prev_lse, qk_scale,
+                           kernel_type, mask_type, input_layout, calc_type,
+                           output, softmax_lse):
+            return torch.randn(q_rope.shape[0], value.shape[1], value.shape[2])
 
-        mock_fia.side_effect = mock_fia_attn
+        mock_ring.side_effect = mock_ring_attn
 
         def mock_kv_b_proj(kv_c_normed):
             return (torch.randn(kv_c_normed.shape[0],
@@ -543,13 +534,6 @@ class TestAscendMLAImpl(TestBase):
 
         # mock proj
         self.impl.kv_b_proj.side_effect = mock_kv_b_proj
-
-        def mock_update_fn(lse_list, out_list, mode):
-            total_len = out_list[0].shape[0]
-            D = out_list[0].shape[1]
-            return (torch.randn(total_len, D, dtype=torch.float32), None)
-
-        mock_update.side_effect = mock_update_fn
         NUM_BLOCKS, BLOCK_SIZE = 10, 32  # fixed
         USED_BLOCKS = 3
         # pcp_size, dcp_size, nums_tokens_per_rank, nums_all_rank_context, num_prefills, num_decodes, num_seqs, cp_local_block_size, num_computed_tokens, num_computed_tokens_of_pcp_dcp
@@ -602,8 +586,8 @@ class TestAscendMLAImpl(TestBase):
                                      self.impl.num_heads,
                                      self.impl.v_head_dim,
                                      dtype=torch.float16)
-            prefix_lse = torch.randn(self.impl.num_heads,
-                                     sum(nums_tokens_per_rank),
+            prefix_lse = torch.randn(sum(nums_tokens_per_rank),
+                                     self.impl.num_heads,
                                      dtype=torch.float16)
             chunk_ctx = get_chunk_metadata(
                 pcp_size,
@@ -618,7 +602,7 @@ class TestAscendMLAImpl(TestBase):
                 cp_local_block_size=cp_local_block_size)
             meta = MagicMock()
             prefill_meta = MagicMock()
-            prefill_meta.query_lens = torch.tensor(nums_tokens_per_rank)
+            prefill_meta.query_lens = nums_tokens_per_rank
             prefill_meta.block_table = torch.randint(
                 0, USED_BLOCKS, (1, 64))  # (batch, max_blocks)
             prefill_meta.chunked_context = chunk_ctx
@@ -637,14 +621,14 @@ class TestAscendMLAImpl(TestBase):
             self.assertEqual(mock_reorg.call_count,
                              iters * (1 if dcp_size * pcp_size > 1 else 0))
             self.assertEqual(mock_load.call_count, iters)
-            self.assertEqual(mock_fia.call_count, iters)
+            self.assertEqual(mock_ring.call_count, iters)
             mock_reorg.reset_mock()
             mock_load.reset_mock()
-            mock_fia.reset_mock()
-            mock_update.reset_mock()
+            mock_ring.reset_mock()
             mock_dcp.reset_mock()
             mock_pcp.reset_mock()
             self.assertEqual(out.shape, prefix_out.shape)
+            self.assertEqual(lse.shape, prefix_lse.shape)
 
     @patch_distributed_groups(dcp_size=2, pcp_size=2)
     def test_reorg_kvcache_with_dcp_pcp(self, mock_all2all, mock_dcp,
@@ -782,6 +766,7 @@ class TestAscendMLAImpl(TestBase):
 
             mock_dcp.world_size = self.impl.dcp_size
             mock_dcp_group = MagicMock()
+            # mock_dcp_group.world_size = self.impl.dcp_size
             mock_get_dcp_group.return_value = mock_dcp_group
             attn_out_lse = torch.randn(self.impl.pcp_size * NUM_TOKENS,
                                        self.impl.dcp_size * num_heads,
@@ -790,51 +775,61 @@ class TestAscendMLAImpl(TestBase):
             self.impl.dcp_size = 1
             self.impl.pcp_size = 1
             assert out.shape == (NUM_TOKENS, num_heads, self.impl.kv_lora_rank)
-    
-    @patch('torch.ops.npu.npu_fused_infer_attention_score')
-    @patch('vllm_ascend.attention.context_parallel.mla_cp._npu_attn_out_lse_update')
+
+    @patch('torch_npu.atb.npu_ring_mla')
     def test_attention_with_mask_and_nomask_with_dcp_pcp(
-            self, mock_npu_attn_update, mock_npu_fia):
+            self, mock_npu_ring_mla):
         num_heads = self.impl.num_heads
         v_head_dim = self.impl.v_head_dim
         qk_nope_head_dim = self.impl.qk_nope_head_dim
         qk_rope_head_dim = self.impl.qk_rope_head_dim
 
-        def mock_npu_fia_effect(*args, **kwargs):
-            q_nope = args[0]
-            q_tokens = q_nope.shape[0]
-            out = torch.randn(q_tokens, num_heads, v_head_dim, dtype=torch.float16)
-            lse = torch.randn(q_tokens, num_heads, 1, dtype=torch.float32)
-            return out, lse
-        mock_npu_fia.side_effect = mock_npu_fia_effect
+        def mock_npu_ring_mla_effect(q_nope, q_rope, k_nope, k_rope, value,
+                                     mask, seqlen, head_num, kv_head_num,
+                                     pre_out, prev_lse, qk_scale, kernel_type,
+                                     mask_type, input_layout, calc_type,
+                                     output, softmax_lse):
 
-        def mock_update_effect(lse_mask, lse_nomask, out_mask, out_nomask):
-            return torch.randn_like(out_mask)
-        mock_npu_attn_update.side_effect = mock_update_effect
-        
-        test_cases = [([8], 2, 2), ([8, 12], 2, 2)] 
+            return torch.randn(q_nope.shape[0], value.shape[1],
+                               value.shape[-1])
+
+        mock_npu_ring_mla.side_effect = mock_npu_ring_mla_effect
+        test_cases = [([8], 2, 2), ([8], 2, 1), ([8], 1, 2), ([8], 2, 2),
+                      ([8, 12], 2, 2)]
         for test_case in test_cases:
             scheduled_tokens, pcp_size, dcp_size = test_case
-            nums_tokens_per_rank = [num // pcp_size for num in scheduled_tokens]
-            seq_len_q, seq_len_k = sum(nums_tokens_per_rank), sum(scheduled_tokens)
-            
-            q_nope = torch.randn(seq_len_q, num_heads, qk_nope_head_dim, dtype=torch.float16)
-            q_pe = torch.randn(seq_len_q, num_heads, qk_rope_head_dim, dtype=torch.float16)
-            k_nope = torch.randn(seq_len_k, num_heads, qk_nope_head_dim, dtype=torch.float16)
-            k_pe = torch.randn(seq_len_k, num_heads, qk_rope_head_dim, dtype=torch.float16)
-            value = torch.randn(seq_len_k, num_heads, v_head_dim, dtype=torch.float16)
+            nums_tokens_per_rank = []
+            for num_tokens in scheduled_tokens:
+                assert num_tokens % (2 * pcp_size) == 0
+                nums_tokens_per_rank.append(num_tokens // pcp_size)
+            seq_len_q, seq_len_k = sum(nums_tokens_per_rank), sum(
+                scheduled_tokens)
+            q_nope = torch.randn(seq_len_q,
+                                 num_heads,
+                                 qk_nope_head_dim,
+                                 dtype=torch.float16)
+            q_pe = torch.randn(seq_len_q,
+                               num_heads,
+                               qk_rope_head_dim,
+                               dtype=torch.float16)
+            k_nope = torch.randn(seq_len_k,
+                                 num_heads,
+                                 qk_nope_head_dim,
+                                 dtype=torch.float16)
+            k_pe = torch.randn(seq_len_k,
+                               num_heads,
+                               qk_rope_head_dim,
+                               dtype=torch.float16)
+            value = torch.randn(seq_len_k,
+                                num_heads,
+                                v_head_dim,
+                                dtype=torch.float16)
             mask = torch.triu(torch.ones(10, 10, dtype=torch.float16), 1)
-
-            attn_metadata = MagicMock()
-            attn_metadata.prefill = MagicMock()
-            attn_metadata.prefill.chunked_context = None
-
             for rank in range(pcp_size):
-                info = get_pcp_split_info(rank, pcp_size, nums_tokens_per_rank)
-                q_head_idx, _, kv_with_q_head_nomask_idx, kv_with_q_head_mask_idx = info[:4]
-                chunk_seqlens = info[6]
-                kv_with_q_head_nomask_seqlens = info[7]
-
+                q_head_idx, q_tail_idx, kv_with_q_head_nomask_idx, kv_with_q_head_mask_idx, kv_with_q_tail_nomask_idx, \
+                    kv_with_q_tail_mask_idx, chunk_seqlens, kv_with_q_head_nomask_seqlens, kv_with_q_tail_nomask_seqlens = get_pcp_split_info(
+                    rank, pcp_size, nums_tokens_per_rank)
+                kv_with_q_head_nomask_idx = [kv_with_q_head_nomask_idx]
                 output_head, lse_head = self.impl._attention_with_mask_and_nomask(
                     q_nope=torch.index_select(q_nope, 0, q_head_idx),
                     q_pe=torch.index_select(q_pe, 0, q_head_idx),
@@ -843,90 +838,171 @@ class TestAscendMLAImpl(TestBase):
                     value=value,
                     kv_mask_idx=kv_with_q_head_mask_idx,
                     kv_nomask_idx=kv_with_q_head_nomask_idx,
-                    attn_mask_seqlens=torch.tensor([chunk_seqlens, chunk_seqlens], dtype=torch.int32),
-                    attn_nomask_seqlens=torch.tensor([kv_with_q_head_nomask_seqlens], dtype=torch.int32),
-                    mask=mask,
-                    attn_metadata=attn_metadata
-                )
+                    attn_mask_seqlens=torch.tensor(
+                        [chunk_seqlens, chunk_seqlens], dtype=torch.int32),
+                    attn_nomask_seqlens=[kv_with_q_head_nomask_seqlens],
+                    mask=mask)
+                self.assertEqual(output_head.shape,
+                                 (q_head_idx.shape[0], num_heads, v_head_dim))
+                self.assertEqual(lse_head.shape,
+                                 (num_heads, q_head_idx.shape[0]))
+                self.assertEqual(mock_npu_ring_mla.call_count,
+                                 1 + (len(kv_with_q_head_nomask_idx[0]) != 0))
+                mock_npu_ring_mla.reset_mock()
+                kv_with_q_tail_nomask_idx = [kv_with_q_tail_nomask_idx]
+                output_tail, lse_tail = self.impl._attention_with_mask_and_nomask(
+                    q_nope=torch.index_select(q_nope, 0, q_tail_idx),
+                    q_pe=torch.index_select(q_pe, 0, q_tail_idx),
+                    k_nope=k_nope,
+                    k_pe=k_pe,
+                    value=value,
+                    kv_mask_idx=kv_with_q_tail_mask_idx,
+                    kv_nomask_idx=kv_with_q_tail_nomask_idx,
+                    attn_mask_seqlens=torch.tensor(
+                        [chunk_seqlens, chunk_seqlens], dtype=torch.int32),
+                    attn_nomask_seqlens=[kv_with_q_tail_nomask_seqlens],
+                    mask=mask)
 
-                self.assertEqual(output_head.shape, (q_head_idx.shape[0], num_heads, v_head_dim))
-                if lse_head is not None:
-                    self.assertEqual(lse_head.shape, (q_head_idx.shape[0], num_heads, 1))
-                else:
-                    self.assertIsNone(lse_head)
+                self.assertEqual(output_tail.shape,
+                                 (q_tail_idx.shape[0], num_heads, v_head_dim))
+                self.assertEqual(lse_tail.shape,
+                                 (num_heads, q_tail_idx.shape[0]))
+                self.assertEqual(mock_npu_ring_mla.call_count,
+                                 1 + (len(kv_with_q_tail_nomask_idx[0]) != 0))
+                mock_npu_ring_mla.reset_mock()
 
-                mock_npu_fia.reset_mock()
-                mock_npu_attn_update.reset_mock()
-    
-    @patch('torch.ops.npu.npu_fused_infer_attention_score')
-    @patch('vllm_ascend.attention.context_parallel.mla_cp._npu_attn_out_lse_update')
-    @patch('vllm_ascend.attention.context_parallel.mla_cp._update_out_and_lse')
-    def test_attention_with_mask_and_nomask_trigger_chunked(
-            self, mock_update_out_lse, mock_npu_attn_update, mock_npu_fia):
-        
-        num_heads = self.impl.num_heads
-        v_head_dim = self.impl.v_head_dim
-        qk_nope_head_dim = self.impl.qk_nope_head_dim
-        qk_rope_head_dim = self.impl.qk_rope_head_dim
+    @patch_distributed_groups(dcp_size=2, pcp_size=2)
+    def test_process_attn_out_lse_with_dcp_pcp(self, mock_all_to_all, mock_dcp,
+                                               mock_pcp):
+        B, H, D = 4, self.impl.num_heads, self.impl.v_head_dim  # total: [4, 4, 8]
+        test_cases = [(1, 1), (1, 2), (2, 1), (2, 2), (4, 4)]
+        for test_case in test_cases:
+            self.impl.dcp_size = test_case[0]
+            self.impl.pcp_size = test_case[1]
+            mock_dcp.world_size = test_case[0]
+            mock_pcp.world_size = test_case[1]
+            # Inputs
+            attn_output = torch.randn(B, H, D)
+            softmax_lse = torch.randn(B, H, 1)
+            decode_meta = MagicMock()
 
-        def mock_npu_fia_effect(*args, **kwargs):
-            q_tokens = args[0].shape[0]
-            out = torch.randn(q_tokens, num_heads, v_head_dim, dtype=torch.float16)
-            lse = torch.randn(q_tokens, num_heads, 1, dtype=torch.float32)
-            return out, lse
-        mock_npu_fia.side_effect = mock_npu_fia_effect
+            result = _process_attn_out_lse(attn_output, softmax_lse)
+            # [PCP * S, DCP * H, D + 1]
+            self.assertIsInstance(result, torch.Tensor)
+            assert result.shape == (B * self.impl.pcp_size, H, D + 1)
+            self.impl.dcp_size = 1
+            self.impl.pcp_size = 1
 
-        def mock_chunked_update_effect(outs, lses):
-            return outs[0], lses[0] 
-        mock_update_out_lse.side_effect = mock_chunked_update_effect
+    @patch('torch_npu.atb.npu_ring_mla')
+    def test_forward_prefill_cp_with_dcp_pcp(self, mock_npu_ring_mla):
 
-        test_cases = [([8], 2, 2)] 
+        def mock_attention_with_nomask_and_mask(
+                q_nope: torch.Tensor, q_pe: torch.Tensor, k_nope: torch.Tensor,
+                k_pe: torch.Tensor, value: torch.Tensor,
+                kv_mask_idx: torch.Tensor, kv_nomask_idx: torch.Tensor,
+                attn_mask_seqlens: torch.Tensor,
+                attn_nomask_seqlens: torch.Tensor, mask: torch.Tensor):
+            mock_output = torch.randn(q_nope.shape[0],
+                                      self.impl.num_heads,
+                                      self.impl.v_head_dim,
+                                      dtype=k_pe.dtype,
+                                      device=k_pe.device)
+            mock_lse = torch.randn(self.impl.num_heads,
+                                   q_pe.shape[0],
+                                   dtype=torch.float32,
+                                   device=k_pe.device)
+            return mock_output, mock_lse
+
+        def mock_compute_prefill_context(q_nope, q_pe, kv_c_and_k_pe_cache,
+                                         rope_dim, attn_metadata,
+                                         prefix_output, prefix_lse):
+            mock_output = torch.randn_like(prefix_output)
+            mock_lse = torch.randn_like(prefix_lse)
+            return mock_output, mock_lse
+
+        def mock_npu_ring_mla_effect(q_nope, q_rope, k_nope, k_rope, value,
+                                     mask, seqlen, head_num, kv_head_num,
+                                     pre_out, prev_lse, qk_scale, kernel_type,
+                                     mask_type, input_layout, calc_type,
+                                     output, softmax_lse):
+            return torch.randn(q_nope.shape[0], value.shape[1],
+                               value.shape[-1])
+
+        self.impl._attention_with_mask_and_nomask = MagicMock()
+        self.impl._attention_with_mask_and_nomask.side_effect = mock_attention_with_nomask_and_mask
+        self.impl._compute_prefill_context = MagicMock()
+        self.impl._compute_prefill_context.side_effect = mock_compute_prefill_context
+        mock_npu_ring_mla.side_effect = mock_npu_ring_mla_effect
+        block_num = 10
+        block_size = 32
+        kv_c_and_k_pe_cache = (torch.randn(block_num,
+                                           block_size,
+                                           1,
+                                           self.impl.q_lora_rank,
+                                           dtype=torch.float16),
+                               torch.randn(block_num,
+                                           block_size,
+                                           1,
+                                           self.impl.qk_rope_head_dim,
+                                           dtype=torch.float16))
+        test_cases = [([8], 2, 2), ([8], 2, 1), ([8], 1, 2), ([8], 2, 2),
+                      ([8, 16], 2, 2)]
         for test_case in test_cases:
             scheduled_tokens, pcp_size, dcp_size = test_case
-            nums_tokens_per_rank = [num // pcp_size for num in scheduled_tokens]
-            
-            q_nope = torch.randn(sum(nums_tokens_per_rank), num_heads, qk_nope_head_dim, dtype=torch.float16)
-            q_pe = torch.randn(sum(nums_tokens_per_rank), num_heads, qk_rope_head_dim, dtype=torch.float16)
-            k_nope = torch.randn(sum(scheduled_tokens), num_heads, qk_nope_head_dim, dtype=torch.float16)
-            k_pe = torch.randn(sum(scheduled_tokens), num_heads, qk_rope_head_dim, dtype=torch.float16)
-            value = torch.randn(sum(scheduled_tokens), num_heads, v_head_dim, dtype=torch.float16)
-            mask = torch.ones(10, 10, dtype=torch.float16)
+            nums_tokens_per_rank = []
+            for num_tokens in scheduled_tokens:
+                assert num_tokens % (
+                    2 * pcp_size) == 0  # padded head&tail compute balance
+                nums_tokens_per_rank.append(num_tokens // pcp_size)
+            seq_len_q, seq_len_k = sum(nums_tokens_per_rank), sum(
+                scheduled_tokens)
 
-            attn_metadata = MagicMock()
-            attn_metadata.prefill = MagicMock()
-            attn_metadata.prefill.chunked_context = "TRIGGER_CHUNKED"
-            update_called_at_least_once = False
-
+            q_nope = torch.randn(seq_len_q,
+                                 self.impl.num_heads,
+                                 self.impl.qk_nope_head_dim,
+                                 dtype=torch.float16)
+            q_pe = torch.randn(seq_len_q,
+                               self.impl.num_heads,
+                               self.impl.qk_rope_head_dim,
+                               dtype=torch.float16)
+            k_nope = torch.randn(seq_len_k,
+                                 self.impl.num_heads,
+                                 self.impl.qk_nope_head_dim,
+                                 dtype=torch.float16)
+            k_pe = torch.randn(seq_len_k,
+                               self.impl.num_heads,
+                               self.impl.qk_rope_head_dim,
+                               dtype=torch.float16)
+            value = torch.randn(seq_len_k,
+                                self.impl.num_heads,
+                                self.impl.v_head_dim,
+                                dtype=torch.float16)
+            # only test one rank
             for rank in range(pcp_size):
-                info = get_pcp_split_info(rank, pcp_size, nums_tokens_per_rank)
-                q_head_idx, _, kv_with_q_head_nomask_idx, kv_with_q_head_mask_idx = info[:4]
-                chunk_seqlens = info[6]
-                kv_with_q_head_nomask_seqlens = info[7]
+                q_head_idx, q_tail_idx, kv_with_q_head_nomask_idx, kv_with_q_head_mask_idx, kv_with_q_tail_nomask_idx, \
+                    kv_with_q_tail_mask_idx, chunk_seqlens, kv_with_q_head_nomask_seqlens, kv_with_q_tail_nomask_seqlens = get_pcp_split_info(
+                    rank, pcp_size, nums_tokens_per_rank)
+                attn_metadata = MagicMock()
+                attn_metadata.prefill = MagicMock()
+                attn_metadata.prefill.pcp_metadata.q_head_idx = q_head_idx
+                attn_metadata.prefill.pcp_metadata.q_tail_idx = q_tail_idx
+                attn_metadata.prefill.pcp_metadata.q_full_idx = torch.cat([
+                    attn_metadata.prefill.pcp_metadata.q_head_idx,
+                    attn_metadata.prefill.pcp_metadata.q_tail_idx
+                ])
+                attn_metadata.prefill.pcp_metadata.kv_with_q_head_nomask_idx = kv_with_q_head_nomask_idx
 
-                output_head, lse_head = self.impl._attention_with_mask_and_nomask(
-                    q_nope=torch.index_select(q_nope, 0, q_head_idx),
-                    q_pe=torch.index_select(q_pe, 0, q_head_idx),
-                    k_nope=k_nope,
-                    k_pe=k_pe,
-                    value=value,
-                    kv_mask_idx=kv_with_q_head_mask_idx,
-                    kv_nomask_idx=kv_with_q_head_nomask_idx,
-                    attn_mask_seqlens=torch.tensor([chunk_seqlens, chunk_seqlens], dtype=torch.int32),
-                    attn_nomask_seqlens=torch.tensor([kv_with_q_head_nomask_seqlens], dtype=torch.int32),
-                    mask=mask,
-                    attn_metadata=attn_metadata
-                )
+                attn_metadata.prefill.pcp_metadata.kv_with_q_head_mask_idx = kv_with_q_head_mask_idx
+                attn_metadata.prefill.pcp_metadata.kv_with_q_tail_nomask_idx = kv_with_q_tail_nomask_idx
+                attn_metadata.prefill.pcp_metadata.kv_with_q_tail_mask_idx = kv_with_q_tail_mask_idx
+                attn_metadata.prefill.pcp_metadata.attn_mask_seqlens = torch.tensor(
+                    [chunk_seqlens, chunk_seqlens], dtype=torch.int32)
+                attn_metadata.prefill.pcp_metadata.head_attn_nomask_seqlens = kv_with_q_head_nomask_seqlens
+                attn_metadata.prefill.pcp_metadata.tail_attn_nomask_seqlens = kv_with_q_tail_nomask_seqlens
 
-                if kv_with_q_head_nomask_idx is not None and kv_with_q_head_nomask_idx.numel() > 0:
-                    self.assertTrue(mock_update_out_lse.called, f"Rank {rank} should have called update")
-                    update_called_at_least_once = True
-                    self.assertIsNotNone(lse_head)
-                else:
-                    self.assertIsNotNone(lse_head)
-
-                self.assertEqual(output_head.shape, (q_head_idx.shape[0], num_heads, v_head_dim))
-
-                mock_npu_fia.reset_mock()
-                mock_update_out_lse.reset_mock()
-            
-            self.assertTrue(update_called_at_least_once, "Test case data did not trigger nomask branch at all!")
+                output = self.impl._forward_prefill(q_nope, q_pe, k_nope, k_pe,
+                                                    value, kv_c_and_k_pe_cache,
+                                                    attn_metadata)
+                self.assertEqual(
+                    output.shape,
+                    (seq_len_q, self.impl.num_heads * self.impl.v_head_dim))

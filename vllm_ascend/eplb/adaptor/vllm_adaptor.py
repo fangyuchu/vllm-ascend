@@ -26,19 +26,36 @@ import vllm_ascend.envs as envs_ascend
 from vllm_ascend.quantization.methods.base import QuantType
 
 
+def _is_mtp_speculative(vllm_config) -> bool:
+    if vllm_config is None:
+        return False
+    spec_config = getattr(vllm_config, "speculative_config", None)
+    if spec_config is None:
+        return False
+    return spec_config.method == "mtp"
+
+
+def _get_mtp_num_layers(vllm_config) -> int:
+    if not _is_mtp_speculative(vllm_config):
+        return 0
+    hf_config = vllm_config.model_config.hf_config
+    num_mtp = getattr(hf_config, "num_nextn_predict_layers", None)
+    return num_mtp if num_mtp is not None and num_mtp > 0 else 1
+
+
 class VllmEplbAdaptor:
-    def __init__(self, model, **args):
+    def __init__(self, model_runner, **args):
         super().__init__(**args)
-        if hasattr(model, "language_model"):
-            self.model = model.language_model
-            self.config = model.config.text_config
-        else:
-            self.model = model
-            self.config = model.config
+        self.model_runner = model_runner
+        self.model = model_runner.model  # Main model
         self.rank_id = dist.get_rank()
         self.world_size = dist.get_world_size()
-        self.num_dense_layers = getattr(self.config, "first_k_dense_replace", 0)
-        self.num_moe_layers = self.config.num_hidden_layers - self.num_dense_layers
+        self.num_dense_layers = getattr(self.model.config, "first_k_dense_replace", 0)
+        self.num_moe_layers = self.model.config.num_hidden_layers - self.num_dense_layers
+
+        vllm_config = getattr(model_runner, "vllm_config", None)
+        self.num_mtp_layers = _get_mtp_num_layers(vllm_config)
+        self.total_moe_layers = self.num_moe_layers + self.num_mtp_layers
 
         self.expert_map_per_layer_cpu = dict()  # copy of expert map on CPU to avoid device synchronize frequently
 
@@ -83,7 +100,7 @@ class VllmEplbAdaptor:
         else:
             self.expert_weight_names = ["w13_weight", "w2_weight"]
 
-        for layer_idx in range(self.num_dense_layers, self.config.num_hidden_layers):
+        for layer_idx in range(self.num_dense_layers, self.model.config.num_hidden_layers):
             self.expert_param_per_layer[layer_idx] = list()
             for name in self.expert_weight_names:
                 param_key = f"model.layers.{layer_idx}.mlp.experts.{name}"
@@ -148,5 +165,16 @@ class VllmEplbAdaptor:
             map_cpu = self.model.model.layers[self.num_dense_layers + layer_id].mlp.experts.global_expert_map.cpu()
             all_layer_global_expert_map.append(map_cpu)
             self.expert_map_per_layer_cpu[self.num_dense_layers + layer_id] = map_cpu[self.rank_id]
+
+        if self.num_mtp_layers > 0:
+            drafter = getattr(self.model_runner, "drafter", None)
+            if drafter is not None and hasattr(drafter, "model"):
+                mtp_model = drafter.model
+                for mtp_layer_idx in range(self.num_mtp_layers):
+                    mtp_layer = mtp_model.model.layers[mtp_layer_idx]
+                    map_cpu = mtp_layer.mlp.experts.global_expert_map.cpu()
+                    all_layer_global_expert_map.append(map_cpu)
+                    mtp_global_idx = self.num_dense_layers + self.num_moe_layers + mtp_layer_idx
+                    self.expert_map_per_layer_cpu[mtp_global_idx] = map_cpu[self.rank_id]
 
         return torch.stack(all_layer_global_expert_map)

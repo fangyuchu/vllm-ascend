@@ -25,6 +25,7 @@
 #ifndef HCCL_COMM
     #include "block_mmad_preload_async_fixpipe_quant.hpp"
     #include "copy_gm_to_l1_custom.hpp"
+    #include "copy_l0c_to_gm_custom.hpp"
     #include "block_epilogue_pertoken_row.hpp"
     #include "block_epilogue_pertoken_v2.hpp"
     #include "block_epilogue_pertoken_swiglu.hpp"
@@ -40,6 +41,7 @@
 #else
     #include "utils/block_mmad_preload_async_fixpipe_quant.hpp"
     #include "utils/copy_gm_to_l1_custom.hpp"
+    #include "utils/copy_l0c_to_gm_custom.hpp"
     #include "utils/block_epilogue_pertoken_row.hpp"
     #include "utils/block_epilogue_pertoken_v2.hpp"
     #include "utils/block_epilogue_pertoken_swiglu.hpp"
@@ -142,8 +144,8 @@ public:
 
         CATLASS_HOST_DEVICE
         Params(
-            GemmCoord problemShape_, uint32_t EP_, uint32_t listLen_, 
-            uint32_t expertPerRank_, uint32_t maxOutputSize_,
+            GemmCoord problemShape_,
+            uint32_t EP_, uint32_t listLen_, uint32_t expertPerRank_, uint32_t maxOutputSize_,
             uint32_t rank_, uint32_t rankSize_, int64_t topK_,
             uint64_t initRoutingQuantTilingKey_, uint32_t epilogueCoreNum_, uint32_t epilogueGranularity_,
             GM_ADDR ptrA_, LayoutA layoutA_, LayoutA layoutA2_,
@@ -389,6 +391,7 @@ private:
         uint16_t syncgmmIdx = 0;
         AscendC::CrossCoreWaitFlag<0x2>(syncgmmIdx / CROSS_CORE_FLAG_MAX_SET_COUNT); // Wait for AIV to finish cumsum for matmul
         syncgmmIdx++;
+        AscendC::PipeBarrier<PIPE_ALL>();
 
         for (uint32_t groupIdx = 0; groupIdx < params.expertPerRank; ++groupIdx) {
             uint32_t currentM = cumsumMM((params.EP - 1) * params.expertPerRank + groupIdx);
@@ -402,6 +405,7 @@ private:
             int32_t arrayGroupIdx = params.listLen == 1 ? 0 : groupIdx;
             gmB1.SetGlobalBuffer(reinterpret_cast<__gm__ ElementB *>(GetTensorAddr<int8_t>(arrayGroupIdx, params.ptrB1)));
             gmS.SetGlobalBuffer(reinterpret_cast<__gm__ ElementScale *>(GetTensorAddr<int64_t>(arrayGroupIdx, params.ptrScale1)));
+            AscendC::PipeBarrier<PIPE_ALL>();
             if (currentM <= L1TileShape::M) {
                 gmB1.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
             }
@@ -489,6 +493,8 @@ private:
 
         uint32_t startCoreIdx = 0;
 
+        AscendC::PipeBarrier<PIPE_ALL>();
+
         int64_t preCurrentmSum = 0;
         int32_t syncLoopIdx = -1;
         uint32_t lastDequantExpertNum = params.expertPerRank;
@@ -496,6 +502,8 @@ private:
         if (params.epilogueGranularity < params.expertPerRank) {
             lastDequantExpertNum = params.expertPerRank - params.epilogueGranularity;
         }
+
+        AscendC::PipeBarrier<PIPE_ALL>();
 
         for (uint32_t groupIdx = 0; groupIdx < params.expertPerRank; ++groupIdx) {
             uint32_t currentM = cumsumMM((params.EP - 1) * params.expertPerRank + groupIdx);

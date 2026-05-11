@@ -1,4 +1,3 @@
-import gc
 import pytest
 import torch
 import torch.nn.functional as F
@@ -33,6 +32,3 @@ def test_l2norm(B: int, T: int, H: int, D: int, dtype: torch.dtype):
     tri = l2norm_fwd(x)
 
     assert torch.allclose(tri, ref, rtol=rtol, atol=atol)
-    gc.collect()
-    torch.npu.empty_cache()
-    torch.npu.reset_peak_memory_stats()

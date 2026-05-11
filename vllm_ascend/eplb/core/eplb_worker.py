@@ -23,18 +23,17 @@ import torch.distributed as dist
 from vllm.logger import logger
 
 from vllm_ascend.eplb.core.eplb_utils import generate_log2phy_map
-from vllm_ascend.eplb.core.policy.policy_factory import PolicyFactory
+from vllm_ascend.eplb.core.policy.policy_factory import DynamicConfig, PolicyFactory
 
 
 class EplbWorker:
     def __init__(self, shared_dict, policy_type, enable_d2d: bool = True):
         self.policy_type = policy_type
-        self.policy = PolicyFactory.generate_policy(policy_type)
+        self.policy = PolicyFactory.generate_policy(policy_type, DynamicConfig())
         self.shared_dict = shared_dict
         self.old_expert_maps = None
         self.enable_d2d = enable_d2d
         self.rank_id = dist.get_rank()
-        self.multi_stage = policy_type == 3
         self.rank_id_to_initial_global = list(range(dist.get_world_size()))
 
     def do_update(self):
@@ -62,7 +61,7 @@ class EplbWorker:
         # Get the updated expert table based on the workload information
         old_placement = self.global2local(self.old_expert_maps, self.num_local_experts)
         if self.shared_dict["descale"]:
-            exclude_dp_ranks = self.shared_dict["excluded_dp_ranks"]
+            exclude_dp_ranks = self.shared_dict["exclude_dp_ranks"]
             enable_d2d_after_failure = self.shared_dict["enable_d2d_after_failure"]
             self.update_rank_id(exclude_dp_ranks)
             new_placement, old_deployment, need_load_h2d, num_add_experts_per_rank = self.trigger_fault_redeployment(
@@ -275,7 +274,7 @@ class EplbWorker:
         return list(zip(send_all, recv_all, maps, log2phy_all, layer_ids))
 
     def trigger_fault_redeployment(self, load_info, old_placement, exclude_dp_ranks, enable_d2d_after_failure):
-        policy = PolicyFactory.generate_policy(4)
+        policy = PolicyFactory.generate_policy(4, DynamicConfig())
         policy.failed_cards = exclude_dp_ranks
         policy.enable_d2d_after_failure = enable_d2d_after_failure
 
@@ -356,15 +355,6 @@ class EplbProcess:
         Subprocess entry: bind to specified NPU, loop waiting for planner_q to wake up,
         call do_update, then notify main process update is complete.
         """
-        try:
-            from ms_service_metric.adapters.vllm.adapter import get_vllm_adapter, initialize_vllm_metric  # type: ignore
-
-            initialize_vllm_metric()
-            adapter = get_vllm_adapter()
-            logger.info("[EPLB metrics] The adapter initialized: %s", adapter.is_initialized())
-        except Exception as e:
-            logger.warning("[EPLB metrics] Failed to initialize metrics: %s", e)
-
         if self.policy_type == 3:
             from vllm_ascend.eplb.core.policy.policy_flashlb import warm_up
 

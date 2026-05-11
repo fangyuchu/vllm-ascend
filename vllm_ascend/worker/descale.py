@@ -175,8 +175,8 @@ def get_expert_distribution_after_descale(
     eplb_updator = model_runner.eplb_updator
     model_runner.shared_dict["descale"] = True
     model_runner.shared_dict["enable_d2d_after_failure"] = enable_d2d_after_failure
-    model_runner.shared_dict["excluded_dp_ranks"] = exclued_dp_ranks
-    if model_runner.shared_dict["expert_maps"] is None and model_runner.shared_dict["expert_maps"]:
+    model_runner.shared_dict["exclude_dp_ranks"] = exclued_dp_ranks
+    if model_runner.shared_dict["expert_maps"] is None:
         model_runner.shared_dict["expert_maps"] = get_global_expert_map(model_runner)
 
     eplb_updator.wakeup_eplb_worker()
@@ -230,7 +230,7 @@ def init_dp_cpu_group(vllm_config: VllmConfig, group_type="normal") -> None:
             vllm_config.parallel_config.data_parallel_rank,
             vllm_config.parallel_config.data_parallel_size,
             backend="gloo",
-            gloo_timeout_seconds=vllm_config.parallel_config.fault_tolerance_config.gloo_comm_timeout,
+            fault_tolerance_config=vllm_config.fault_tolerance_config,
         )
         get_dynamic_eplb_group().group_type = group_type
 
@@ -241,9 +241,10 @@ def init_dp_cpu_group(vllm_config: VllmConfig, group_type="normal") -> None:
         vllm_config.parallel_config.data_parallel_rank,
         vllm_config.parallel_config.data_parallel_size,
         backend="gloo",
+        fault_tolerance_config=vllm_config.fault_tolerance_config,
     )
     get_dp_group().group_type = group_type
-    timeout = timedelta(seconds=vllm_config.parallel_config.fault_tolerance_config.gloo_comm_timeout)
+    timeout = timedelta(seconds=vllm_config.fault_tolerance_config.gloo_comm_timeout)
     _set_pg_timeout(timeout=timeout, group=get_dp_group().cpu_group)
 
 
@@ -252,6 +253,21 @@ def reinit_comm_group(use_mask_mc2: bool, vllm_config: VllmConfig, worker: NPUWo
         init_dp_cpu_group(vllm_config, "stateless")
     else:
         worker._init_worker_distributed_environment()
+
+
+def _is_mtp_speculative(vllm_config) -> bool:
+    spec_config = getattr(vllm_config, "speculative_config", None)
+    if spec_config is None:
+        return False
+    return spec_config.method == "mtp"
+
+
+def _get_mtp_num_layers(vllm_config) -> int:
+    if not _is_mtp_speculative(vllm_config):
+        return 0
+    hf_config = vllm_config.model_config.hf_config
+    num_mtp = getattr(hf_config, "num_nextn_predict_layers", None)
+    return num_mtp if num_mtp is not None and num_mtp > 0 else 1
 
 
 def save_expert_weights_to_ram(
@@ -285,11 +301,18 @@ def save_expert_weights_to_ram(
 
     weight_suffixes = BASE_WEIGHT_SUFFIXES.union(QUANT_WEIGHT_SUFFIXES) if quant else BASE_WEIGHT_SUFFIXES
 
-    def _generate_expert_weight_name(layer_id: int, expert_id: int, suffix: str) -> str:
-        """Generate the full parameter name for a single expert weight."""
-        return f"model.layers.{layer_id}.mlp.experts.{expert_id}.{suffix}"
+    def _generate_expert_weight_name(layer_id: int, expert_id: int, suffix: str) -> str | None:
+        if layer_id < num_hidden_layers:
+            return f"model.layers.{layer_id}.mlp.experts.{expert_id}.{suffix}"
+        else:
+            mtp_local_idx = layer_id - num_hidden_layers
+            if mtp_local_idx < num_mtp_layers:
+                return f"mtp.layers.{mtp_local_idx}.mlp.experts.{expert_id}.{suffix}"
+        return None
 
     num_dense_layers = getattr(model_runner.model.config, "first_k_dense_replace", 0)
+    num_hidden_layers = getattr(model_runner.model.config, "num_hidden_layers", 0)
+    num_mtp_layers = _get_mtp_num_layers(vllm_config)
     weights_to_save = set()
     for index, cur_layer_need_load_h2d in enumerate(cur_rank_need_load_h2d):
         layer_id = index + num_dense_layers
@@ -484,14 +507,14 @@ def init_ep2dp_map(dp_size: int, tp_size: int) -> dict[int, int]:
 def update_ep2dp_map(
     ep2dp_map: dict[int, int],
     exclude_dp_ranks: list[int],
-    rank_mapping: dict[int, int],
+    rank_mapping: dict[str, int],
 ) -> dict[int, int]:
     for old_ep_rank, dp_rank in ep2dp_map.items():
         if dp_rank != -1:
             if dp_rank in exclude_dp_ranks:
                 ep2dp_map[old_ep_rank] = -1
             else:
-                ep2dp_map[old_ep_rank] = rank_mapping[dp_rank]
+                ep2dp_map[old_ep_rank] = rank_mapping[str(dp_rank)]
     return ep2dp_map
 
 
@@ -599,13 +622,11 @@ def reconfigure_moe(
         module.local_num_experts = num_global_new_phy_experts // new_ep_size
         module.global_num_experts = num_global_new_phy_experts
         module.global_redundant_expert_num = num_global_new_phy_experts - num_global_logical_experts
-        sp_size = module.sp_size
         module.moe_parallel_config = FusedMoEParallelConfig.make(
             tp_size_=get_tp_group().world_size,
             pcp_size_=get_pcp_group().world_size,
             dp_size_=get_dp_group().world_size,
             vllm_parallel_config=parallel_config,
-            sp_size_=sp_size,
         )
         module.moe_config = FusedMoEConfig(
             num_experts=module.global_num_experts,
@@ -613,7 +634,6 @@ def reconfigure_moe(
             hidden_dim=module.hidden_size,
             intermediate_size_per_partition=module.intermediate_size_per_partition,
             num_local_experts=module.local_num_experts,
-            num_logical_experts=num_global_logical_experts,
             moe_parallel_config=module.moe_parallel_config,
             in_dtype=module.vllm_config.model_config.dtype,
             router_logits_dtype=None,
@@ -716,5 +736,15 @@ def get_global_expert_map(model_runner):
     for layer_id in range(num_moe_layers):
         map_cpu = model_runner.model.model.layers[num_dense_layers + layer_id].mlp.experts.global_expert_map.cpu()
         all_layer_global_expert_map.append(map_cpu)
+    vllm_config = getattr(model_runner, "vllm_config", None)
+    num_mtp_layers = _get_mtp_num_layers(vllm_config)
+    if num_mtp_layers > 0:
+        drafter = getattr(model_runner, "drafter", None)
+        if drafter is not None and hasattr(drafter, "model"):
+            mtp_model = drafter.model
+            for mtp_layer_idx in range(num_mtp_layers):
+                mtp_layer = mtp_model.model.layers[mtp_layer_idx]
+                map_cpu = mtp_layer.mlp.experts.global_expert_map.cpu()
+                all_layer_global_expert_map.append(map_cpu)
 
     return torch.stack(all_layer_global_expert_map)

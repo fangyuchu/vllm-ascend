@@ -3,7 +3,6 @@
 import pytest
 import torch
 import torch.nn.functional as F
-import huggingface_hub
 from modelscope import snapshot_download  # type: ignore[import-untyped]
 
 from tests.e2e.conftest import HfRunner, VllmRunner
@@ -32,7 +31,7 @@ DTYPE = "half"
 
 @pytest.fixture(scope="module", params=CROSS_ENCODER_MODELS)
 def model_name(request):
-    yield snapshot_download(request.param, local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,)
+    yield snapshot_download(request.param)
 
 def test_cross_encoder_score_1_to_1(model_name):
     text_pair = [TEXTS_1[0], TEXTS_2[0]]
@@ -101,7 +100,7 @@ def test_cross_encoder_score_N_to_N(model_name):
 
 @pytest.fixture(scope="module", params=EMBEDDING_MODELS)
 def emb_model_name(request):
-    yield snapshot_download(request.param, local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,)
+    yield snapshot_download(request.param)
 
 
 def test_embedding_score_1_to_1(emb_model_name):
