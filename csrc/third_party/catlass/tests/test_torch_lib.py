@@ -9,16 +9,13 @@
 import os
 
 import torch
-import torch_npu
 from torch_npu.testing.testcase import TestCase, run_tests
 
 script_path = os.path.dirname(os.path.abspath(__file__))
-torch.ops.load_library(
-    os.path.join(script_path, "../output/python_extension/libcatlass_torch.so"))  # 手动指定so路径
+torch.ops.load_library(os.path.join(script_path, "../output/python_extension/libcatlass_torch.so"))  # 手动指定so路径
 
 
 class CatlassTest(TestCase):
-
     def test_basic_matmul_torch_lib(self):
         a = torch.ones((2, 3)).to(torch.float16).npu()
         b = torch.ones((3, 4)).to(torch.float16).npu()

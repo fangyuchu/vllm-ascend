@@ -7,20 +7,21 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 
 
+import logging
 import os
 import sys
-import logging
+from dataclasses import dataclass
+
 import numpy as np
 from ml_dtypes import bfloat16
-from dataclasses import dataclass
+
 np.random.seed(1)
 
 
 WORKSPACE = os.path.dirname(os.path.abspath(__file__))
 
 
-class TestPagedMLAttention():
-
+class TestPagedMLAttention:
     @dataclass
     class AttentionInputs:
         query: any
@@ -64,8 +65,10 @@ class TestPagedMLAttention():
         group_num = head // kv_head
         score = None
         for i in range(kv_head):
-            group_score = np.matmul(left[i * group_num:(i + 1) * group_num, :, :].astype(np.float32),
-                                    right[i:(i + 1), :, :].astype(np.float32))
+            group_score = np.matmul(
+                left[i * group_num : (i + 1) * group_num, :, :].astype(np.float32),
+                right[i : (i + 1), :, :].astype(np.float32),
+            )
             if score is None:
                 score = group_score
             else:
@@ -81,12 +84,13 @@ class TestPagedMLAttention():
         soft_res = sim_sub / row_sum
         return soft_res
 
-    def ref_masked_attention(self,
-            query,  # (q_seqlen, num_heads, head_size)
-            key,    # (k_seqlen, kv_heads, head_size)
-            value,
-            scale: float,
-            mask    # (q_seqlen, k_seqlen)
+    def ref_masked_attention(
+        self,
+        query,  # (q_seqlen, num_heads, head_size)
+        key,  # (k_seqlen, kv_heads, head_size)
+        value,
+        scale: float,
+        mask,  # (q_seqlen, k_seqlen)
     ):
         # Q * K.T
         query = query
@@ -95,10 +99,10 @@ class TestPagedMLAttention():
         sim_high = self.group_matmul(query.shape[0], key.shape[0], query, key)  # (head_num, q_seqlen, k_seqlen)
         sim_high = sim_high * scale
         if mask is not None:
-            sim_high = sim_high + (
-                mask[:sim_high.shape[-2], :sim_high.shape[-1]] * self.post_mask_factor
-                ).astype(np.float32)
-        
+            sim_high = sim_high + (mask[: sim_high.shape[-2], : sim_high.shape[-1]] * self.post_mask_factor).astype(
+                np.float32
+            )
+
         # softmax
         p_high = self.softmax_numpy(sim_high)
         p = p_high.astype(query.dtype)
@@ -123,11 +127,11 @@ class TestPagedMLAttention():
         for i in range(batch):
             q_seqlen = int(attention_inputs.q_seqlen_list[i])
             k_seqlen = int(attention_inputs.k_seqlen_list[i])
-            q = attention_inputs.query[cu_seqlen:(cu_seqlen + q_seqlen), :, :]
+            q = attention_inputs.query[cu_seqlen : (cu_seqlen + q_seqlen), :, :]
             block_table = attention_inputs.block_tables[i]
             keys = []
             values = []
-            for j in range(k_seqlen): # j 每个k token拼接
+            for j in range(k_seqlen):  # j 每个k token拼接
                 block_number = int(block_table[j // block_size])
                 block_offset = j % block_size
 
@@ -140,16 +144,16 @@ class TestPagedMLAttention():
                 values.append(v)
             keys = np.stack(keys, axis=0)
             values = np.stack(values, axis=0)
-            scale = 1.0 / (head_size_qk ** 0.5)
+            scale = 1.0 / (head_size_qk**0.5)
             if attention_inputs.mask_type == 1:
-                mask = attention_inputs.global_mask[cu_seqlen:(cu_seqlen + q_seqlen), :]
+                mask = attention_inputs.global_mask[cu_seqlen : (cu_seqlen + q_seqlen), :]
             else:
                 mask = None
             out, out_high = self.ref_masked_attention(q, keys, values, scale, mask)
             out = out.reshape(-1, num_heads, head_size_vo)
             out_high = out_high.reshape(-1, num_heads, head_size_vo)
-            output[cu_seqlen: cu_seqlen + q_seqlen, :, :] = out
-            true_out[cu_seqlen: cu_seqlen + q_seqlen, :, :] = out_high
+            output[cu_seqlen : cu_seqlen + q_seqlen, :, :] = out
+            true_out[cu_seqlen : cu_seqlen + q_seqlen, :, :] = out_high
             cu_seqlen += attention_inputs.q_seqlen_list[i]
 
     def calc_data(self, gen_data_params: GenDataParams):
@@ -161,26 +165,26 @@ class TestPagedMLAttention():
         kv_max_range = 1.0
         num_tokens = np.array(gen_data_params.q_seqlen_list).sum()
         batch_size = len(gen_data_params.q_seqlen_list)
-        query = np.random.uniform(q_min_range, q_max_range,
-            size=(num_tokens, gen_data_params.num_heads, head_size_qk)).astype(gen_data_params.dtype)
+        query = np.random.uniform(
+            q_min_range, q_max_range, size=(num_tokens, gen_data_params.num_heads, head_size_qk)
+        ).astype(gen_data_params.dtype)
         query_nope = query[:, :, :head_size_vo]
-        query_rope = query[:, :, -gen_data_params.head_size_rope:]
+        query_rope = query[:, :, -gen_data_params.head_size_rope :]
 
-        key_cache = np.random.uniform(kv_min_range, kv_max_range,
-            size=(gen_data_params.num_blocks, gen_data_params.block_size,
-            gen_data_params.kv_heads, head_size_qk)).astype(gen_data_params.dtype)
+        key_cache = np.random.uniform(
+            kv_min_range,
+            kv_max_range,
+            size=(gen_data_params.num_blocks, gen_data_params.block_size, gen_data_params.kv_heads, head_size_qk),
+        ).astype(gen_data_params.dtype)
         kv_nope_cache = key_cache[:, :, :, :head_size_vo]
-        kv_rope_cache = key_cache[:, :, :, -gen_data_params.head_size_rope:]
+        kv_rope_cache = key_cache[:, :, :, -gen_data_params.head_size_rope :]
         value_cache = kv_nope_cache
 
         max_k_seqlen = max(gen_data_params.k_seqlen_list)
         max_num_blocks_per_seq = (max_k_seqlen + gen_data_params.block_size - 1) // gen_data_params.block_size
-        block_tables = []   # (num_tokens, max_num_blocks_per_seq）
+        block_tables = []  # (num_tokens, max_num_blocks_per_seq）
         for i in range(batch_size):
-            block_table = [
-                max_num_blocks_per_seq * i + j
-                for j in range(max_num_blocks_per_seq)
-            ]
+            block_table = [max_num_blocks_per_seq * i + j for j in range(max_num_blocks_per_seq)]
             block_tables.append(block_table)
 
         pre_mask_factor = -10000.0
@@ -203,8 +207,16 @@ class TestPagedMLAttention():
         ref_output = np.zeros(shape_out, dtype=gen_data_params.dtype)
         true_out = np.zeros(shape_out, dtype=np.float32)
 
-        attention_inputs = self.AttentionInputs(query, key_cache, value_cache, block_tables,
-            gen_data_params.q_seqlen_list, gen_data_params.k_seqlen_list, mask, gen_data_params.mask_type)
+        attention_inputs = self.AttentionInputs(
+            query,
+            key_cache,
+            value_cache,
+            block_tables,
+            gen_data_params.q_seqlen_list,
+            gen_data_params.k_seqlen_list,
+            mask,
+            gen_data_params.mask_type,
+        )
         self.ref_single_query_cached_kv_attention(
             attention_inputs,
             ref_output,
@@ -217,10 +229,10 @@ class TestPagedMLAttention():
         kv_nope_cache.tofile(os.path.join(WORKSPACE, "data", "k.bin"))
         kv_rope_cache.tofile(os.path.join(WORKSPACE, "data", "k_rope.bin"))
         np.array(block_tables).astype(np.int32).tofile(os.path.join(WORKSPACE, "data", "block_table.bin"))
-        np.array(gen_data_params.q_seqlen_list).astype(np.int32).tofile(
-            os.path.join(WORKSPACE, "data", "q_seqlen.bin"))
+        np.array(gen_data_params.q_seqlen_list).astype(np.int32).tofile(os.path.join(WORKSPACE, "data", "q_seqlen.bin"))
         np.array(gen_data_params.k_seqlen_list).astype(np.int32).tofile(
-            os.path.join(WORKSPACE, "data", "kv_seqlen.bin"))
+            os.path.join(WORKSPACE, "data", "kv_seqlen.bin")
+        )
         if mask:
             mask.tofile(os.path.join(WORKSPACE, "data", "mask.bin"))
         ref_output.astype(np.float32).tofile(os.path.join(WORKSPACE, "data", "golden.bin"))
@@ -250,11 +262,19 @@ if __name__ == "__main__":
         sys.exit()
     q_seqlen_list = [q_seqlen] * batch
     kv_seqlen_list = [kv_seqlen] * batch
-    
+
     testObj = TestPagedMLAttention()
     testObj.check_attr(batch, q_seqlen, kv_seqlen, num_blocks, block_size)
-    gen_data_params = testObj.GenDataParams(q_seqlen_list, kv_seqlen_list, num_head,
-                                            kv_heads, embedding_size, embedding_size_rope,
-                                            num_blocks, block_size, mask_type, dtype)
+    gen_data_params = testObj.GenDataParams(
+        q_seqlen_list,
+        kv_seqlen_list,
+        num_head,
+        kv_heads,
+        embedding_size,
+        embedding_size_rope,
+        num_blocks,
+        block_size,
+        mask_type,
+        dtype,
+    )
     testObj.calc_data(gen_data_params)
-

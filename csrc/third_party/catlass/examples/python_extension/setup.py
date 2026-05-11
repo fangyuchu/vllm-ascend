@@ -1,4 +1,3 @@
-
 # Copyright (c) 2025 Huawei Technologies Co., Ltd.
 # This file is a part of the CANN Open Software.
 # Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
@@ -16,8 +15,7 @@ import time
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
 
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
 
 class CMakeExtension(Extension):
@@ -33,35 +31,30 @@ class CMakeBuild(build_ext):
             self.generate_pyi(ext)
 
     def build_cmake(self, ext):
-        extdir = os.path.abspath(os.path.dirname(
-            self.get_ext_fullpath(ext.name)))
+        extdir = os.path.abspath(os.path.dirname(self.get_ext_fullpath(ext.name)))
         cmake_args = [
             "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=" + extdir + "/torch_catlass",
             "-DPython3_EXECUTABLE=" + sys.executable,
-            "-DBUILD_PYBIND=True"
+            "-DBUILD_PYBIND=True",
         ]
 
         build_args = []
         if not os.path.exists(self.build_temp):
             os.makedirs(self.build_temp)
 
-        subprocess.check_call(["cmake", ext.sourcedir] +
-                              cmake_args, cwd=self.build_temp)
-        subprocess.check_call(
-            ["cmake", "--build", ".", "-j"] + build_args, cwd=self.build_temp)
+        subprocess.check_call(["cmake", ext.sourcedir] + cmake_args, cwd=self.build_temp)
+        subprocess.check_call(["cmake", "--build", ".", "-j"] + build_args, cwd=self.build_temp)
 
     def generate_pyi(self, ext):
-        extdir = os.path.abspath(os.path.dirname(
-            self.get_ext_fullpath(ext.name)))
+        extdir = os.path.abspath(os.path.dirname(self.get_ext_fullpath(ext.name)))
         module_name = ext.name.split(".")[-1]
         stubgen_args = [module_name, "--output-dir", extdir]
-        stubgen_bin = os.path.join(os.path.dirname(
-            sys.executable), "pybind11-stubgen")
+        stubgen_bin = os.path.join(os.path.dirname(sys.executable), "pybind11-stubgen")
         try:
             subprocess.check_call([stubgen_bin] + stubgen_args, cwd=extdir)
-        except FileNotFoundError as e:
+        except FileNotFoundError:
             logging.warning("No pybind11-stubgen found")
-        except subprocess.CalledProcessError as e:
+        except subprocess.CalledProcessError:
             logging.warning("pybind11-stubgen exited abnormally")
 
 
