@@ -19,7 +19,6 @@ from vllm.v1.worker.worker_base import WorkerBase
 
 from vllm_ascend.platform import NPUPlatform
 
-
 _GLOBAL_PAUSE_EVENT = threading.Event()
 
 

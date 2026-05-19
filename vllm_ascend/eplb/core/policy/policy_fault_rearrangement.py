@@ -250,9 +250,7 @@ class FaultRearrangement(EplbPolicy):
         expert_from_rank,
     ) -> defaultdict[int, list[tuple[int, int]]]:
         if self.rank_id_to_node_id is None:
-            raise ValueError(
-                "self.rank_id_to_node_id was not assigned before calling this function"
-            )
+            raise ValueError("self.rank_id_to_node_id was not assigned before calling this function")
 
         node_cards = defaultdict(list)
         for card_id in range(self.n_remain_cards):
