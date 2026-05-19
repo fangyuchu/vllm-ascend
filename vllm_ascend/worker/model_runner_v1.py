@@ -2752,6 +2752,8 @@ class NPUModelRunner(GPUModelRunner):
     def load_model(self) -> None:
         logger.info("Starting to load model %s...", self.model_config.model)
 
+        _saved_expert_weights_dict = getattr(self, "_saved_expert_weights_dict", None)
+
         if self.ascend_config.mix_placement:
             # TODO: Enabling the mix placement in deepseek_v2.py
             # remove this part after the mix placement merged into vllm
@@ -2764,7 +2766,24 @@ class NPUModelRunner(GPUModelRunner):
         with DeviceMemoryProfiler() as m:  # noqa: SIM117
             if self.eplb_enable:
                 self.vllm_config.parallel_config.enable_eplb = True
-            self.model: nn.Module = get_model(vllm_config=self.vllm_config)
+
+            if _saved_expert_weights_dict is not None:
+                from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+
+                original_get_all_weights = DefaultModelLoader.get_all_weights
+
+                def saving_get_all_weights(self_loader, model_config, model):
+                    for name, tensor in original_get_all_weights(self_loader, model_config, model):
+                        _saved_expert_weights_dict[name] = tensor
+                        yield name, tensor
+
+                DefaultModelLoader.get_all_weights = saving_get_all_weights
+                try:
+                    self.model: nn.Module = get_model(vllm_config=self.vllm_config)
+                finally:
+                    DefaultModelLoader.get_all_weights = original_get_all_weights
+            else:
+                self.model: nn.Module = get_model(vllm_config=self.vllm_config)
             if self.dynamic_eplb:
                 model_register(self.model)
             if self.drafter:

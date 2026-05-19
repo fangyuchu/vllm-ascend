@@ -279,6 +279,7 @@ def save_expert_weights_to_ram(
     vllm_config,
     model_runner,
     quant,
+    saved_expert_weights,
 ) -> dict[str, torch.Tensor]:
     """
     Load the specified unsaved expert weights and save them to memory (RAM)
@@ -318,16 +319,11 @@ def save_expert_weights_to_ram(
                 for suffix in weight_suffixes:
                     weights_to_save.add(_generate_expert_weight_name(layer_id, expert_id, suffix))
 
-    model_loader = get_model_loader(vllm_config.load_config)
-    all_weight_iter = model_loader.get_all_weights(vllm_config.model_config, model_runner.model)
-
-    saved_expert_weights = {}
-    for weight_name, weight_tensor in all_weight_iter:
-        if weight_name in weights_to_save:
-            weight_tensor = weight_tensor.transpose(0, 1).contiguous()
-            if any(weight_name.endswith(suffix) for suffix in QUANT_WEIGHT_SUFFIXES):
-                weight_tensor = torch.squeeze(weight_tensor)
-            saved_expert_weights[weight_name] = weight_tensor
+    for weight_name in weights_to_save:
+        weight_tensor = saved_expert_weights[weight_name].transpose(0, 1).contiguous()
+        if any(weight_name.endswith(suffix) for suffix in QUANT_WEIGHT_SUFFIXES):
+            weight_tensor = torch.squeeze(weight_tensor)
+        saved_expert_weights[weight_name] = weight_tensor
 
     return saved_expert_weights
 

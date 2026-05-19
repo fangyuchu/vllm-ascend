@@ -45,6 +45,7 @@ from vllm.lora.request import LoRARequest
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.mem_constants import GiB_bytes
+from vllm.model_executor.model_loader import get_model_loader
 from vllm.utils.mem_utils import MemorySnapshot, memory_profiling
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -136,6 +137,7 @@ class NPUWorker(WorkerBase):
         # init ascend config and soc version
         init_ascend_config(vllm_config)
         check_ascend_device_type()
+        self.expert_weights = {}
 
         super().__init__(
             vllm_config=vllm_config,
@@ -296,6 +298,7 @@ class NPUWorker(WorkerBase):
             self.vllm_config,
             self.model_runner,
             self.quant,
+            self.expert_weights
         )
 
         expand_expert_weights(self.model_runner, num_add_experts_per_rank, self.quant)
@@ -654,11 +657,13 @@ class NPUWorker(WorkerBase):
 
             context = nullcontext()  # type: ignore
 
-        with context, set_current_vllm_config(self.vllm_config):
-            self.model_runner.load_model()
         if self.vllm_config.parallel_config.enable_fault_tolerance:
             self.backup_expert_rank_mapping = True
             # todo Hot backup-related code has not yet been ported here.
+            self.model_runner._saved_expert_weights_dict = self.expert_weights
+
+        with context, set_current_vllm_config(self.vllm_config):
+            self.model_runner.load_model()
 
     def compile_or_warm_up_model(self) -> float:
         # Note: need to adapt for graph mode.
