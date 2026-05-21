@@ -20,7 +20,6 @@ from vllm.distributed import (
 )
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig, FusedMoEParallelConfig
-from vllm.model_executor.model_loader import get_model_loader
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.parallel_state import (
