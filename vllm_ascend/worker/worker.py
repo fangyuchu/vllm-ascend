@@ -69,20 +69,9 @@ from vllm_ascend.utils import (
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 from vllm_ascend.worker.scale_down import (
-    d2d_transmission_for_scaling_down,
-    destroy_comm_group,
-    gen_all_layer_log2phy,
-    get_expert_distribution_after_scale_down,
-    init_dp_cpu_group,
+    ScaleDownHelper,
     init_elastic_info,
     init_ep2dp_map,
-    load_expert_weights_to_cpu,
-    reconfigure_moe,
-    reload_expert_weights,
-    update_elastic_info,
-    update_ep2dp_map,
-    update_eplb_adaptor_info,
-    update_parallel_config,
 )
 from vllm_ascend.worker.sentinel.npu_worker_sentinel import NPUWorkerSentinel
 
@@ -233,8 +222,11 @@ class NPUWorker(WorkerBase):
         ):
             enable_d2d_rebalance = False
 
-        experts_to_load = get_expert_distribution_after_scale_down(
-            self.model_runner, excluded_ep_ranks, enable_d2d_rebalance, new_dp_rank
+        helper = ScaleDownHelper(self.vllm_config, self.model_runner, self.quant)
+
+        # Phase 1: Expert distribution recalculation
+        experts_to_load = helper.get_expert_distribution_after_scale_down(
+            excluded_ep_ranks, enable_d2d_rebalance, new_dp_rank
         )
         num_add_experts_per_rank = self.model_runner.shared_dict["num_add_experts_per_rank"]
 
@@ -242,37 +234,27 @@ class NPUWorker(WorkerBase):
             # use_mask_mc2 is False
             raise RuntimeError("only support mask mc2")
 
-        # reload fault expert weights
-        saved_weights = load_expert_weights_to_cpu(
-            experts_to_load,
-            self.vllm_config,
-            self.model_runner,
-            self.quant,
-        )
+        # Phase 2: Expert weight reloading
+        saved_weights = helper.load_expert_weights_to_cpu(experts_to_load)
+        helper.reload_expert_weights(experts_to_load, saved_weights)
 
-        reload_expert_weights(
-            self.model_runner,
-            experts_to_load,
-            saved_weights,
-            self.quant,
-        )
-
+        # Phase 3：EPLB adaptor update
         if get_ascend_config().eplb_config.dynamic_eplb:
-            update_eplb_adaptor_info(self.model_runner, num_add_experts_per_rank, new_dp_rank)
+            helper.update_eplb_adaptor_info(num_add_experts_per_rank, new_dp_rank)
 
-        # allow balanced D2D transmission
+        # Phase 4: Log2phy map generation
         if enable_d2d_rebalance:
-            all_layer_log2phy = d2d_transmission_for_scaling_down(self.model_runner)
+            all_layer_log2phy = helper.d2d_transmission_for_scaling_down()
         else:
-            all_layer_log2phy = gen_all_layer_log2phy(self.model_runner, new_dp_rank)
+            all_layer_log2phy = helper.gen_all_layer_log2phy(new_dp_rank)
 
-        self.global_experts_distribution = self.model_runner.eplb_process.worker.local2global(
+        self.global_expert_distribution = self.model_runner.eplb_process.worker.local2global(
             self.model_runner.shared_dict["expert_maps"]
         )
 
+        # Phase 5: Configuration and state update
         old_ep_size = len(self.ep2dp_map)
-        # update parallel config
-        update_parallel_config(self.vllm_config, scale_down_config)
+        helper.update_parallel_config(scale_down_config)
         self.model_runner.dp_size = self.vllm_config.parallel_config.data_parallel_size
         self.model_runner.dp_rank = self.vllm_config.parallel_config.data_parallel_rank
         logger.info(
@@ -280,23 +262,18 @@ class NPUWorker(WorkerBase):
             f"excluded_ep_ranks is {excluded_ep_ranks} "
             f"rank_mapping is {rank_mapping}"
         )
-        self.ep2dp_map = update_ep2dp_map(self.ep2dp_map, excluded_ep_ranks, rank_mapping)
+        self.ep2dp_map = helper.update_ep2dp_map(self.ep2dp_map, excluded_ep_ranks, rank_mapping)
         elastic_info = get_elastic_info()
         num_new_phy_experts = (self.model_runner.shared_dict["expert_maps"][0] != -1).sum().item()
-        update_elastic_info(elastic_info, num_new_phy_experts, old_ep_size, self.ep2dp_map)
+        helper.update_elastic_info(elastic_info, num_new_phy_experts, old_ep_size, self.ep2dp_map)
 
-        # reinit comm_group
-        destroy_comm_group()
+        # Phase 6: Communication group reinitialization
+        helper.destroy_comm_group()
         with set_current_vllm_config(self.vllm_config):
-            init_dp_cpu_group(self.vllm_config, coord_store, "stateless")
-        # update AscendFusedMoE
-        reconfigure_moe(
-            self.model_runner,
-            self.vllm_config,
-            num_logical_expert,
-            num_new_phy_experts,
-            all_layer_log2phy,
-        )
+            helper.init_dp_cpu_group(coord_store, "stateless")
+
+        # Phase 7: MoE reconfiguration
+        helper.reconfigure_moe(num_logical_expert, num_new_phy_experts, all_layer_log2phy)
 
     def uninstall_static_kernel(self):
         import fcntl
