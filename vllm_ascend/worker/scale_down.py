@@ -247,7 +247,8 @@ def dynamic_merge_view(
     non_dim_shapes = [s for i, s in enumerate(tensor1.shape) if i != dim]
     for i, s in enumerate(tensor2.shape):
         if i != dim and s != non_dim_shapes[i if i < dim else i - 1]:
-            raise ValueError(f"size mismatch on non merged dimension {i}：tensor1={s} vs tensor2 = {non_dim_shapes[i]}")
+            expected = non_dim_shapes[i if i < dim else i - 1]
+            raise ValueError(f"size mismatch on non merged dimension {i}：tensor1={expected} vs tensor2={s}")
     if target_tensor.shape[dim] != total_dim_size:
         raise ValueError(f"target tensor on dim {dim} must be {dim_size1}+{dim_size2}={total_dim_size}")
 
@@ -280,7 +281,8 @@ class ScaleDownHelper:
         model_runner.shared_dict["scale_down"] = True
         model_runner.shared_dict["enable_d2d_after_failure"] = enable_d2d_rebalance
         model_runner.shared_dict["excluded_dp_ranks"] = excluded_dp_ranks
-        if model_runner.shared_dict["expert_maps"] is None and model_runner.shared_dict["expert_maps"]:
+        expert_maps = model_runner.shared_dict["expert_maps"]
+        if expert_maps is None or (expert_maps.shape == (1, 1, 1) and not expert_maps.any()):
             model_runner.shared_dict["expert_maps"] = self._get_global_expert_map()
 
         eplb_updator.wakeup_eplb_worker()
