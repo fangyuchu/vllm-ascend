@@ -32,6 +32,17 @@ else:
 
 _PORTS_FMT = "!2I"
 # TODO: Refactor scale_down.py - use descaler object instead of NpuWorker attrs to streamline code
+STORE_KEY = ""
+
+BASE_WEIGHT_SUFFIXES = {"down_proj.weight", "up_proj.weight", "gate_proj.weight"}
+QUANT_WEIGHT_SUFFIXES = {
+    "down_proj.weight_offset",
+    "up_proj.weight_offset",
+    "gate_proj.weight_offset",
+    "down_proj.weight_scale",
+    "up_proj.weight_scale",
+    "gate_proj.weight_scale",
+}
 
 
 def distribute_experts(global_num_expert: int, ep_size: int) -> dict[int, list[int]]:
