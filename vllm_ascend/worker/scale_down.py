@@ -45,6 +45,11 @@ QUANT_WEIGHT_SUFFIXES = {
 }
 
 
+def _generate_expert_weight_name(layer_id: int, expert_id: int, suffix: str) -> str:
+    """Generate the full parameter name for a single expert weight."""
+    return f"model.layers.{layer_id}.mlp.experts.{expert_id}.{suffix}"
+
+
 def distribute_experts(global_num_expert: int, ep_size: int) -> dict[int, list[int]]:
     distribution = {}
     base = global_num_expert // ep_size
