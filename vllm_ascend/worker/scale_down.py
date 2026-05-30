@@ -304,11 +304,12 @@ class ScaleDownHelper:
     def _get_global_expert_map(self):
         """Collect global expert maps from all model layers."""
         model_runner = self.model_runner
-        num_dense_layers = getattr(model_runner.model.config, "first_k_dense_replace", 0)
-        num_moe_layers = model_runner.model.config.num_hidden_layers - num_dense_layers
+        model = model_runner.get_model()
+        num_dense_layers = getattr(model.config, "first_k_dense_replace", 0)
+        num_moe_layers = model.config.num_hidden_layers - num_dense_layers
         all_layer_global_expert_map = []
         for layer_id in range(num_moe_layers):
-            map_cpu = model_runner.model.model.layers[num_dense_layers + layer_id].mlp.experts.global_expert_map.cpu()
+            map_cpu = model.model.layers[num_dense_layers + layer_id].mlp.experts.global_expert_map.cpu()
             all_layer_global_expert_map.append(map_cpu)
 
         return torch.stack(all_layer_global_expert_map)
@@ -318,7 +319,7 @@ class ScaleDownHelper:
 
         weight_suffixes = BASE_WEIGHT_SUFFIXES.union(QUANT_WEIGHT_SUFFIXES) if self.quant else BASE_WEIGHT_SUFFIXES
 
-        num_dense_layers = getattr(self.model_runner.model.config, "first_k_dense_replace", 0)
+        num_dense_layers = getattr(self.model_runner.get_model().config, "first_k_dense_replace", 0)
         weights_to_save = set()
         for index, per_layer_experts in enumerate(experts_to_load):
             layer_id = index + num_dense_layers
@@ -328,7 +329,7 @@ class ScaleDownHelper:
                         weights_to_save.add(_generate_expert_weight_name(layer_id, expert_id, suffix))
 
         model_loader = get_model_loader(self.vllm_config.load_config)
-        all_weight_iter = model_loader.get_all_weights(self.vllm_config.model_config, self.model_runner.model)
+        all_weight_iter = model_loader.get_all_weights(self.vllm_config.model_config, self.model_runner.get_model())
 
         saved_weights = {}
         for weight_name, weight_tensor in all_weight_iter:
@@ -396,7 +397,7 @@ class ScaleDownHelper:
                     dynamic_merge_view(module.w13_weight_scale_fp32[target_index], w1_weight_scale, w3_weight_scale)
 
         cur_layer_id = 0
-        for module in self.model_runner.model.modules():
+        for module in self.model_runner.get_model().modules():
             if isinstance(module, FusedMoE):
                 if experts_to_load[cur_layer_id] is not None:
                     for slot_pos, expert_id in experts_to_load[cur_layer_id]:
@@ -543,7 +544,7 @@ def reconfigure_moe(
     new_ep_size = parallel_config.data_parallel_size * parallel_config.tensor_parallel_size
     get_ascend_config().eplb_config.num_redundant_experts = num_global_new_phy_experts - num_global_logical_experts
 
-    moe_modules = [module for module in model_runner.model.modules() if isinstance(module, FusedMoE)]
+    moe_modules = [module for module in model_runner.get_model().modules() if isinstance(module, FusedMoE)]
 
     for cur_layer_id, module in enumerate(moe_modules):
         module.local_num_experts = num_global_new_phy_experts // new_ep_size
