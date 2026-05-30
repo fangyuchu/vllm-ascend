@@ -56,7 +56,6 @@ lib.dcmi_get_device_health.argtypes = [
 ]
 lib.dcmi_get_device_health.restype = c_int
 
-fault_or_descale_npu = set()
 ALL_NPUS = []
 active_npus = []
 active_npus_lock = threading.Lock()
@@ -260,7 +259,7 @@ def monitor_machine_fault(host, port, recover_timeout, interval_time):
 
     while True:
         exclude_dp_ranks = set()
-        descale_npu = set()
+        failed_npus = set()
         for device in device_list:
             with active_npus_lock:
                 current_active_npus = set(active_npus)
@@ -275,16 +274,16 @@ def monitor_machine_fault(host, port, recover_timeout, interval_time):
                 continue
             if CardDropFaultCode in result[0]:
                 error_npu = [Per_device_card * device[0] + card_id for card_id in range(Per_device_card)]
-                descale_npu.update([npu for npu in error_npu if npu in current_active_npus])
+                failed_npus.update([npu for npu in error_npu if npu in current_active_npus])
                 print(f"device id: {device[0]} card_id: {device[1]} CardDropFault")
 
-        exclude_dp_ranks.update([get_dp_by_npu(npu) for npu in descale_npu])
+        exclude_dp_ranks.update([get_dp_by_npu(npu) for npu in failed_npus])
 
         if exclude_dp_ranks:
             pause(host, port, recover_timeout, list(exclude_dp_ranks))
             scale(host, port, recover_timeout, list(exclude_dp_ranks))
             with active_npus_lock:
-                active_npus = [x for x in active_npus if x not in descale_npu]
+                active_npus = [x for x in active_npus if x not in failed_npus]
         time.sleep(interval_time)
 
 

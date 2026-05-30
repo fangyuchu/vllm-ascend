@@ -27,50 +27,15 @@ from vllm_ascend.eplb.core.eplb_utils import generate_log2phy_map
 
 if TYPE_CHECKING:
     from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
-    from vllm_ascend.worker.worker import NPUWorker
 else:
     NPUModelRunner = None
-    NPUWorker = None
 
 _PORTS_FMT = "!2I"
-# TODO: Refactor descale.py - use descaler object instead of NpuWorker attrs to streamline code
-
-
-def gen_expert_backup_map(
-    num_experts: int, ep_size: int, num_die_per_npu: int, global_expert_distribution: dict[int, list[int]]
-) -> list[list[int]]:
-    backup_experts = [[] for _ in range(ep_size)]
-    if global_expert_distribution is None:
-        global_expert_distribution = distribute_experts(num_experts, ep_size)
-
-    def get_least_load_backup_rank(exclude_ranks: list[int]) -> int:
-        assert len(exclude_ranks) != ep_size, "At least one backup rank must remain available."
-        min_backup_count = float("inf")
-        optimal_backup_rank = -1
-        for rank in range(ep_size):
-            if rank in exclude_ranks:
-                continue
-            current_backup_count = len(backup_experts[rank])
-            if current_backup_count <= min_backup_count:
-                min_backup_count = current_backup_count
-                optimal_backup_rank = rank
-        return optimal_backup_rank
-
-    for rank_group_start in range(0, ep_size, num_die_per_npu):
-        rank_group_end = min(ep_size, rank_group_start + num_die_per_npu)
-        current_rank_group = list(range(rank_group_start, rank_group_end))
-
-        current_group_experts = []
-        for rank in current_rank_group:
-            current_group_experts.extend(global_expert_distribution[rank])
-        for expert_id in current_group_experts:
-            backup_rank = get_least_load_backup_rank(current_rank_group)
-            backup_experts[backup_rank].append(expert_id)
-    return backup_experts
+# TODO: Refactor scale_down.py - use descaler object instead of NpuWorker attrs to streamline code
 
 
 def distribute_experts(global_num_expert: int, ep_size: int) -> dict[int, list[int]]:
-    init_global_expert_distribution = {}
+    distribution = {}
     base = global_num_expert // ep_size
     remainder = global_num_expert % ep_size
 
@@ -78,9 +43,9 @@ def distribute_experts(global_num_expert: int, ep_size: int) -> dict[int, list[i
     for rank in range(ep_size):
         num = base + (1 if rank < remainder else 0)
         expert_ids = list(range(start_index, start_index + num))
-        init_global_expert_distribution[rank] = expert_ids
+        distribution[rank] = expert_ids
         start_index += num
-    return init_global_expert_distribution
+    return distribution
 
 
 def gen_global_log2phy_map(
@@ -161,7 +126,7 @@ def generate_redundant_expert_ids(num_experts: int, ep_size: int, num_redundant_
     return redundant_ids
 
 
-def get_expert_distribution_after_descale(
+def get_expert_distribution_after_scale_down(
     model_runner,
     exclued_dp_ranks,
     enable_d2d_after_failure,
@@ -171,7 +136,8 @@ def get_expert_distribution_after_descale(
     model_runner.shared_dict["descale"] = True
     model_runner.shared_dict["enable_d2d_after_failure"] = enable_d2d_after_failure
     model_runner.shared_dict["excluded_dp_ranks"] = exclued_dp_ranks
-    if model_runner.shared_dict["expert_maps"] is None and model_runner.shared_dict["expert_maps"]:
+    expert_maps = model_runner.shared_dict["expert_maps"]
+    if expert_maps is None or (expert_maps.shape == (1, 1, 1) and not expert_maps.any()):
         model_runner.shared_dict["expert_maps"] = get_global_expert_map(model_runner)
 
     eplb_updator.wakeup_eplb_worker()
@@ -235,7 +201,7 @@ def init_dp_cpu_group(vllm_config: VllmConfig, coord_store, group_type="normal")
     _set_pg_timeout(timeout=timeout, group=get_dp_group().cpu_group)
 
 
-def save_expert_weights_to_ram(
+def load_expert_weights_to_cpu(
     cur_rank_need_load_h2d,
     vllm_config,
     model_runner,
@@ -316,7 +282,7 @@ def dynamic_merge_view(
     return target_tensor
 
 
-def reload_fault_expert_weights(
+def reload_expert_weights(
     model_runner: NPUModelRunner,
     cur_rank_need_load_h2d,
     experts_saved_weights: dict[str, torch.Tensor],
@@ -427,12 +393,12 @@ def init_ep2dp_map(dp_size: int, tp_size: int) -> dict[int, int]:
 
 def update_ep2dp_map(
     ep2dp_map: dict[int, int],
-    exclude_dp_ranks: list[int],
+    excluded_dp_ranks: list[int],
     rank_mapping: dict[int, int],
 ) -> dict[int, int]:
     for old_ep_rank, dp_rank in ep2dp_map.items():
         if dp_rank != -1:
-            if dp_rank in exclude_dp_ranks:
+            if dp_rank in excluded_dp_ranks:
                 ep2dp_map[old_ep_rank] = -1
             else:
                 ep2dp_map[old_ep_rank] = rank_mapping[dp_rank]
@@ -444,22 +410,18 @@ def init_elastic_info(
     phy_experts_num: int,
     share_expert_rank_num: int = 0,
 ):
-    # ----- 1 Basic configuration (first 4 parameters) -----
-    # Meaning: whether to descale (0 = no descale), actual number of ranks after descale
+    # Basic configuration (first 4 parameters)
+    # Meaning: whether to scale down (0 = no scale down), actual number of ranks after scale down
     # reduction (=ep_size), number of ranks for shared experts,number of MoE experts
-    descale = 0
-    base_config = torch.tensor([descale, ep_size, share_expert_rank_num, phy_experts_num], dtype=torch.int32)
+    is_scaled_down = 0
+    base_config = torch.tensor([is_scaled_down, ep_size, share_expert_rank_num, phy_experts_num], dtype=torch.int32)
 
-    # ----- 2 Mapping tables -----
     # Table1: epRankID -> localEpRankId(-1 indicates invalid）
     table1 = torch.arange(0, ep_size, dtype=torch.int32)
     # Table2: localEpRankId -> epRankID(-1 indicates padding）
     table2 = torch.arange(0, ep_size, dtype=torch.int32)
 
-    # ----- 3 Concatenate into a complete 1D Tensor -----
     elastic_info = torch.cat([base_config, table1, table2], dim=0).npu().contiguous()
-
-    # ---- 4 Configure Tensor properties and set global variables
     elastic_info.requires_grad_(False)
     set_elastic_info(elastic_info)
 
@@ -475,8 +437,8 @@ def update_elastic_info(
         elastic_info = torch.full((4 + 2 * raw_ep_size,), -1, dtype=torch.int32).npu().contiguous()
     raw_ep_ranks = sorted(ep2dp.keys())
     valid_ep_ranks = [ep for ep in raw_ep_ranks if ep2dp[ep] != -1]
-    descale_ep_size = len(valid_ep_ranks)
-    is_descale = 1 if descale_ep_size < raw_ep_size else 0
+    scaled_down_ep_size = len(valid_ep_ranks)
+    is_scaled_down = 1 if scaled_down_ep_size < raw_ep_size else 0
 
     # Table1: epRankID -> localEpRankId(-1 indicates invalid）
     table1 = torch.full((raw_ep_size,), -1, dtype=torch.int32, device="cpu")
@@ -486,34 +448,24 @@ def update_elastic_info(
     # Table2: localEpRankId -> epRankID(-1 indicates padding）
     table2 = torch.full((raw_ep_size,), -1, dtype=torch.int32, device="cpu")
     for local_ep_rank, ep_rank in enumerate(valid_ep_ranks):
-        if local_ep_rank < descale_ep_size:
+        if local_ep_rank < scaled_down_ep_size:
             table2[local_ep_rank] = ep_rank
 
     # update elastic_info
     new_elastic_info_cpu = torch.cat(
-        [torch.tensor([is_descale, descale_ep_size, share_expert_num, expert_num], dtype=torch.int32), table1, table2],
+        [
+            torch.tensor([is_scaled_down, scaled_down_ep_size, share_expert_num, expert_num], dtype=torch.int32),
+            table1,
+            table2,
+        ],
         dim=0,
     )
     elastic_info.copy_(new_elastic_info_cpu)
     set_elastic_info(elastic_info)
 
 
-def gen_local_log2phy_map(global_log2phy_map: dict[int, list[int]]) -> torch.Tensor:
-    num_logical_exp = len(global_log2phy_map)
-    log2phy = torch.zeros(num_logical_exp, dtype=torch.int32, device="cpu")
-    for log_expert_id in sorted(global_log2phy_map.keys()):
-        replica_list = global_log2phy_map[log_expert_id]
-        # num_replicas = len(replica_list)
-        # phy_id = replica_list[global_rank % num_replicas]
-        # TODO: For now we can only use the 0-th physical expert of each logical expert;
-        # using the two lines above for load balancing causes accuracy issues.
-        phy_id = replica_list[0]
-        log2phy[log_expert_id] = phy_id
-    return log2phy.npu()
-
-
 def reconfigure_moe(
-    modelrunner: NPUModelRunner,
+    model_runner: NPUModelRunner,
     vllm_config: VllmConfig,
     num_global_logical_experts: int,
     num_global_new_phy_experts: int,
@@ -525,9 +477,9 @@ def reconfigure_moe(
     new_ep_size = parallel_config.data_parallel_size * parallel_config.tensor_parallel_size
     get_ascend_config().eplb_config.num_redundant_experts = num_global_new_phy_experts - num_global_logical_experts
 
-    moe_moules = [module for module in modelrunner.model.modules() if isinstance(module, FusedMoE)]
+    moe_modules = [module for module in model_runner.model.modules() if isinstance(module, FusedMoE)]
 
-    for cur_layer_id, module in enumerate(moe_moules):
+    for cur_layer_id, module in enumerate(moe_modules):
         module.local_num_experts = num_global_new_phy_experts // new_ep_size
         module.global_num_experts = num_global_new_phy_experts
         module.global_redundant_expert_num = num_global_new_phy_experts - num_global_logical_experts

@@ -60,12 +60,12 @@ class EplbWorker:
 
         # Get MOE load information
         load_info = self.fetch_and_sum_load_info()
-        if load_info is None and not self.shared_dict["descale"]:
+        if load_info is None and not self.shared_dict["scale_down"]:
             return
 
         # Get the updated expert table based on the workload information
         old_placement = self.global2local(self.old_expert_maps, self.num_local_experts)
-        if self.shared_dict["descale"]:
+        if self.shared_dict["scale_down"]:
             exclude_dp_ranks = self.shared_dict["excluded_dp_ranks"]
             enable_d2d_after_failure = self.shared_dict["enable_d2d_after_failure"]
             self.update_rank_id(exclude_dp_ranks)
@@ -91,11 +91,11 @@ class EplbWorker:
         self.old_expert_maps = new_expert_maps
         logger.debug("EPLB Process compute complete")
 
-        if self.shared_dict["descale"] and not self.shared_dict["enable_d2d_after_failure"]:
+        if self.shared_dict["scale_down"] and not self.shared_dict["enable_d2d_after_failure"]:
             packed_update_info = []
         else:
             packed_update_info = self.pack_update_info(update_info)
-        self.shared_dict["descale"] = False
+        self.shared_dict["scale_down"] = False
 
         if num_add_experts_per_rank > 0:
             self.rank_id_to_initial_global = list(range(len(self.rank_id_to_initial_global)))

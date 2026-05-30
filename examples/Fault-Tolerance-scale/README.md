@@ -82,7 +82,7 @@ Fault Detected
     ↓
 Send pause command (pause request processing for fault DP ranks)
     ↓
-Send descale command (notify vLLM to remove fault DP ranks)
+Send scale-down command (notify vLLM to remove fault DP ranks)
     ↓
 Update active_npus list (remove fault NPUS from available list)
 ```

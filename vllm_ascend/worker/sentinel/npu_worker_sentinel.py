@@ -121,6 +121,6 @@ class NPUWorkerSentinel(BaseSentinel):
         self.clear_input_batch_callback()
         torch_npu.distributed.reinit_process_group(None, False)
         torch.npu.synchronize()
-        self.worker.dp_descale(exclude_ep_ranks, vllm_config_update_dict, store)
+        self.worker.scale_down(exclude_ep_ranks, vllm_config_update_dict, store)
         self.worker.execute_dummy_batch()
         return FaultToleranceResult(ft_request.request_id, True)
