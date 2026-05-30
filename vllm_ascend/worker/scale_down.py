@@ -1,5 +1,6 @@
 import socket
 import struct
+from copy import copy
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
@@ -200,6 +201,103 @@ def init_dp_cpu_group(vllm_config: VllmConfig, coord_store, group_type="normal")
     timeout = timedelta(seconds=vllm_config.parallel_config.fault_tolerance_config.gloo_comm_timeout)
     _set_pg_timeout(timeout=timeout, group=get_dp_group().cpu_group)
 
+def _is_mtp_speculative(vllm_config) -> bool:
+    spec_config = getattr(vllm_config, "speculative_config", None)
+    if spec_config is None:
+        return False
+    method = getattr(spec_config, "method", None)
+    return method == "mtp" or (isinstance(method, str) and method.endswith("_mtp"))
+
+
+def _get_mtp_num_layers(vllm_config) -> int:
+    if not _is_mtp_speculative(vllm_config):
+        return 0
+
+    draft = getattr(vllm_config.speculative_config, "draft_model_config", None)
+    if draft is not None:
+        num = draft.get_total_num_hidden_layers()
+        if num > 0:
+            return num
+
+    hf = vllm_config.model_config.hf_config
+    for attr in ("num_nextn_predict_layers", "mtp_num_hidden_layers", "n_predict"):
+        num = getattr(hf, attr, None)
+        if num:
+            return num
+
+    raise RuntimeError(
+        "MTP layer count not found in model config; unsupported model configuration."
+    )
+
+
+def _append_mtp_copies(main_list: list, num_mtp_layers: int) -> None:
+    """Append MTP layer copies to main_list by cyclic modulo indexing."""
+    if num_mtp_layers <= 0:
+        return
+    num_main = len(main_list)
+    for mtp_idx in range(num_mtp_layers):
+        main_idx = mtp_idx % num_main if num_main > 0 else 0
+        item = main_list[main_idx]
+        main_list.append(item.clone() if hasattr(item, "clone") else copy(item))
+
+
+def _resolve_mtp_weight_prefix(
+    prefix: str, experts_saved_weights: dict[str, torch.Tensor], probe_key: str
+) -> str:
+    """Resolve GLM-5 MTP mtp_block prefix mismatch.
+
+    The checkpoint raw weight names and module.layer_name may differ;
+    automatically toggle between prefix with/without mtp_block.
+    """
+    if probe_key in experts_saved_weights:
+        return prefix
+    if "mtp_block" in prefix:
+        return prefix.replace(".mtp_block.mlp.", ".mlp.", 1)
+    return prefix.replace(".mlp.", ".mtp_block.mlp.", 1)
+
+
+# model_type → MTP weight path template mapping
+_MTP_WEIGHT_PATH_TEMPLATES: dict[frozenset[str], str] = {
+    frozenset(
+        {
+            "nemotron_h",
+            "nemotron_h_mtp",
+            "qwen3_next",
+            "qwen3_next_mtp",
+            "qwen3_5",
+            "qwen3_5_moe",
+            "qwen3_5_mtp",
+            "exaone_moe",
+            "exaone_moe_mtp",
+        }
+    ): "mtp.layers.{idx}.mlp.experts.{eid}.{suffix}",
+    frozenset({"glm_moe_dsa"}): "model.layers.{layer_id}.mlp.experts.{eid}.{suffix}",
+    frozenset({"longcat_flash", "longcat_flash_mtp"}): (
+        "model.mtp.layers.{idx}.transformer_layer.mlp.experts.{eid}.{suffix}"
+    ),
+    frozenset({"ernie4_5_moe", "ernie_mtp"}): "model.mtp_block.0.mlp.experts.{eid}.{suffix}",
+}
+
+
+def _get_mtp_weight_path(
+    model_type: str,
+    mtp_local_idx: int,
+    layer_id: int,
+    expert_id: int,
+    suffix: str,
+) -> str:
+    """Look up the MTP weight path template for the given model_type."""
+    for model_types, template in _MTP_WEIGHT_PATH_TEMPLATES.items():
+        if model_type in model_types:
+            return template.format(
+                idx=mtp_local_idx,
+                layer_id=layer_id,
+                eid=expert_id,
+                suffix=suffix,
+            )
+    return f"model.layers.{layer_id}.mlp.experts.{expert_id}.{suffix}"
+
+
 
 def load_expert_weights_to_cpu(
     cur_rank_need_load_h2d,
@@ -233,10 +331,24 @@ def load_expert_weights_to_cpu(
     weight_suffixes = BASE_WEIGHT_SUFFIXES.union(QUANT_WEIGHT_SUFFIXES) if quant else BASE_WEIGHT_SUFFIXES
 
     def _generate_expert_weight_name(layer_id: int, expert_id: int, suffix: str) -> str:
-        """Generate the full parameter name for a single expert weight."""
-        return f"model.layers.{layer_id}.mlp.experts.{expert_id}.{suffix}"
+        if layer_id < num_hidden_layers:
+            return f"model.layers.{layer_id}.mlp.experts.{expert_id}.{suffix}"
+
+        mtp_local_idx = layer_id - num_hidden_layers
+        if mtp_local_idx >= num_mtp_layers:
+            raise RuntimeError(
+                f"MTP layer index out of range: layer_id={layer_id}, "
+                f"mtp_local_idx={mtp_local_idx}, num_mtp_layers={num_mtp_layers}"
+            )
+
+        model_type = getattr(vllm_config.model_config.hf_config, "model_type", "")
+        return _get_mtp_weight_path(model_type, mtp_local_idx, layer_id, expert_id, suffix)
 
     num_dense_layers = getattr(model_runner.model.config, "first_k_dense_replace", 0)
+    num_hidden_layers = getattr(model_runner.model.config, "num_hidden_layers", 0)
+    num_mtp_layers = _get_mtp_num_layers(vllm_config)
+    num_main_moe_layers = num_hidden_layers - num_dense_layers
+
     weights_to_save = set()
     for index, cur_layer_need_load_h2d in enumerate(cur_rank_need_load_h2d):
         layer_id = index + num_dense_layers
@@ -244,6 +356,16 @@ def load_expert_weights_to_cpu(
             for pos, expert_id in cur_layer_need_load_h2d:
                 for suffix in weight_suffixes:
                     weights_to_save.add(_generate_expert_weight_name(layer_id, expert_id, suffix))
+
+    # MTP layers
+    if num_mtp_layers > 0:
+        for mtp_idx in range(num_mtp_layers):
+            layer_id = num_hidden_layers + mtp_idx
+            data_idx = num_main_moe_layers + mtp_idx
+            if data_idx < len(cur_rank_need_load_h2d) and cur_rank_need_load_h2d[data_idx]:
+                for pos, expert_id in cur_rank_need_load_h2d[data_idx]:
+                    for suffix in weight_suffixes:
+                        weights_to_save.add(_generate_expert_weight_name(layer_id, expert_id, suffix))
 
     model_loader = get_model_loader(vllm_config.load_config)
     all_weight_iter = model_loader.get_all_weights(vllm_config.model_config, model_runner.model)
@@ -255,6 +377,17 @@ def load_expert_weights_to_cpu(
             if any(weight_name.endswith(suffix) for suffix in QUANT_WEIGHT_SUFFIXES):
                 weight_tensor = torch.squeeze(weight_tensor)
             saved_expert_weights[weight_name] = weight_tensor
+
+    # Load from draft model
+    drafter = getattr(model_runner, "drafter", None)
+    if drafter is not None and hasattr(drafter, "model") and num_mtp_layers > 0:
+        draft_weight_iter = model_loader.get_all_weights(vllm_config.model_config, drafter.model)
+        for weight_name, weight_tensor in draft_weight_iter:
+            if weight_name in weights_to_save and weight_name not in saved_expert_weights:
+                weight_tensor = weight_tensor.transpose(0, 1).contiguous()
+                if any(weight_name.endswith(suffix) for suffix in QUANT_WEIGHT_SUFFIXES):
+                    weight_tensor = torch.squeeze(weight_tensor)
+                saved_expert_weights[weight_name] = weight_tensor
 
     return saved_expert_weights
 
@@ -289,10 +422,15 @@ def reload_expert_weights(
     quant: bool | str = False,
 ) -> None:
     def _load_single_expert(expert_id: int, target_index: int, quant: bool | str = False):
-        prefix = f"{module.layer_name}.{expert_id}"
-        w1_weight = experts_saved_weights[f"{prefix}.gate_proj.weight"]
-        w2_weight = experts_saved_weights[f"{prefix}.down_proj.weight"]
-        w3_weight = experts_saved_weights[f"{prefix}.up_proj.weight"]
+        raw_prefix = f"{module.layer_name}.{expert_id}"
+        prefix = _resolve_mtp_weight_prefix(raw_prefix, experts_saved_weights,
+                                               f"{raw_prefix}.gate_proj.weight")
+        w1_key = f"{prefix}.gate_proj.weight"
+        w2_key = f"{prefix}.down_proj.weight"
+        w3_key = f"{prefix}.up_proj.weight"
+        w1_weight = experts_saved_weights[w1_key]
+        w2_weight = experts_saved_weights[w2_key]
+        w3_weight = experts_saved_weights[w3_key]
         if get_ascend_config().eplb_config.dynamic_eplb:
             device = module.w2_weight_list[target_index].device
             module._load_w2(
@@ -339,12 +477,20 @@ def reload_expert_weights(
             )
 
         if quant:
-            w1_weight_scale = experts_saved_weights[f"{prefix}.gate_proj.weight_scale"].to(device)
-            w2_weight_scale = experts_saved_weights[f"{prefix}.down_proj.weight_scale"].to(device)
-            w3_weight_scale = experts_saved_weights[f"{prefix}.up_proj.weight_scale"].to(device)
-            w1_weight_offset = experts_saved_weights[f"{prefix}.gate_proj.weight_offset"].to(device)
-            w2_weight_offset = experts_saved_weights[f"{prefix}.down_proj.weight_offset"].to(device)
-            w3_weight_offset = experts_saved_weights[f"{prefix}.up_proj.weight_offset"].to(device)
+            prefix = _resolve_mtp_weight_prefix(raw_prefix, experts_saved_weights,
+                                                   f"{raw_prefix}.gate_proj.weight_scale")
+            s1_key = f"{prefix}.gate_proj.weight_scale"
+            s2_key = f"{prefix}.down_proj.weight_scale"
+            s3_key = f"{prefix}.up_proj.weight_scale"
+            o1_key = f"{prefix}.gate_proj.weight_offset"
+            o2_key = f"{prefix}.down_proj.weight_offset"
+            o3_key = f"{prefix}.up_proj.weight_offset"
+            w1_weight_scale = experts_saved_weights[s1_key].to(device)
+            w2_weight_scale = experts_saved_weights[s2_key].to(device)
+            w3_weight_scale = experts_saved_weights[s3_key].to(device)
+            w1_weight_offset = experts_saved_weights[o1_key].to(device)
+            w2_weight_offset = experts_saved_weights[o2_key].to(device)
+            w3_weight_offset = experts_saved_weights[o3_key].to(device)
             module.w2_weight_offset.data[target_index].copy_(w2_weight_offset)
             dynamic_merge_view(module.w13_weight_offset.data[target_index], w1_weight_offset, w3_weight_offset)
             if get_ascend_config().eplb_config.dynamic_eplb:
@@ -362,6 +508,15 @@ def reload_expert_weights(
                     _load_single_expert(expert_id=expert_id, target_index=slot_pos, quant=quant)
 
             cur_layer_id += 1
+
+    draft_model = getattr(getattr(model_runner, "drafter", None), "model", None)
+    if draft_model is not None:
+        for module in draft_model.modules():
+            if isinstance(module, FusedMoE):
+                if cur_rank_need_load_h2d[cur_layer_id] is not None:
+                    for slot_pos, expert_id in cur_rank_need_load_h2d[cur_layer_id]:
+                        _load_single_expert(expert_id=expert_id, target_index=slot_pos, quant=quant)
+                cur_layer_id += 1
 
 
 def update_parallel_config(original_config: VllmConfig, update_config: dict[str, int]) -> None:  # , worker_guard)
@@ -478,6 +633,11 @@ def reconfigure_moe(
     get_ascend_config().eplb_config.num_redundant_experts = num_global_new_phy_experts - num_global_logical_experts
 
     moe_modules = [module for module in model_runner.model.modules() if isinstance(module, FusedMoE)]
+    draft_model = getattr(getattr(model_runner, "drafter", None), "model", None)
+    if draft_model is not None:
+        moe_modules.extend(
+            module for module in draft_model.modules() if isinstance(module, FusedMoE)
+        )
 
     for cur_layer_id, module in enumerate(moe_modules):
         module.local_num_experts = num_global_new_phy_experts // new_ep_size
@@ -558,6 +718,9 @@ def d2d_transmission_for_scaling_down(model_runner):
         eplb_loader.asyn_expert_weight_transfer(reqs)
         eplb_loader.update_expert_map_and_weight(reqs)
 
+    num_mtp_layers = _get_mtp_num_layers(getattr(model_runner, "vllm_config", None)) or 0
+    _append_mtp_copies(all_layer_log2phy_map, num_mtp_layers)
+
     torch_npu.npu.synchronize()
 
     return all_layer_log2phy_map
@@ -570,6 +733,9 @@ def gen_all_layer_log2phy(model_runner, rank):
         cur_layer_log2phy_map = generate_log2phy_map(cur_deployment[layer_id], rank)
         all_layer_log2phy.append(cur_layer_log2phy_map)
 
+    num_mtp_layers = _get_mtp_num_layers(getattr(model_runner, "vllm_config", None)) or 0
+    _append_mtp_copies(all_layer_log2phy, num_mtp_layers)
+
     return all_layer_log2phy
 
 
@@ -580,5 +746,15 @@ def get_global_expert_map(model_runner):
     for layer_id in range(num_moe_layers):
         map_cpu = model_runner.model.model.layers[num_dense_layers + layer_id].mlp.experts.global_expert_map.cpu()
         all_layer_global_expert_map.append(map_cpu)
+    vllm_config = getattr(model_runner, "vllm_config", None)
+    num_mtp_layers = _get_mtp_num_layers(vllm_config)
+    if num_mtp_layers > 0:
+        drafter = getattr(model_runner, "drafter", None)
+        if drafter is not None and hasattr(drafter, "model"):
+            mtp_model = drafter.model
+            for mtp_layer_idx in range(num_mtp_layers):
+                mtp_layer = mtp_model.model.layers[mtp_layer_idx]
+                map_cpu = mtp_layer.mlp.experts.global_expert_map.cpu()
+                all_layer_global_expert_map.append(map_cpu)
 
     return torch.stack(all_layer_global_expert_map)
