@@ -436,26 +436,22 @@ class ScaleDownHelper:
 
         all_layer_log2phy_map = []
 
-        while eplb_updator.update_info_all:
-            (expert_send_info, expert_recv_info, updated_expert_map, log2phy_map, layer_id) = (
-                eplb_updator.update_info_all.pop(0)
-            )
-
+        for info in eplb_updator.update_info_all:
+            (expert_send_info, expert_recv_info, updated_expert_map, log2phy_map, layer_id) = info
             log2phy_map_this_rank = torch.from_numpy(np.array(log2phy_map))
             all_layer_log2phy_map.append(log2phy_map_this_rank)
             eplb_loader.set_log2phy_map(log2phy_map_this_rank)
             updated_expert_map_this_rank = torch.from_numpy(np.array(updated_expert_map))
-
             eplb_loader.generate_expert_d2d_transfer_task(
                 expert_send_info,
                 expert_recv_info,
                 updated_expert_map_this_rank,
                 layer_id + eplb_adaptor.num_dense_layers,
             )
-
             reqs = []
             eplb_loader.asyn_expert_weight_transfer(reqs)
             eplb_loader.update_expert_map_and_weight(reqs)
+        eplb_updator.update_info_all.clear()
 
         torch_npu.npu.synchronize()
 
