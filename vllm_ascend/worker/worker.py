@@ -223,10 +223,14 @@ class NPUWorker(WorkerBase):
             enable_d2d_rebalance = False
 
         scale_down_helper = ScaleDownHelper(self.vllm_config, self.model_runner, self.quant)
+        # Currently,only TP=1 is supported.Therefore excluded_dp_ranks = excluded_ep_ranks
+        # TODO: In scenarios TP>1,the logic for converting from
+        #  excluded_ep_ranks to excluded_dp_ranks needs to be added
+        excluded_dp_ranks = excluded_ep_ranks
 
         # Phase 1: Expert distribution recalculation
         experts_to_load = scale_down_helper.get_expert_distribution_after_scale_down(
-            excluded_ep_ranks, enable_d2d_rebalance, new_dp_rank
+            excluded_dp_ranks, enable_d2d_rebalance, new_dp_rank
         )
         num_add_experts_per_rank = self.model_runner.shared_dict["num_add_experts_per_rank"]
 
@@ -259,10 +263,10 @@ class NPUWorker(WorkerBase):
         self.model_runner.dp_rank = self.vllm_config.parallel_config.data_parallel_rank
         logger.info(
             f"self.ep2dp_map is {self.ep2dp_map} "
-            f"excluded_ep_ranks is {excluded_ep_ranks} "
+            f"excluded_dp_ranks is {excluded_dp_ranks} "
             f"rank_mapping is {rank_mapping}"
         )
-        self.ep2dp_map = scale_down_helper.update_ep2dp_map(self.ep2dp_map, excluded_ep_ranks, rank_mapping)
+        self.ep2dp_map = scale_down_helper.update_ep2dp_map(self.ep2dp_map, excluded_dp_ranks, rank_mapping)
         elastic_info = get_elastic_info()
         num_new_phy_experts = (self.model_runner.shared_dict["expert_maps"][0] != -1).sum().item()
         scale_down_helper.update_elastic_info(elastic_info, num_new_phy_experts, old_ep_size, self.ep2dp_map)
