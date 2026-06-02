@@ -1,5 +1,6 @@
 import socket
 import struct
+from contextlib import contextmanager
 from copy import copy
 from datetime import timedelta
 from typing import TYPE_CHECKING
@@ -15,6 +16,7 @@ from vllm.distributed import (
     get_tp_group,
     stateless_init_torch_distributed_process_group,
 )
+from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig, FusedMoEParallelConfig
 from vllm.model_executor.model_loader import get_model_loader
@@ -407,7 +409,7 @@ class ScaleDownHelper:
         method = getattr(spec_config, "method", None)
         return method == "mtp" or (isinstance(method, str) and method.endswith("_mtp"))
 
-    def load_expert_weights_to_cpu(self, experts_to_load) -> dict[str, torch.Tensor]:
+    def load_expert_weights_to_cpu(self, experts_to_load, weight_name_to_tensor) -> dict[str, torch.Tensor]:
         """Load specified expert weights from disk into CPU memory"""
 
         weight_suffixes = BASE_WEIGHT_SUFFIXES.union(QUANT_WEIGHT_SUFFIXES) if self.quant else BASE_WEIGHT_SUFFIXES
@@ -450,31 +452,16 @@ class ScaleDownHelper:
                         for suffix in weight_suffixes:
                             weights_to_save.add(_generate_expert_weight_name(layer_id, expert_id, suffix))
 
-        model_loader = get_model_loader(self.vllm_config.load_config)
-        all_weight_iter = model_loader.get_all_weights(self.vllm_config.model_config, self.model_runner.get_model())
+        saved_expert_weights = {}
+        for weight_name in weights_to_save:
+            weight_tensor = weight_name_to_tensor[weight_name]
+            if weight_tensor.ndim >= 2:
+                weight_tensor = weight_tensor.transpose(0, 1).contiguous()
+            if any(weight_name.endswith(suffix) for suffix in QUANT_WEIGHT_SUFFIXES):
+                weight_tensor = torch.squeeze(weight_tensor)
+            saved_expert_weights[weight_name] = weight_tensor
 
-        saved_weights = {}
-        for weight_name, weight_tensor in all_weight_iter:
-            if weight_name in weights_to_save:
-                if weight_tensor.ndim >= 2:
-                    weight_tensor = weight_tensor.transpose(0, 1).contiguous()
-                if any(weight_name.endswith(suffix) for suffix in QUANT_WEIGHT_SUFFIXES):
-                    weight_tensor = torch.squeeze(weight_tensor)
-                saved_weights[weight_name] = weight_tensor
-
-        # Load from draft model
-        drafter = getattr(self.model_runner, "drafter", None)
-        if drafter is not None and hasattr(drafter, "model") and num_mtp_layers > 0:
-            draft_weight_iter = model_loader.get_all_weights(self.vllm_config.model_config, drafter.model)
-            for weight_name, weight_tensor in draft_weight_iter:
-                if weight_name in weights_to_save and weight_name not in saved_weights:
-                    if weight_tensor.ndim >= 2:
-                        weight_tensor = weight_tensor.transpose(0, 1).contiguous()
-                    if any(weight_name.endswith(suffix) for suffix in QUANT_WEIGHT_SUFFIXES):
-                        weight_tensor = torch.squeeze(weight_tensor)
-                    saved_weights[weight_name] = weight_tensor
-
-        return saved_weights
+        return saved_expert_weights
 
     def reload_expert_weights(self, experts_to_load, saved_weights: dict[str, torch.Tensor]) -> None:
         """Load saved expert weights from CPU into the FusedMoE modules."""
@@ -687,6 +674,48 @@ def init_dp_cpu_group_impl(vllm_config: VllmConfig, coord_store, group_type="nor
     get_dp_group().group_type = group_type
     timeout = timedelta(seconds=vllm_config.parallel_config.fault_tolerance_config.gloo_comm_timeout)
     _set_pg_timeout(timeout=timeout, group=get_dp_group().cpu_group)
+
+
+@contextmanager
+def patch_get_all_weights(
+    saved_expert_weights_dict: dict[str, torch.Tensor] | None = None,
+    enable_fault_tolerance: bool = False,
+    drafter_model: torch.nn.Module | None = None,
+):
+    if saved_expert_weights_dict is None or not enable_fault_tolerance:
+        yield
+        return
+
+    from vllm.config import LoadConfig
+    from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+
+    loader = get_model_loader(LoadConfig())
+    if not isinstance(loader, DefaultModelLoader):
+        logger.warning(
+            "Fault tolerance weight saving only supports DefaultModelLoader, "
+            "Current loader type: %s. "
+            "Scale-down weight reload will not available. ",
+            type(loader).__name__,
+        )
+        yield
+        return
+    original_get_all_weights = DefaultModelLoader.get_all_weights
+
+    def saving_get_all_weights(self_loader, model_config, model):
+        for name, tensor in original_get_all_weights(self_loader, model_config, model):
+            saved_expert_weights_dict[name] = tensor
+            yield name, tensor
+
+        if drafter_model is not None:
+            for name, tensor in original_get_all_weights(self_loader, model_config, drafter_model):
+                saved_expert_weights_dict[name] = tensor
+                yield name, tensor
+
+    DefaultModelLoader.get_all_weights = saving_get_all_weights
+    try:
+        yield
+    finally:
+        DefaultModelLoader.get_all_weights = original_get_all_weights
 
 
 def reconfigure_moe(
