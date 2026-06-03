@@ -92,10 +92,6 @@ class ACLGraphWrapper:
         self.enable_enpu = enable_enpu
         self.use_eagle = use_eagle
 
-        if not hasattr(self.vllm_config.compilation_config, "concrete_aclgraph_entry_list"):
-            self.vllm_config.compilation_config.concrete_aclgraph_entry_list = []
-        self.vllm_config.compilation_config.concrete_aclgraph_entry_list.append(self.concrete_aclgraph_entries)
-
     def __getattr__(self, key: str):
         # allow accessing the attributes of the runnable.
         if hasattr(self.runnable, key):

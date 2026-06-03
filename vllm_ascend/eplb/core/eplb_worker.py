@@ -36,11 +36,6 @@ class EplbWorker:
         self.rank_id = dist.get_rank()
         self.multi_stage = policy_type == 3
 
-        n_total_ranks = dist.get_world_size()
-        n_ranks_per_node = torch.npu.device_count()
-        self.rank_id_to_initial_global = list(range(n_total_ranks))
-        self.rank_id_to_node_id = [rank_id // n_ranks_per_node for rank_id in range(n_total_ranks)]
-
     def do_update(self):
         # put data in to queue
         # in process self.policy.generate_policy()
@@ -60,26 +55,25 @@ class EplbWorker:
 
         # Get MOE load information
         load_info = self.fetch_and_sum_load_info()
-        if load_info is None and not self.shared_dict["scale_down"]:
+        if load_info is None:
             return
 
         # Get the updated expert table based on the workload information
         old_placement = self.global2local(self.old_expert_maps, self.num_local_experts)
-        if self.shared_dict["scale_down"]:
-            exclude_dp_ranks = self.shared_dict["excluded_dp_ranks"]
-            enable_d2d_after_failure = self.shared_dict["enable_d2d_after_failure"]
-            self.update_rank_id(exclude_dp_ranks)
-            new_placement, old_deployment, need_load_h2d, num_add_experts_per_rank = self.trigger_fault_redeployment(
-                load_info, old_placement, exclude_dp_ranks, enable_d2d_after_failure
+        _, _, new_placement = self.calculate_rebalance_experts(load_info, old_placement)
+
+        if self.rank_id == 0:
+            if self.multi_stage:
+                hotness = self._calculate_hotness(old_placement, load_info.sum(0))
+            else:
+                hotness = self._calculate_hotness(old_placement, load_info)
+            current_mean, current_max = self._compute_imbalance(old_placement, hotness)
+            update_mean, update_max = self._compute_imbalance(new_placement, hotness)
+            logger.info(
+                "[Expert Hotness] Current: mean={:.3f}, max={:.3f}, Updated: mean={:.3f}, max={:.3f}".format(
+                    current_mean, current_max, update_mean, update_max
+                )
             )
-            if not torch.is_tensor(old_deployment):
-                old_placement = torch.tensor(old_deployment)
-            self.old_expert_maps = self.local2global(old_placement)
-            self.shared_dict["need_load_h2d"] = need_load_h2d
-            self.shared_dict["num_add_experts_per_rank"] = num_add_experts_per_rank
-        else:
-            num_add_experts_per_rank = 0
-            _, _, new_placement = self.calculate_rebalance_experts(load_info, old_placement)
 
         if not torch.is_tensor(new_placement):
             new_placement = torch.tensor(new_placement)
@@ -91,14 +85,7 @@ class EplbWorker:
         self.old_expert_maps = new_expert_maps
         logger.debug("EPLB Process compute complete")
 
-        if self.shared_dict["scale_down"] and not self.shared_dict["enable_d2d_after_failure"]:
-            packed_update_info = []
-        else:
-            packed_update_info = self.pack_update_info(update_info)
-        self.shared_dict["scale_down"] = False
-
-        if num_add_experts_per_rank > 0:
-            self.rank_id_to_initial_global = list(range(len(self.rank_id_to_initial_global)))
+        packed_update_info = self.pack_update_info(update_info)
 
         return packed_update_info
 
@@ -183,10 +170,8 @@ class EplbWorker:
                 if src_rank_id not in expert_send_info_this_layer:
                     expert_send_info_this_layer[src_rank_id] = []
 
-                dst_global_rank_id = self.rank_id_to_initial_global[dst_rank_id]
-                src_global_rank_id = self.rank_id_to_initial_global[src_rank_id]
-                expert_send_info_this_layer[src_rank_id].append((dst_global_rank_id, expert_id))
-                expert_recv_info_this_layer[dst_rank_id].append((src_global_rank_id, expert_id))
+                expert_send_info_this_layer[src_rank_id].append((dst_rank_id, expert_id))
+                expert_recv_info_this_layer[dst_rank_id].append((src_rank_id, expert_id))
 
             yield (
                 expert_send_info_this_layer,
@@ -281,35 +266,6 @@ class EplbWorker:
 
         return list(zip(send_all, recv_all, maps, log2phy_all, layer_ids))
 
-    def trigger_fault_redeployment(self, load_info, old_placement, exclude_dp_ranks, enable_d2d_after_failure):
-        policy = PolicyFactory.generate_policy(4, DynamicConfig())
-        policy.failed_cards = exclude_dp_ranks
-        policy.enable_d2d_after_failure = enable_d2d_after_failure
-        policy.rank_id_to_node_id = self.rank_id_to_node_id
-
-        new_deployment, old_deployment, need_load_h2d, num_add_experts_per_rank = policy.rebalance_experts(
-            old_placement, load_info
-        )
-
-        return new_deployment, old_deployment, need_load_h2d, num_add_experts_per_rank
-
-    def update_rank_id(self, exclude_dp_ranks: list[int]):
-        unique_fault_ids = sorted(list(set(exclude_dp_ranks)))
-        fault_count = 0
-        for fault_id in unique_fault_ids:
-            if fault_id <= self.rank_id:
-                fault_count += 1
-            else:
-                break
-        self.rank_id = self.rank_id - fault_count
-        for i in reversed(unique_fault_ids):
-            self.rank_id_to_initial_global.pop(i)
-            self.rank_id_to_node_id.pop(i)
-
-    def warm_up_shared_dict(self):
-        old_expert_maps = self.get_init_expert_maps()
-        _ = old_expert_maps.max()
-
     @staticmethod
     def _compute_imbalance(deployment_all_layer, hotness_all_layer: np.ndarray):
         imbalance_list = []
@@ -357,8 +313,6 @@ class EplbProcess:
 
         # Create EplbWorker instance
         self.worker = EplbWorker(self.shared_dict, self.policy_type, self.enable_d2d)
-        warm_maps = torch.zeros((1, 1, 1), dtype=torch.int32)
-        self.shared_dict["expert_maps"] = warm_maps
 
     def worker_process(self, planner_q, block_update_q):
         """
@@ -369,7 +323,6 @@ class EplbProcess:
             from vllm_ascend.eplb.core.policy.policy_flashlb import warm_up
 
             warm_up()
-        self.worker.warm_up_shared_dict()
         while True:
             try:
                 planner_q.get()

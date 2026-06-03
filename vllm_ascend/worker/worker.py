@@ -19,26 +19,19 @@
 
 import copy
 import gc
-from datetime import timedelta
 from types import NoneType
 
 import torch
 import torch.nn as nn
 import torch_npu
 import vllm.envs as envs_vllm
-from torch.distributed.distributed_c10d import _set_pg_timeout
 from torch_npu.op_plugin.atb._atb_ops import _register_atb_extensions
 from torch_npu.profiler import dynamic_profile as dp
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.distributed import ensure_model_parallel_initialized, init_distributed_environment
 from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
 from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized, get_kv_transfer_group, has_kv_transfer_group
-from vllm.distributed.parallel_state import (
-    Handle,
-    get_dp_group,
-    get_pp_group,
-    get_tp_group,
-)
+from vllm.distributed.parallel_state import Handle, get_pp_group, get_tp_group
 from vllm.logger import logger
 from vllm.lora.request import LoRARequest
 from vllm.sequence import IntermediateTensors
@@ -68,8 +61,6 @@ from vllm_ascend.utils import (
     register_ascend_customop,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
-from vllm_ascend.worker.sentinel.npu_worker_sentinel import NPUWorkerSentinel
-from vllm_ascend.worker.sentinel.scale_down import init_elastic_info, init_ep2dp_map
 
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
 from torch._dynamo.variables import TorchInGraphFunctionVariable  # noqa: E402
@@ -142,7 +133,7 @@ class NPUWorker(WorkerBase):
 
         if "UnquantizedLinearMethod" in WEIGHT_LOADER_V2_SUPPORTED:
             WEIGHT_LOADER_V2_SUPPORTED.remove("UnquantizedLinearMethod")
-        self.worker_sentinel: NPUWorkerSentinel | None = None
+
         self.use_v2_model_runner = envs_vllm.VLLM_USE_V2_MODEL_RUNNER
         self._pp_send_work: list[Handle] = []
 
@@ -163,32 +154,6 @@ class NPUWorker(WorkerBase):
 
             signal.signal(signal.SIGTERM, signal_handler)
             signal.signal(signal.SIGINT, signal_handler)
-        if self.vllm_config.parallel_config.enable_fault_tolerance:
-            self.ep2dp_map = init_ep2dp_map(
-                self.vllm_config.parallel_config.data_parallel_size,
-                self.vllm_config.parallel_config.tensor_parallel_size,
-            )
-            self.quant = self.model_config.quantization is not None
-            if hasattr(self.vllm_config.model_config.hf_config, "num_experts"):
-                self.num_logical_expert = self.vllm_config.model_config.hf_config.num_experts
-            elif hasattr(self.vllm_config.model_config.hf_config, "n_routed_experts"):
-                self.num_logical_expert = self.vllm_config.model_config.hf_config.n_routed_experts
-            else:
-                raise ValueError("unknown number of experts")
-
-            self.use_mask_mc2 = False
-            ep_size = (
-                self.vllm_config.parallel_config.data_parallel_size
-                * self.vllm_config.parallel_config.tensor_parallel_size
-            )
-            additional_config = self.vllm_config.additional_config or {}
-            eplb_cfg = additional_config.get("eplb_config", {})
-            num_redundant_experts = int(eplb_cfg.get("num_redundant_experts") or 0)
-            if num_redundant_experts and get_ascend_device_type() in {AscendDeviceType.A3}:
-                self.use_mask_mc2 = True
-
-            self.model_loaded = False
-            init_elastic_info(ep_size, self.num_logical_expert + num_redundant_experts)
 
     def uninstall_static_kernel(self):
         import fcntl
@@ -280,23 +245,6 @@ class NPUWorker(WorkerBase):
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
-
-    def create_worker_sentinel(self, worker_cmd_addr: str):
-        assert self.vllm_config.parallel_config.enable_fault_tolerance is True, "enable_fault_tolerance is False"
-
-        def clear_input_batch_callback():
-            input_batch = self.model_runner.input_batch
-            cached_req_ids = input_batch.req_id_to_index.keys()
-            for req_id in list(cached_req_ids):
-                input_batch.remove_request(req_id)
-
-        self.worker_sentinel = NPUWorkerSentinel(
-            self.parallel_config,
-            clear_input_batch_callback,
-            self.device,
-            worker_cmd_addr,
-            self,
-        )
 
     def _init_device(self):
         device = torch.device(f"npu:{self.local_rank}")
@@ -490,9 +438,6 @@ class NPUWorker(WorkerBase):
 
         with context, set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()
-        if self.vllm_config.parallel_config.enable_fault_tolerance:
-            self.model_loaded = True
-            # todo Hot backup-related code has not yet been ported here.
 
     def compile_or_warm_up_model(self) -> float:
         # Note: need to adapt for graph mode.
@@ -641,10 +586,6 @@ class NPUWorker(WorkerBase):
         )
         init_ascend_model_parallel(self.parallel_config)
         ensure_ec_transfer_initialized(self.vllm_config)
-        if self.vllm_config.parallel_config.enable_fault_tolerance:
-            timeout = timedelta(seconds=self.vllm_config.parallel_config.fault_tolerance_config.gloo_comm_timeout)
-            dp_cpu_group = get_dp_group()
-            _set_pg_timeout(timeout=timeout, group=dp_cpu_group.cpu_group)
 
     def _create_profiler(self, trace_name: str):
         """Create torch_npu profiler with trace naming for unique files per worker (RFC #6954)."""

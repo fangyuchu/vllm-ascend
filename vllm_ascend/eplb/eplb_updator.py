@@ -35,6 +35,7 @@ class EplbUpdator:
         self.eplb_loader = loader
         self.eplb_process = eplb_process
         self.shared_dict = self.eplb_process.shared_dict
+        self.comm_group = get_dynamic_eplb_group()
 
     def set_adaptor(self, adaptor: VllmEplbAdaptor):
         self.adaptor = adaptor
@@ -130,23 +131,12 @@ class EplbUpdator:
         self.update_iteration()
 
     def compute_and_set_moe_load(self):
-        # local_load = self.adaptor.get_rank_expert_workload().unsqueeze(1)
-        # moe_load = self.comm_group.all_gather(local_load, dim=1).cpu()
-        #
-        # if self.multi_stage:
-        #     moe_load = moe_load.permute(2, 0, 1, 3)
-        #
-        # self.shared_dict["moe_load"] = moe_load
-        local_load = self.adaptor.get_rank_expert_workload().cpu()
-        self.comm_group = get_dynamic_eplb_group()
-        self.world_size = dist.get_world_size(group=self.comm_group.cpu_group)
-        gather_list = [torch.empty_like(local_load) for _ in range(self.world_size)]
-        dist.all_gather(
-            tensor_list=gather_list,
-            tensor=local_load,
-            group=self.comm_group.cpu_group,
-        )
-        moe_load = torch.stack(gather_list, dim=0).permute(1, 0, 2)
+        local_load = self.adaptor.get_rank_expert_workload().unsqueeze(1)
+        moe_load = self.comm_group.all_gather(local_load, dim=1).cpu()
+
+        if self.multi_stage:
+            moe_load = moe_load.permute(2, 0, 1, 3)
+
         self.shared_dict["moe_load"] = moe_load
         logger.debug(f"[ModelRunner] Updated shared_dict['moe_load'] shape={moe_load.shape}")
 

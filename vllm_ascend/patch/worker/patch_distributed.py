@@ -34,7 +34,6 @@ class GroupCoordinatorPatch(GroupCoordinator):
         use_device_communicator: bool,  # whether to use device communicator
         use_message_queue_broadcaster: bool = False,
         group_name: str | None = None,
-        gloo_timeout_seconds: int | None = None,
     ):
         group_name = group_name or "anonymous"
         self.unique_name = _get_unique_name(group_name)
@@ -87,7 +86,6 @@ class GroupCoordinatorPatch(GroupCoordinator):
 
         self.use_custom_op_call = True
         self.use_cpu_custom_send_recv = False
-        self.group_type = "normal"
 
     def all_to_all(
         self,
