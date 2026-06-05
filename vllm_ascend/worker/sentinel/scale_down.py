@@ -9,14 +9,15 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 import torch_npu
-from torch.distributed.distributed_c10d import _set_pg_timeout
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_dp_group,
     get_pcp_group,
     get_tp_group,
+    get_world_group,
     stateless_init_torch_distributed_process_group,
 )
+from vllm.distributed.parallel_state import _get_unique_name
 from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig, FusedMoEParallelConfig
@@ -660,6 +661,7 @@ def init_dp_cpu_group_impl(vllm_config: VllmConfig, coord_store, group_type="nor
             listen_socket=listen_sockets[0] if listen_sockets else None,
             backend="gloo",
             gloo_timeout_seconds=vllm_config.parallel_config.fault_tolerance_config.gloo_comm_timeout,
+            group_name = _get_unique_name('eplb_group')
         )
         get_dynamic_eplb_group().group_type = group_type
 
@@ -670,10 +672,11 @@ def init_dp_cpu_group_impl(vllm_config: VllmConfig, coord_store, group_type="nor
         vllm_config.parallel_config.data_parallel_size,
         backend="gloo",
         listen_socket=listen_sockets[1] if listen_sockets else None,
+        group_name=_get_unique_name('dp_group'),
+        gloo_timeout_seconds=vllm_config.parallel_config.fault_tolerance_config.gloo_comm_timeout,
     )
+
     get_dp_group().group_type = group_type
-    timeout = timedelta(seconds=vllm_config.parallel_config.fault_tolerance_config.gloo_comm_timeout)
-    _set_pg_timeout(timeout=timeout, group=get_dp_group().cpu_group)
 
     for sock in listen_sockets:
         with contextlib.suppress(OSError):

@@ -8,10 +8,11 @@ import torch_npu
 import zmq
 from vllm.config import ParallelConfig, set_current_vllm_config
 from vllm.distributed import get_pp_group, get_tp_group
-from vllm.distributed.parallel_state import get_dp_group
+from vllm.distributed.parallel_state import get_dp_group, _get_unique_name
 from vllm.distributed.utils import get_cached_tcp_store_client, stateless_init_torch_distributed_process_group
 from vllm.logger import logger
 from vllm.utils.network_utils import close_sockets, make_zmq_socket
+from vllm.v1.engine.exceptions import EngineLoopPausedError
 from vllm.v1.fault_tolerance import BaseSentinel
 from vllm.v1.fault_tolerance.utils import FaultToleranceRequest, FaultToleranceResult
 from vllm.v1.worker.worker_base import WorkerBase
@@ -31,7 +32,7 @@ def get_pause_event() -> threading.Event:
 
 def evaluate_pause_condition() -> None:
     if get_pause_event().is_set():
-        raise RuntimeError("Worker is paused as a fault was detected on another rank.")
+        raise EngineLoopPausedError("Worker is paused as a fault was detected on another rank.")
 
 
 class NPUWorkerSentinel(BaseSentinel):
@@ -105,6 +106,7 @@ class NPUWorkerSentinel(BaseSentinel):
             self.dp_rank,
             self.dp_size,
             backend="gloo",
+            group_name=_get_unique_name("dp_group"),
             gloo_timeout_seconds=self.worker.vllm_config.parallel_config.fault_tolerance_config.gloo_comm_timeout,
         )
 

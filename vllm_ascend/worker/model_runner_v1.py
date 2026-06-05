@@ -1928,7 +1928,17 @@ class NPUModelRunner(GPUModelRunner):
         tensor = torch.zeros(2, self.dp_size, device="cpu", dtype=torch.int32)
         tensor[0][self.dp_rank] = num_tokens_padded
         tensor[1][self.dp_rank] = cudagraph_mode
-        dist.all_reduce(tensor, group=get_dp_group().cpu_group)
+        try:
+            dist.all_reduce(tensor, group=get_dp_group().cpu_group)
+        except RuntimeError as e:
+            from vllm.v1.engine.exceptions import EngineLoopPausedError
+            if self.fault_tolerance:
+                raise EngineLoopPausedError(
+                    'All-reduce across DP ranks failed, likely due to a rank failure. '
+                    'Pausing the engine loop to allow for recovery.'
+                ) from e
+            else:
+                raise
 
         num_tokens_across_dp = tensor[0, :]
         max_num_tokens = int(num_tokens_across_dp.max().item())
