@@ -3,7 +3,6 @@ import socket
 import struct
 from contextlib import contextmanager
 from copy import copy
-from datetime import timedelta
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -14,7 +13,6 @@ from vllm.distributed import (
     get_dp_group,
     get_pcp_group,
     get_tp_group,
-    get_world_group,
     stateless_init_torch_distributed_process_group,
 )
 from vllm.distributed.parallel_state import _get_unique_name
@@ -661,7 +659,7 @@ def init_dp_cpu_group_impl(vllm_config: VllmConfig, coord_store, group_type="nor
             listen_socket=listen_sockets[0] if listen_sockets else None,
             backend="gloo",
             gloo_timeout_seconds=vllm_config.parallel_config.fault_tolerance_config.gloo_comm_timeout,
-            group_name = _get_unique_name('eplb_group')
+            group_name=_get_unique_name("eplb_group"),
         )
         get_dynamic_eplb_group().group_type = group_type
 
@@ -672,7 +670,7 @@ def init_dp_cpu_group_impl(vllm_config: VllmConfig, coord_store, group_type="nor
         vllm_config.parallel_config.data_parallel_size,
         backend="gloo",
         listen_socket=listen_sockets[1] if listen_sockets else None,
-        group_name=_get_unique_name('dp_group'),
+        group_name=_get_unique_name("dp_group"),
         gloo_timeout_seconds=vllm_config.parallel_config.fault_tolerance_config.gloo_comm_timeout,
     )
 

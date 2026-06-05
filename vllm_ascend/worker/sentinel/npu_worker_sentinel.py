@@ -8,7 +8,7 @@ import torch_npu
 import zmq
 from vllm.config import ParallelConfig, set_current_vllm_config
 from vllm.distributed import get_pp_group, get_tp_group
-from vllm.distributed.parallel_state import get_dp_group, _get_unique_name
+from vllm.distributed.parallel_state import _get_unique_name, get_dp_group
 from vllm.distributed.utils import get_cached_tcp_store_client, stateless_init_torch_distributed_process_group
 from vllm.logger import logger
 from vllm.utils.network_utils import close_sockets, make_zmq_socket
