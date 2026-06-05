@@ -98,11 +98,7 @@ class NPUWorkerSentinel(BaseSentinel):
             raise ValueError(f"Unexpected return value from stop_device: {result}")
 
     def retry(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
-        self._clean_worker_state()
-        get_pause_event().clear()
-        NPUPlatform.set_device(self.device)
-        torch_npu.npu.restart_device(self.device.index)
-        torch_npu.distributed.reinit_process_group(None, False)
+        self.clean_states()
         get_dp_group().cpu_group = stateless_init_torch_distributed_process_group(
             self.data_parallel_master_ip,
             ft_request.params["new_stateless_dp_group_port"],
@@ -119,18 +115,14 @@ class NPUWorkerSentinel(BaseSentinel):
         super().shutdown()
 
     def scale_down(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
-        get_pause_event().clear()
+        self.clean_states()
         exclude_ep_ranks = ft_request.params["exclude_ep_ranks"]
         vllm_config_update_dict = ft_request.params["vllm_config_update_dict"]
         self._coord_store_port = ft_request.params["coord_store_port"]
         store = get_cached_tcp_store_client(self.data_parallel_master_ip, self._coord_store_port)
-        NPUPlatform.set_device(self.device)
-        torch_npu.npu.restart_device(self.device.index)
-        self._clean_worker_state()
-        torch_npu.distributed.reinit_process_group(None, False)
-        torch.npu.synchronize()
         self.scale_down_worker(exclude_ep_ranks, vllm_config_update_dict, store)
         self.worker.execute_dummy_batch()
+        torch.npu.synchronize()
         return FaultToleranceResult(ft_request.request_id, True)
 
     def scale_down_worker(self, excluded_ep_ranks: list[int], scale_down_config, coord_store):
@@ -224,7 +216,16 @@ class NPUWorkerSentinel(BaseSentinel):
         # Phase 7: MoE reconfiguration
         scale_down_helper.reconfigure_moe(num_logical_expert, num_new_phy_experts, all_layer_log2phy)
 
-    def _clean_worker_state(self):
+    def clean_states(self):
+        get_pause_event().clear()
+        # clean device states
+        NPUPlatform.set_device(self.device)
+        torch_npu.npu.stop_device(self.device.index)
+        torch_npu.npu.restart_device(self.device.index)
+        torch_npu.distributed.reinit_process_group(None, False)
+        torch.npu.synchronize()
+
+        # clean worker states
         self.worker.model_runner.execute_model_state = None
         self.worker.model_runner.kv_connector_output = None
         input_batch = self.worker.model_runner.input_batch
@@ -236,3 +237,6 @@ class NPUWorkerSentinel(BaseSentinel):
         input_batch.req_prompt_embeds.clear()
         self.worker.model_runner.async_output_copy_stream = torch.cuda.Stream()
         self.worker.model_runner.prepare_inputs_event = torch.Event()
+        torch.npu.synchronize()
+        logger.info(f'Device and worker states are cleaned.')
+        
