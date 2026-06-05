@@ -29,6 +29,11 @@ def get_pause_event() -> threading.Event:
     return _GLOBAL_PAUSE_EVENT
 
 
+def evaluate_pause_condition() -> None:
+    if get_pause_event().is_set():
+        raise RuntimeError("Worker is paused as a fault was detected on another rank.")
+
+
 class NPUWorkerSentinel(BaseSentinel):
     def __init__(
         self,

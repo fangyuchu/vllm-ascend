@@ -142,6 +142,8 @@ from vllm_ascend.ascend_forward_context import (  # isort: skip
 )
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
 
+from vllm_ascend.worker.sentinel.npu_worker_sentinel import evaluate_pause_condition
+
 if TYPE_CHECKING:
     import xgrammar as xgr  # type: ignore[import-untyped]
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -492,6 +494,9 @@ class NPUModelRunner(GPUModelRunner):
         # immediately once the other two flags are no longer needed.
         if self.dp_size == 1:
             return num_tokens, None, with_prefill
+
+        if self.fault_tolerance:
+            evaluate_pause_condition()
 
         if should_skip_allreduce_across_dp_group(self.vllm_config, is_draft_model):
             num_tokens_after_padding = torch.tensor([num_tokens] * self.dp_size, device="cpu", dtype=torch.int32)
@@ -1132,6 +1137,8 @@ class NPUModelRunner(GPUModelRunner):
         ):
             scheduler_output = deepcopy(scheduler_output)
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        if self.fault_tolerance:
+            evaluate_pause_condition()
         with record_function_or_nullcontext("prepare input"):
             with self.synchronize_input_prep():
                 # Update persistent batch states.
@@ -1916,6 +1923,8 @@ class NPUModelRunner(GPUModelRunner):
             num_tokens_after_padding = torch.tensor([num_tokens_padded] * self.dp_size, device="cpu", dtype=torch.int32)
             return False, num_tokens_after_padding, cudagraph_mode
 
+        if self.fault_tolerance:
+            evaluate_pause_condition()
         tensor = torch.zeros(2, self.dp_size, device="cpu", dtype=torch.int32)
         tensor[0][self.dp_rank] = num_tokens_padded
         tensor[1][self.dp_rank] = cudagraph_mode
