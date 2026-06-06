@@ -107,7 +107,7 @@ class NPUWorkerSentinel(BaseSentinel):
             self.dp_size,
             backend="gloo",
             group_name=_get_unique_name("dp_group"),
-            gloo_timeout_seconds=self.worker.vllm_config.parallel_config.fault_tolerance_config.gloo_comm_timeout,
+            gloo_timeout_seconds=self.worker.vllm_config.parallel_config.gloo_timeout_seconds,
         )
 
         return FaultToleranceResult(ft_request.request_id, True)

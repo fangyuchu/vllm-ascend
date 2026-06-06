@@ -643,7 +643,7 @@ class NPUWorker(WorkerBase):
         init_ascend_model_parallel(self.parallel_config)
         ensure_ec_transfer_initialized(self.vllm_config)
         if self.vllm_config.parallel_config.enable_fault_tolerance:
-            timeout = timedelta(seconds=self.vllm_config.parallel_config.fault_tolerance_config.gloo_comm_timeout)
+            timeout = timedelta(seconds=self.vllm_config.parallel_config.gloo_timeout_seconds)
             dp_cpu_group = get_dp_group()
             _set_pg_timeout(timeout=timeout, group=dp_cpu_group.cpu_group)
 

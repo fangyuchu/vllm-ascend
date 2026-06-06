@@ -3,11 +3,13 @@ import socket
 import struct
 from contextlib import contextmanager
 from copy import copy
+from datetime import timedelta
 from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 import torch_npu
+from torch.distributed.distributed_c10d import _set_pg_timeout
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_dp_group,
@@ -649,6 +651,8 @@ def init_dp_cpu_group_impl(vllm_config: VllmConfig, coord_store, group_type="nor
         ports = list(struct.unpack(_PORTS_FMT, coord_store.get(STORE_KEY)))
         listen_sockets = []
 
+    timeout = timedelta(seconds=vllm_config.parallel_config.gloo_timeout_seconds)
+
     eplb_port, dp_port = ports
     if get_ascend_config().eplb_config.dynamic_eplb:
         get_dynamic_eplb_group().cpu_group = stateless_init_torch_distributed_process_group(
@@ -658,10 +662,10 @@ def init_dp_cpu_group_impl(vllm_config: VllmConfig, coord_store, group_type="nor
             vllm_config.parallel_config.data_parallel_size,
             listen_socket=listen_sockets[0] if listen_sockets else None,
             backend="gloo",
-            gloo_timeout_seconds=vllm_config.parallel_config.fault_tolerance_config.gloo_comm_timeout,
             group_name=_get_unique_name("eplb_group"),
         )
         get_dynamic_eplb_group().group_type = group_type
+        _set_pg_timeout(timeout=timeout, group=get_dynamic_eplb_group().cpu_group)
 
     get_dp_group().cpu_group = stateless_init_torch_distributed_process_group(
         vllm_config.parallel_config.data_parallel_master_ip,
@@ -671,8 +675,8 @@ def init_dp_cpu_group_impl(vllm_config: VllmConfig, coord_store, group_type="nor
         backend="gloo",
         listen_socket=listen_sockets[1] if listen_sockets else None,
         group_name=_get_unique_name("dp_group"),
-        gloo_timeout_seconds=vllm_config.parallel_config.fault_tolerance_config.gloo_comm_timeout,
     )
+    _set_pg_timeout(timeout=timeout, group=get_dp_group().cpu_group)
 
     get_dp_group().group_type = group_type
 
