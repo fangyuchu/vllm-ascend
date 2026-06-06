@@ -136,6 +136,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
                 "PTA and CANN version is too old to support mc2 hierarchy comm, please upgrade your version."
             )
         self.elastic_info = None
+        self._initial_moe_expert_num = None
 
     def get_dispatch_mc2_kwargs(
         self,
@@ -158,7 +159,12 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             quant_mode = 4 if self.a5_need_extra_args and token_dispatch_input.quant.is_mxfp else 2
         else:
             quant_mode = 0
-        self.moe_expert_num = len(expert_map) + global_redundant_expert_num
+        if self._initial_moe_expert_num is None:
+            self._initial_moe_expert_num = len(expert_map) + global_redundant_expert_num
+        if self.elastic_info is not None:
+            self.moe_expert_num = self._initial_moe_expert_num
+        else:
+            self.moe_expert_num = len(expert_map) + global_redundant_expert_num
         kwargs_mc2 = {
             "x": hidden_states,
             "expert_ids": topk_ids,
