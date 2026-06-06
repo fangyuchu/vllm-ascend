@@ -161,6 +161,8 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             quant_mode = 0
         if self._initial_moe_expert_num is None:
             self._initial_moe_expert_num = len(expert_map) + global_redundant_expert_num
+        # Fault tolerance enabled(self.elastic_info is not None)
+        # Scaling down via MC2 Mask does not update self.moe_expert_num
         if self.elastic_info is not None:
             self.moe_expert_num = self._initial_moe_expert_num
         else:
