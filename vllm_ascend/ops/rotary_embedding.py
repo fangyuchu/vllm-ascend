@@ -60,20 +60,22 @@ _sin_slice: torch.Tensor = None
 
 
 def reset_rotary_embedding_globals():
-    """Reset all rotary embedding global caches to None.
+    """Reset rotary embedding global caches that depend on ``max_num_batched_tokens``.
 
     This should be called during scale-down (fault-tolerance) so that
     ``set_cos_and_sin`` will re-allocate tensors with the correct
     ``max_num_batched_tokens`` on the next forward pass.
+
+    NOTE: We only reset caches whose sizes are tied to ``max_num_batched_tokens``.
+    Caches like ``_cos_cache`` / ``_sin_cache`` / ``_cos_sin_cache`` are derived
+    from the model's ``cos_sin_cache`` (size = max_position_embeddings) and do
+    NOT need to be reset.
     """
-    global _cos_mla, _sin_mla, _cos, _sin, _cos_sin_cache, _cos_cache, _sin_cache, _cos_slice, _sin_slice
+    global _cos_mla, _sin_mla, _cos, _sin, _cos_slice, _sin_slice
     _cos_mla = None
     _sin_mla = None
     _cos = None
     _sin = None
-    _cos_sin_cache = None
-    _cos_cache = None
-    _sin_cache = None
     _cos_slice = None
     _sin_slice = None
 
