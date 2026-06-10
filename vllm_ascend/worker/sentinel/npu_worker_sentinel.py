@@ -19,6 +19,7 @@ from vllm.v1.worker.worker_base import WorkerBase
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.parallel_state import get_elastic_info
+from vllm_ascend.ops.rotary_embedding import reset_rotary_embedding_globals
 from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.worker.sentinel.scale_down import ScaleDownHelper
 
@@ -239,5 +240,10 @@ class NPUWorkerSentinel(BaseSentinel):
         input_batch.req_prompt_embeds.clear()
         self.worker.model_runner.async_output_copy_stream = torch.cuda.Stream()
         self.worker.model_runner.prepare_inputs_event = torch.Event()
+
+        # Reset rotary embedding global caches so they are re-allocated
+        # with the correct size after scale-down.
+        reset_rotary_embedding_globals()
+
         torch.npu.synchronize()
         logger.info("Device and worker states are cleaned.")

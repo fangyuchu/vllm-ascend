@@ -59,6 +59,25 @@ _cos_slice: torch.Tensor = None
 _sin_slice: torch.Tensor = None
 
 
+def reset_rotary_embedding_globals():
+    """Reset all rotary embedding global caches to None.
+
+    This should be called during scale-down (fault-tolerance) so that
+    ``set_cos_and_sin`` will re-allocate tensors with the correct
+    ``max_num_batched_tokens`` on the next forward pass.
+    """
+    global _cos_mla, _sin_mla, _cos, _sin, _cos_sin_cache, _cos_cache, _sin_cache, _cos_slice, _sin_slice
+    _cos_mla = None
+    _sin_mla = None
+    _cos = None
+    _sin = None
+    _cos_sin_cache = None
+    _cos_cache = None
+    _sin_cache = None
+    _cos_slice = None
+    _sin_slice = None
+
+
 def set_cos_and_sin(vllm_config, max_num_reqs, decode_token_per_req, dtype, device):
     global _cos_mla
     global _sin_mla
