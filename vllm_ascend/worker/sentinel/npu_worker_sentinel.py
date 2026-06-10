@@ -19,7 +19,7 @@ from vllm.v1.worker.worker_base import WorkerBase
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.parallel_state import get_elastic_info
-from vllm_ascend.ops.rotary_embedding import reset_rotary_embedding_globals
+from vllm_ascend.ops.rotary_embedding import reset_rotary_embedding_globals, set_cos_and_sin
 from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.worker.sentinel.scale_down import ScaleDownHelper
 
@@ -244,6 +244,20 @@ class NPUWorkerSentinel(BaseSentinel):
         # Reset rotary embedding global caches so they are re-allocated
         # with the correct size after scale-down.
         reset_rotary_embedding_globals()
+
+        # Re-initialize rotary embedding caches after reset.
+        # set_cos_and_sin is only called once in ModelRunner.__init__(),
+        # but after scale-down the max_num_batched_tokens may change,
+        # so we must re-initialize here to avoid NoneType errors in
+        # get_cos_and_sin_mla() used by MTP draft model.
+        model_runner = self.worker.model_runner
+        set_cos_and_sin(
+            model_runner.vllm_config,
+            model_runner.max_num_reqs,
+            model_runner.uniform_decode_query_len,
+            model_runner.dtype,
+            model_runner.device,
+        )
 
         torch.npu.synchronize()
         logger.info("Device and worker states are cleaned.")
