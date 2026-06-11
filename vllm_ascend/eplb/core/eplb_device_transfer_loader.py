@@ -38,6 +38,7 @@ class D2DExpertWeightLoader:
         self.state = ExpertWeightUpdateState.WAITING
         self.recv_expert_list = []
         self.num_layers = 0
+        self.comm_group = None
         if get_ascend_config().eplb_config.dynamic_eplb:
             self.comm_group = get_dynamic_eplb_group()
 
