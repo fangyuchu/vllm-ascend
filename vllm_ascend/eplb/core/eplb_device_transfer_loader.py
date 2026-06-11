@@ -19,6 +19,7 @@ from enum import Enum
 import torch.distributed as dist
 from vllm.logger import logger
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.parallel_state import get_dynamic_eplb_group
 
 
@@ -37,7 +38,9 @@ class D2DExpertWeightLoader:
         self.state = ExpertWeightUpdateState.WAITING
         self.recv_expert_list = []
         self.num_layers = 0
-        self.comm_group = get_dynamic_eplb_group()
+        self.comm_group = None
+        if get_ascend_config().eplb_config.dynamic_eplb:
+            self.comm_group = get_dynamic_eplb_group()
 
     def set_adator(self, eplb_adaptor):
         self.eplb_adaptor = eplb_adaptor
