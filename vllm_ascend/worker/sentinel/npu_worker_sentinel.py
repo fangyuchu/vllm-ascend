@@ -19,7 +19,6 @@ from vllm.v1.worker.worker_base import WorkerBase
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.parallel_state import get_elastic_info
-from vllm_ascend.ops.rotary_embedding import reset_rotary_embedding_globals
 from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.worker.sentinel.scale_down import ScaleDownHelper
 
