@@ -96,6 +96,14 @@ def get_cos_and_sin_mla(positions, use_cache=False):
     global _cos_mla
     global _sin_mla
     num_tokens = positions.size(0)
+
+    # Dynamically expand caches if num_tokens exceeds pre-allocated size.
+    # This can happen in MTP draft model when cuda graph padding produces
+    # more tokens than max_num_batched_tokens.
+    if _cos_mla is None or _cos_mla.size(0) < num_tokens:
+        _cos_mla = torch.ones(num_tokens, 1, 1, cos.size(-1), dtype=cos.dtype, device=cos.device)
+        _sin_mla = torch.zeros(num_tokens, 1, 1, sin.size(-1), dtype=sin.dtype, device=sin.device)
+
     _cos_mla[:num_tokens, ...] = cos
     _sin_mla[:num_tokens, ...] = sin
     return _cos_mla[:num_tokens, ...], _sin_mla[:num_tokens, ...]
@@ -136,6 +144,17 @@ def update_cos_sin(positions):
         return
 
     num_tokens = positions.size(0)
+
+    # Dynamically expand caches if num_tokens exceeds pre-allocated size.
+    # This can happen when cuda graph padding produces more tokens than
+    # max_num_batched_tokens.
+    if _cos.size(1) < num_tokens:
+        rope_dim = _cos.size(-1)
+        dtype = _cos.dtype
+        device = _cos.device
+        _cos = torch.ones(1, num_tokens, 1, rope_dim, dtype=dtype, device=device)
+        _sin = torch.zeros(1, num_tokens, 1, rope_dim, dtype=dtype, device=device)
+
     _cos[:, :num_tokens] = (
         _cos_sin_cache.index_select(0, positions).view(num_tokens, 2, -1).repeat(1, 1, 2).chunk(2, dim=-2)[0]
     )
