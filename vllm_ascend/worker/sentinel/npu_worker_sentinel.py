@@ -109,7 +109,7 @@ class NPUWorkerSentinel(BaseSentinel):
             group_name=_get_unique_name("dp_group"),
             gloo_timeout_seconds=self.worker.vllm_config.parallel_config.gloo_timeout_seconds,
         )
-
+        get_dp_group().group_type = "stateless"
         return FaultToleranceResult(ft_request.request_id, True)
 
     def shutdown(self):
