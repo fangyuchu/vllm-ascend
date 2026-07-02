@@ -1,3 +1,19 @@
+# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+# Copyright 2023 The vLLM team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# This file is a part of the vllm-ascend project.
+#
 """
 End-to-end Elastic EP scaling tests for vllm-ascend.
 
@@ -7,13 +23,15 @@ GSM8K accuracy evaluation (via aisbench).
 """
 
 import os
-import socket
 import subprocess
 import time
 from dataclasses import dataclass, field
 
 import pytest
 import requests
+from vllm.utils.network_utils import get_open_port
+
+from tests.e2e.conftest import RemoteOpenAIServer
 
 # ---------------------------------------------------------------------------
 # Server / model constants
@@ -22,7 +40,7 @@ import requests
 QWEN3_30B_A3B_MODEL = "Qwen/Qwen3-30B-A3B"
 QWEN3_30B_A3B_W8A8_MODEL = "vllm-ascend/Qwen3-30B-A3B-W8A8"
 QWEN3_235B_A22B_MODEL = "Qwen/Qwen3-235B-A22B"
-DATASET_NAME = "/vllm-ascend/gsm8k-lite"
+DATASET_NAME = "vllm-ascend/gsm8k-lite"
 """HuggingFace / ModelScope identifier of the MoE model used for testing."""
 
 MAX_MODEL_LEN = 16384
@@ -41,12 +59,6 @@ GSM8K_THRESHOLD = 5.0
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def get_free_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
 
 
 @pytest.fixture(autouse=True)
@@ -121,9 +133,7 @@ def _make_env_dict() -> dict[str, str]:
         "HCCL_BUFFSIZE": "1024",
         "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES": "1",
     }
-    if os.environ.get("VLLM_USE_MODELSCOPE", "").lower() in ("", "0", "false"):
-        pass
-    else:
+    if os.environ.get("VLLM_USE_MODELSCOPE", "").lower() not in ("", "0", "false"):
         env["VLLM_USE_MODELSCOPE"] = "true"
     return env
 
@@ -168,107 +178,112 @@ class ElasticEPTestConfig:
 # Define common additional_config
 COMMON_ADDITIONAL_CONFIG = '{"eplb_config": {"dynamic_eplb": false, "num_redundant_experts": 128}}'
 
-# Define test configurations
-TEST_CONFIGS = [
-    ElasticEPTestConfig(
-        name="Qwen3-30B-3B, Default Graph",
-        data_parallel_size=8,
-        data_parallel_size_local=8,
-        tensor_parallel_size=1,
-        additional_config=COMMON_ADDITIONAL_CONFIG,
+# Define test configurations — indexed by name for stable lookup
+CONFIG_QWEN3_30B_DEFAULT = ElasticEPTestConfig(
+    name="Qwen3-30B-3B, Default Graph",
+    data_parallel_size=8,
+    data_parallel_size_local=8,
+    tensor_parallel_size=1,
+    additional_config=COMMON_ADDITIONAL_CONFIG,
+)
+
+CONFIG_QWEN3_30B_FULL = ElasticEPTestConfig(
+    name="Qwen3-30B-3B, FULL Graph",
+    data_parallel_size=8,
+    data_parallel_size_local=8,
+    tensor_parallel_size=1,
+    compilation_config='{"cudagraph_mode": "FULL"}',
+    additional_config=COMMON_ADDITIONAL_CONFIG,
+)
+
+CONFIG_QWEN3_30B_PIECEWISE = ElasticEPTestConfig(
+    name="Qwen3-30B-3B, PIECEWISE Graph",
+    data_parallel_size=8,
+    data_parallel_size_local=8,
+    tensor_parallel_size=1,
+    compilation_config='{"cudagraph_mode": "PIECEWISE"}',
+    additional_config=COMMON_ADDITIONAL_CONFIG,
+)
+
+CONFIG_QWEN3_30B_FULL_DECODE_ONLY = ElasticEPTestConfig(
+    name="Qwen3-30B-3B, FULL DECODE ONLY Graph",
+    data_parallel_size=8,
+    data_parallel_size_local=8,
+    tensor_parallel_size=1,
+    compilation_config='{"cudagraph_mode": "FULL_DECODE_ONLY"}',
+    additional_config=COMMON_ADDITIONAL_CONFIG,
+)
+
+CONFIG_QWEN3_30B_TP4 = ElasticEPTestConfig(
+    name="Qwen3-30B-3B, TP=4, Default, FC1, FC2",
+    data_parallel_size=4,
+    data_parallel_size_local=4,
+    tensor_parallel_size=4,
+    additional_config=(
+        '{"eplb_config": {"dynamic_eplb": false,'
+        ' "num_redundant_experts": 128},'
+        ' "enable_flashcomm1": true,'
+        ' "enable_flashcomm2_parallel_size": 2}'
     ),
-    ElasticEPTestConfig(
-        name="Qwen3-30B-3B, FULL Graph",
-        data_parallel_size=8,
-        data_parallel_size_local=8,
-        tensor_parallel_size=1,
-        compilation_config='{"cudagraph_mode": "FULL"}',
-        additional_config=COMMON_ADDITIONAL_CONFIG,
+    scale_sequence=ScaleSequence(
+        name="tp4_scaling",
+        steps=[
+            (3, "Scale down (dp=4 -> dp=3)"),
+            (2, "Scale down (dp=3 -> dp=2)"),
+            (3, "Scale up (dp=2 -> dp=3)"),
+            (4, "Scale up (dp=3 -> dp=4)"),
+        ],
     ),
-    ElasticEPTestConfig(
-        name="Qwen3-30B-3B, PIECEWISE Graph",
-        data_parallel_size=8,
-        data_parallel_size_local=8,
-        tensor_parallel_size=1,
-        compilation_config='{"cudagraph_mode": "PIECEWISE"}',
-        additional_config=COMMON_ADDITIONAL_CONFIG,
+)
+
+CONFIG_QWEN3_30B_W8A8_DEFAULT = ElasticEPTestConfig(
+    name="Qwen3-30B-3B-W8A8, Default Graph",
+    data_parallel_size=8,
+    data_parallel_size_local=8,
+    tensor_parallel_size=1,
+    additional_config=COMMON_ADDITIONAL_CONFIG,
+    quant=True,
+)
+
+CONFIG_QWEN3_30B_W8A8_TP4 = ElasticEPTestConfig(
+    name="Qwen3-30B-3B-W8A8, TP=4, Default, FC1, FC2",
+    data_parallel_size=4,
+    data_parallel_size_local=4,
+    tensor_parallel_size=4,
+    additional_config=(
+        '{"eplb_config": {"dynamic_eplb": false,'
+        ' "num_redundant_experts": 128},'
+        ' "enable_flashcomm1": true,'
+        ' "enable_flashcomm2_parallel_size": 2}'
     ),
-    ElasticEPTestConfig(
-        name="Qwen3-30B-3B, FULL DECODE ONLY Graph",
-        data_parallel_size=8,
-        data_parallel_size_local=8,
-        tensor_parallel_size=1,
-        compilation_config='{"cudagraph_mode": "FULL_DECODE_ONLY"}',
-        additional_config=COMMON_ADDITIONAL_CONFIG,
+    quant=True,
+    scale_sequence=ScaleSequence(
+        name="tp4_scaling",
+        steps=[
+            (3, "Scale down (dp=4 -> dp=3)"),
+            (2, "Scale down (dp=3 -> dp=2)"),
+            (3, "Scale up (dp=2 -> dp=3)"),
+            (4, "Scale up (dp=3 -> dp=4)"),
+        ],
     ),
-    ElasticEPTestConfig(
-        name="Qwen3-30B-3B, TP=4, Default, FC1, FC2",
-        data_parallel_size=4,
-        data_parallel_size_local=4,
-        tensor_parallel_size=4,
-        additional_config=(
-            '{"eplb_config": {"dynamic_eplb": false,'
-            ' "num_redundant_experts": 128},'
-            ' "enable_flashcomm1": true,'
-            ' "enable_flashcomm2_parallel_size": 2}'
-        ),
-        scale_sequence=ScaleSequence(
-            name="tp4_scaling",
-            steps=[
-                (3, "Scale down (dp=4 -> dp=3)"),
-                (2, "Scale down (dp=3 -> dp=2)"),
-                (3, "Scale up (dp=2 -> dp=3)"),
-                (4, "Scale up (dp=3 -> dp=4)"),
-            ],
-        ),
+)
+
+CONFIG_QWEN3_235B_TP2 = ElasticEPTestConfig(
+    name="Qwen3-235B-A22B, TP=4, Default, FC1, FC2",
+    data_parallel_size=8,
+    data_parallel_size_local=8,
+    tensor_parallel_size=2,
+    additional_config=(
+        '{"eplb_config": {"dynamic_eplb": false, "num_redundant_experts": 32}, "enable_flashcomm1": true}'
     ),
-    ElasticEPTestConfig(
-        name="Qwen3-30B-3B-W8A8, Default Graph",
-        data_parallel_size=8,
-        data_parallel_size_local=8,
-        tensor_parallel_size=1,
-        additional_config=COMMON_ADDITIONAL_CONFIG,
-        quant=True,
+    scale_sequence=ScaleSequence(
+        name="tp2_scaling",
+        steps=[
+            (7, "Scale down (dp=8 -> dp=7)"),
+            (8, "Scale up (dp=7 -> dp=8)"),
+        ],
     ),
-    ElasticEPTestConfig(
-        name="Qwen3-30B-3B-W8A8, TP=4, Default, FC1, FC2",
-        data_parallel_size=4,
-        data_parallel_size_local=4,
-        tensor_parallel_size=4,
-        additional_config=(
-            '{"eplb_config": {"dynamic_eplb": false,'
-            ' "num_redundant_experts": 128},'
-            ' "enable_flashcomm1": true,'
-            ' "enable_flashcomm2_parallel_size": 2}'
-        ),
-        quant=True,
-        scale_sequence=ScaleSequence(
-            name="tp4_scaling",
-            steps=[
-                (3, "Scale down (dp=4 -> dp=3)"),
-                (2, "Scale down (dp=3 -> dp=2)"),
-                (3, "Scale up (dp=2 -> dp=3)"),
-                (4, "Scale up (dp=3 -> dp=4)"),
-            ],
-        ),
-    ),
-    ElasticEPTestConfig(
-        name="Qwen3-235B-A22B, TP=4, Default, FC1, FC2",
-        data_parallel_size=8,
-        data_parallel_size_local=8,
-        tensor_parallel_size=2,
-        additional_config=(
-            '{"eplb_config": {"dynamic_eplb": false, "num_redundant_experts": 32}, "enable_flashcomm1": true}'
-        ),
-        scale_sequence=ScaleSequence(
-            name="tp2_scaling",
-            steps=[
-                (7, "Scale down (dp=8 -> dp=7)"),
-                (8, "Scale up (dp=7 -> dp=8)"),
-            ],
-        ),
-    ),
-]
+)
 
 
 def _build_vllm_args(config: ElasticEPTestConfig) -> list[str]:
@@ -277,7 +292,7 @@ def _build_vllm_args(config: ElasticEPTestConfig) -> list[str]:
         "--host",
         "0.0.0.0",
         "--port",
-        str(get_free_port()),
+        str(get_open_port()),
         "--trust-remote-code",
         "--data-parallel-size",
         str(config.data_parallel_size),
@@ -312,8 +327,6 @@ def _build_vllm_args(config: ElasticEPTestConfig) -> list[str]:
 
 def _run_elastic_ep_test(config: ElasticEPTestConfig, model_name: str) -> None:
     """Run a complete Elastic EP test with the given configuration."""
-    from tests.e2e.conftest import RemoteOpenAIServer
-
     vllm_serve_args = _build_vllm_args(config)
     env_dict = _make_env_dict()
 
@@ -369,39 +382,39 @@ def _run_elastic_ep_test(config: ElasticEPTestConfig, model_name: str) -> None:
 
 def test_elastic_ep_scaling_qwen3_30b() -> None:
     """Scale dp 8 -> 7 -> 4 -> 7 -> 8 (tp=1, 8 NPUs) with Default Graph"""
-    _run_elastic_ep_test(TEST_CONFIGS[0], QWEN3_30B_A3B_MODEL)
+    _run_elastic_ep_test(CONFIG_QWEN3_30B_DEFAULT, QWEN3_30B_A3B_MODEL)
 
 
 def test_elastic_ep_scaling_qwen3_30b_with_full_graph() -> None:
     """Scale dp 8 -> 7 -> 4 -> 7 -> 8 (tp=1, 8 NPUs) with FULL Graph"""
-    _run_elastic_ep_test(TEST_CONFIGS[1], QWEN3_30B_A3B_MODEL)
+    _run_elastic_ep_test(CONFIG_QWEN3_30B_FULL, QWEN3_30B_A3B_MODEL)
 
 
 def test_elastic_ep_scaling_qwen3_30b_with_piecewise_graph() -> None:
     """Scale dp 8 -> 7 -> 4 -> 7 -> 8 (tp=1, 8 NPUs) with PIECEWISE Graph"""
-    _run_elastic_ep_test(TEST_CONFIGS[2], QWEN3_30B_A3B_MODEL)
+    _run_elastic_ep_test(CONFIG_QWEN3_30B_PIECEWISE, QWEN3_30B_A3B_MODEL)
 
 
 def test_elastic_ep_scaling_qwen3_30b_with_full_decode_only_graph() -> None:
     """Scale dp 8 -> 7 -> 4 -> 7 -> 8 (tp=1, 8 NPUs) with FULL DECODE ONLY"""
-    _run_elastic_ep_test(TEST_CONFIGS[3], QWEN3_30B_A3B_MODEL)
+    _run_elastic_ep_test(CONFIG_QWEN3_30B_FULL_DECODE_ONLY, QWEN3_30B_A3B_MODEL)
 
 
 def test_elastic_ep_scaling_qwen3_30b_with_tp4() -> None:
     """Scale dp 4 -> 3 -> 2 -> 3 -> 4 (tp=4, 16 NPUs) with FC1, FC2"""
-    _run_elastic_ep_test(TEST_CONFIGS[4], QWEN3_30B_A3B_MODEL)
+    _run_elastic_ep_test(CONFIG_QWEN3_30B_TP4, QWEN3_30B_A3B_MODEL)
 
 
-def test_elastic_ep_scaling_qwen3_30b_w8w8() -> None:
+def test_elastic_ep_scaling_qwen3_30b_w8a8() -> None:
     """Scale dp 8 -> 7 -> 4 -> 7 -> 8 (tp=1, 8 NPUs) W8A8 Default Graph"""
-    _run_elastic_ep_test(TEST_CONFIGS[5], QWEN3_30B_A3B_W8A8_MODEL)
+    _run_elastic_ep_test(CONFIG_QWEN3_30B_W8A8_DEFAULT, QWEN3_30B_A3B_W8A8_MODEL)
 
 
-def test_elastic_ep_scaling_qwen3_30b_w8w8_with_tp4() -> None:
+def test_elastic_ep_scaling_qwen3_30b_w8a8_with_tp4() -> None:
     """Scale dp 4 -> 3 -> 2 -> 3 -> 4 (tp=4, 16 NPUs) W8A8 with FC1, FC2"""
-    _run_elastic_ep_test(TEST_CONFIGS[6], QWEN3_30B_A3B_W8A8_MODEL)
+    _run_elastic_ep_test(CONFIG_QWEN3_30B_W8A8_TP4, QWEN3_30B_A3B_W8A8_MODEL)
 
 
 def test_elastic_ep_scaling_qwen3_235b_with_tp2() -> None:
     """Scale dp 8 -> 7 -> 8 (tp=2, 16 NPUs) 235B with Default, FC1"""
-    _run_elastic_ep_test(TEST_CONFIGS[7], QWEN3_235B_A22B_MODEL)
+    _run_elastic_ep_test(CONFIG_QWEN3_235B_TP2, QWEN3_235B_A22B_MODEL)
