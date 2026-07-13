@@ -25,11 +25,22 @@ from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.worker.sentinel.scale_down import ScaleDownHelper
 
 _GLOBAL_PAUSE_EVENT = threading.Event()
+_GLOBAL_FAULT_DETECTED = threading.Event()
 
 
 def get_pause_event() -> threading.Event:
     global _GLOBAL_PAUSE_EVENT
     return _GLOBAL_PAUSE_EVENT
+
+
+def is_fault_detected() -> bool:
+    """Check if a fault is detected."""
+    return _GLOBAL_FAULT_DETECTED.is_set()
+
+
+def clear_fault_detected() -> None:
+    """Clear fault detected."""
+    _GLOBAL_FAULT_DETECTED.clear()
 
 
 def evaluate_pause_condition() -> None:
@@ -91,6 +102,12 @@ class NPUWorkerSentinel(BaseSentinel):
         except zmq.ZMQError:
             logger.info("Socket closed, terminating.")
             self.sentinel_dead = True
+
+    def fault_detected(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
+        """Handle the fault detected instruction from EngineCoreSentinel."""
+        _GLOBAL_FAULT_DETECTED.set()
+        logger.info("fault detected flag set by EngineCoreSentinel")
+        return FaultToleranceResult(ft_request.request_id, True)
 
     def pause(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
         get_pause_event().set()

@@ -142,7 +142,7 @@ from vllm_ascend.ascend_forward_context import (  # isort: skip
 )
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
 
-from vllm_ascend.worker.sentinel.npu_worker_sentinel import evaluate_pause_condition
+from vllm_ascend.worker.sentinel.npu_worker_sentinel import evaluate_pause_condition, is_fault_detected
 
 if TYPE_CHECKING:
     import xgrammar as xgr  # type: ignore[import-untyped]
@@ -1110,6 +1110,31 @@ class NPUModelRunner(GPUModelRunner):
             raise ValueError(f"Unknown speculative decoding method: {self.speculative_config.method}")
 
         return draft_token_ids
+
+    @contextmanager
+    def synchronize_input_prep(self):
+        """Override to skip prepare_input_event synchronize/record after
+        a fault has been detected."""
+        from vllm.v1.engine.exceptions import EngineLoopPausedError
+
+        if self.prepare_inputs_event is None:
+            yield
+            return
+
+        if is_fault_detected():
+            raise EngineLoopPausedError(
+                "prepare_inputs_event synchronize skipped due to detected fault."
+            )
+
+        self.prepare_inputs_event.synchronize()
+        try:
+            yield
+        finally:
+            if is_fault_detected():
+                raise EngineLoopPausedError(
+                    "prepare_inputs_event record skipped due to detected fault."
+                )
+            self.prepare_inputs_event.record()
 
     @torch.inference_mode()
     def execute_model(
