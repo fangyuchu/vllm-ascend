@@ -1115,14 +1115,13 @@ class NPUModelRunner(GPUModelRunner):
     def synchronize_input_prep(self):
         """Override to skip prepare_input_event synchronize/record after
         a fault has been detected."""
-        from vllm.v1.engine.exceptions import EngineLoopPausedError
 
         if self.prepare_inputs_event is None:
             yield
             return
 
         if is_fault_detected():
-            raise EngineLoopPausedError(
+            raise RuntimeError(
                 "prepare_inputs_event synchronize skipped due to detected fault."
             )
 
@@ -1131,7 +1130,7 @@ class NPUModelRunner(GPUModelRunner):
             yield
         finally:
             if is_fault_detected():
-                raise EngineLoopPausedError(
+                raise RuntimeError(
                     "prepare_inputs_event record skipped due to detected fault."
                 )
             self.prepare_inputs_event.record()
