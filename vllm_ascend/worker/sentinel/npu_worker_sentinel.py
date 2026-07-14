@@ -38,6 +38,11 @@ def is_fault_detected() -> bool:
     return _GLOBAL_FAULT_DETECTED.is_set()
 
 
+def set_fault_detected() -> None:
+    """Mark a fault detected."""
+    _GLOBAL_FAULT_DETECTED.set()
+
+
 def clear_fault_detected() -> None:
     """Clear fault detected."""
     _GLOBAL_FAULT_DETECTED.clear()
@@ -102,12 +107,6 @@ class NPUWorkerSentinel(BaseSentinel):
         except zmq.ZMQError:
             logger.info("Socket closed, terminating.")
             self.sentinel_dead = True
-
-    def fault_detected(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
-        """Handle the fault detected instruction from EngineCoreSentinel."""
-        _GLOBAL_FAULT_DETECTED.set()
-        logger.info("fault detected flag set by EngineCoreSentinel")
-        return FaultToleranceResult(ft_request.request_id, True)
 
     def pause(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
         get_pause_event().set()
