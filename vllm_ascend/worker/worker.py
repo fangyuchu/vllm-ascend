@@ -66,7 +66,7 @@ from vllm_ascend.utils import (
     register_ascend_customop,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
-from vllm_ascend.worker.sentinel.npu_worker_sentinel import NPUWorkerSentinel, get_fault_detected_event
+from vllm_ascend.worker.sentinel.npu_worker_sentinel import NPUWorkerSentinel, get_pause_event
 from vllm_ascend.worker.sentinel.scale_down import init_elastic_info, init_ep2dp_map, patch_get_all_weights
 
 
@@ -76,7 +76,7 @@ def fault_detected_on_exception(func):
         try:
             return func(*args, **kwargs)
         except Exception:
-            get_fault_detected_event().set()
+            get_pause_event().set()
             raise
 
     return wrapper

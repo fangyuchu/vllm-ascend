@@ -142,10 +142,7 @@ from vllm_ascend.ascend_forward_context import (  # isort: skip
 )
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
 
-from vllm_ascend.worker.sentinel.npu_worker_sentinel import (
-    evaluate_pause_condition,
-    get_fault_detected_event,
-)
+from vllm_ascend.worker.sentinel.npu_worker_sentinel import evaluate_pause_condition
 
 if TYPE_CHECKING:
     import xgrammar as xgr  # type: ignore[import-untyped]
@@ -1123,10 +1120,7 @@ class NPUModelRunner(GPUModelRunner):
             yield
             return
 
-        if get_fault_detected_event().is_set():
-            raise RuntimeError(
-                "prepare_inputs_event synchronize skipped due to detected fault."
-            )
+        evaluate_pause_condition()
 
         self.prepare_inputs_event.synchronize()
         try:
@@ -1136,10 +1130,7 @@ class NPUModelRunner(GPUModelRunner):
                     "prepare_inputs_event record skipped due to fault."
                 )
         else:
-            if get_fault_detected_event().is_set():
-                raise RuntimeError(
-                    "prepare_inputs_event record skipped due to detected fault."
-                )
+            evaluate_pause_condition()
             self.prepare_inputs_event.record()
 
     @torch.inference_mode()

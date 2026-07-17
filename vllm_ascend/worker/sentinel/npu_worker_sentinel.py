@@ -25,16 +25,11 @@ from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.worker.sentinel.scale_down import ScaleDownHelper
 
 _GLOBAL_PAUSE_EVENT = threading.Event()
-_GLOBAL_FAULT_DETECTED = threading.Event()
 
 
 def get_pause_event() -> threading.Event:
     global _GLOBAL_PAUSE_EVENT
     return _GLOBAL_PAUSE_EVENT
-
-
-def get_fault_detected_event() -> threading.Event:
-    return _GLOBAL_FAULT_DETECTED
 
 
 def evaluate_pause_condition() -> None:
@@ -232,7 +227,6 @@ class NPUWorkerSentinel(BaseSentinel):
 
     def clean_states(self):
         get_pause_event().clear()
-        get_fault_detected_event().clear()
         # clean device states
         NPUPlatform.set_device(self.device)
         torch_npu.npu.stop_device(self.device.index)
