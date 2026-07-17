@@ -49,6 +49,7 @@ from vllm_ascend.compilation.acl_graph import (
     set_draft_graph_params,
     set_graph_params,
 )
+from vllm_ascend.distributed.elastic_ep.eplb_manager import ElasticEplbManager, generate_expert_maps_file
 from vllm_ascend.distributed.elastic_ep.standby_state import (
     create_ascend_standby_groups,
     pop_ascend_standby_groups,
@@ -61,8 +62,6 @@ from vllm_ascend.distributed.utils import use_stateless_pg_with_world_registrati
 from vllm_ascend.ops.fused_moe.moe_comm_method import setup_moe_comm_method
 from vllm_ascend.quantization.methods import AscendW4A8DynamicFusedMoEMethod
 from vllm_ascend.quantization.methods.w8a8_dynamic import AscendW8A8DynamicFusedMoEMethod
-
-from vllm_ascend.distributed.elastic_ep.eplb_manager import ElasticEplbManager, generate_expert_maps_file
 
 _PATCH_LOCK = threading.Lock()
 

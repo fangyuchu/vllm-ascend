@@ -15,7 +15,6 @@
 # limitations under the License.
 #
 # ruff: noqa: E501
-import vllm.envs as envs
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import wraps
@@ -23,6 +22,7 @@ from functools import wraps
 import torch
 import torch.nn.functional as F
 import torch_npu
+import vllm.envs as envs
 from vllm.config import get_current_vllm_config
 from vllm.distributed import get_dp_group, get_ep_group, get_tp_group, tensor_model_parallel_all_reduce
 from vllm.forward_context import get_forward_context

@@ -7,7 +7,6 @@ import numpy as np
 import torch
 from vllm.config import get_current_vllm_config
 from vllm.distributed.parallel_state import get_eplb_group
-from vllm.logger import logger
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.eplb.core.eplb_utils import generate_log2phy_map

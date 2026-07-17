@@ -40,18 +40,30 @@ def create_ascend_standby_groups(
 
     config = get_ascend_config()
     _STANDBY_MC2 = _init_ep_like_group(
-        standby_ep_ranks, "mc2", master_ip, backend,
-        coord_store=coord_store, enable_elastic_ep=True,
+        standby_ep_ranks,
+        "mc2",
+        master_ip,
+        backend,
+        coord_store=coord_store,
+        enable_elastic_ep=True,
     )
     if config.eplb_config.dynamic_eplb:
         _STANDBY_DYNAMIC_EPLB = _init_ep_like_group(
-            standby_ep_ranks, "dynamic_eplb", master_ip, backend,
-            coord_store=coord_store, enable_elastic_ep=True,
+            standby_ep_ranks,
+            "dynamic_eplb",
+            master_ip,
+            backend,
+            coord_store=coord_store,
+            enable_elastic_ep=True,
         )
     if config.multistream_overlap_gate:
         _STANDBY_FC3_QUANT_X = _init_ep_like_group(
-            standby_ep_ranks, "fc3_quant_x", master_ip, backend,
-            coord_store=coord_store, enable_elastic_ep=True,
+            standby_ep_ranks,
+            "fc3_quant_x",
+            master_ip,
+            backend,
+            coord_store=coord_store,
+            enable_elastic_ep=True,
         )
 
 
