@@ -19,6 +19,7 @@
 
 import copy
 import gc
+from functools import wraps
 from types import NoneType
 
 import torch
@@ -65,8 +66,20 @@ from vllm_ascend.utils import (
     register_ascend_customop,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
-from vllm_ascend.worker.sentinel.npu_worker_sentinel import NPUWorkerSentinel
+from vllm_ascend.worker.sentinel.npu_worker_sentinel import NPUWorkerSentinel, get_fault_detected_event
 from vllm_ascend.worker.sentinel.scale_down import init_elastic_info, init_ep2dp_map, patch_get_all_weights
+
+
+def fault_detected_on_exception(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception:
+            get_fault_detected_event().set()
+            raise
+
+    return wrapper
 
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
 from torch._dynamo.variables import TorchInGraphFunctionVariable  # noqa: E402
@@ -403,6 +416,7 @@ class NPUWorker(WorkerBase):
 
         return int(self.available_kv_cache_memory_bytes)
 
+    @fault_detected_on_exception
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -622,6 +636,7 @@ class NPUWorker(WorkerBase):
     def reset_encoder_cache(self) -> None:
         self.model_runner.reset_encoder_cache()
 
+    @fault_detected_on_exception
     def execute_dummy_batch(self) -> None:
         self.model_runner._dummy_run(num_tokens=self.model_runner.decode_token_per_req, uniform_decode=True)
 

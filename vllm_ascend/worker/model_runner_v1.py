@@ -1131,7 +1131,11 @@ class NPUModelRunner(GPUModelRunner):
         self.prepare_inputs_event.synchronize()
         try:
             yield
-        finally:
+        except:
+            raise RuntimeError(
+                    "prepare_inputs_event record skipped due to fault."
+                )
+        else:
             if get_fault_detected_event().is_set():
                 raise RuntimeError(
                     "prepare_inputs_event record skipped due to detected fault."
