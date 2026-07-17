@@ -353,7 +353,11 @@ class ScaleDownHelper:
         expert_maps = model_runner.shared_dict["expert_maps"]
         if expert_maps is None or (expert_maps.shape == (1, 1, 1) and not expert_maps.any()):
             model_runner.shared_dict["expert_maps"] = self._get_global_expert_map()
+        elif self.model_runner.dynamic_eplb:
+            model_runner.shared_dict["expert_maps"] = model_runner.eplb_adaptor.get_concat_expert_map()
+            model_runner.shared_dict["update_layer_id"] = model_runner.eplb_updator.get_cur_update_layer_id()
 
+        eplb_updator.eplb_process.clear_block_update_q()
         eplb_updator.wakeup_eplb_worker()
         eplb_updator.update_info_all = eplb_updator.eplb_process.block_update_q.get()
         need_load_h2d = model_runner.shared_dict["need_load_h2d"]
@@ -548,20 +552,32 @@ class ScaleDownHelper:
                             _load_single_expert(expert_id=expert_id, target_index=slot_pos)
                     cur_layer_id += 1
 
-    def update_eplb_adaptor_info(self, num_add_experts_per_rank, rank):
+    def update_eplb_info(self, num_add_experts_per_rank, rank):
         model_runner = self.model_runner
+
         model_runner.eplb_adaptor.rank_id = rank
         model_runner.eplb_adaptor.model.clear_all_moe_loads()
         model_runner.shared_dict["moe_load"] = None
+
         model_runner.eplb_updator.cur_iterations = 0
 
+        model_runner.eplb_loader.recv_expert_list = []
+        model_runner.eplb_loader.updated_expert_map = None
+        model_runner.eplb_loader.layer_id = -1
+        from vllm_ascend.eplb.core.eplb_device_transfer_loader import ExpertWeightUpdateState
+
+        model_runner.eplb_loader.state = ExpertWeightUpdateState.WAITING
+
         if num_add_experts_per_rank > 0:
-            model_runner.eplb_adaptor.init_buffer_tensor(num_add_experts_per_rank)
+            model_runner.eplb_adaptor.num_local_experts += num_add_experts_per_rank
+            model_runner.eplb_adaptor.start_init_buffer_tensor()
 
         model_runner.eplb_adaptor.init_expert_param_per_layer()
+
         cur_deployment = model_runner.shared_dict["expert_maps"]
+        num_dense_layers = model_runner.eplb_adaptor.num_dense_layers
         for layer_id in range(cur_deployment.shape[0]):
-            model_runner.eplb_adaptor.do_clone_update_expert_map(layer_id, cur_deployment[layer_id][rank])
+            model_runner.eplb_adaptor.do_clone_update_expert_map(layer_id + num_dense_layers, cur_deployment[layer_id])
 
     def gen_all_layer_log2phy(self, rank):
         all_layer_log2phy = []
@@ -599,6 +615,8 @@ class ScaleDownHelper:
             eplb_loader.update_expert_map_and_weight(reqs)
 
         eplb_updator.update_info_all.clear()
+
+        self.model_runner.shared_dict["expert_maps"] = eplb_adaptor.get_concat_expert_map()
 
         num_mtp_layers = self._get_mtp_num_layers() or 0
         _append_mtp_copies(all_layer_log2phy_map, num_mtp_layers)

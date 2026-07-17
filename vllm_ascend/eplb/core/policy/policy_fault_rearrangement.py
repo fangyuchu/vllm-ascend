@@ -37,22 +37,7 @@ class FaultRearrangement(EplbPolicy):
         self.failed_cards = []
         self.enable_d2d_after_failure = False
         self.rank_id_to_node_id = None
-
-    def get_original_workload(self) -> np.ndarray:
-        workload_new = np.zeros((self.n_layer, self.n_experts))
-        if self.enable_d2d_after_failure:
-            for layer_idx in range(self.n_layer):
-                workload_dict: dict[int, int] = defaultdict(int)
-
-                placement_layer = self.org_deployment[layer_idx].copy()
-                workload_layer = self.org_workload[layer_idx].copy()
-                for card_idx in range(self.n_org_cards):
-                    for index in range(self.n_experts_per_card):
-                        workload_dict[int(placement_layer[card_idx][index])] += workload_layer[card_idx][index]
-                for expert_idx in range(self.n_experts):
-                    workload_new[layer_idx][expert_idx] = workload_dict[expert_idx]
-
-        return workload_new
+        self.update_layer_id = -1
 
     def constraint_expert_local_exchange(
         self, old_deployment: np.ndarray, new_deployment: np.ndarray
@@ -92,11 +77,8 @@ class FaultRearrangement(EplbPolicy):
         return new_deployment_list, old_deployment_list
 
     def rebalance_experts(
-        self, current_expert_table: torch.Tensor, expert_workload: torch.Tensor
+        self, current_expert_table: torch.Tensor, expert_workload: np.ndarray
     ) -> tuple[list[list[list[int]]], list[list[list[int]]], list[defaultdict[int, list[tuple[int, int]]]], int]:
-        if expert_workload is not None:
-            self.org_workload = expert_workload.numpy()
-
         self.org_deployment = current_expert_table.numpy()
 
         self.n_layer, self.n_org_cards, self.n_experts_per_card = self.org_deployment.shape
@@ -107,7 +89,10 @@ class FaultRearrangement(EplbPolicy):
         self.remain_deployment = self.org_deployment[:, mask, :]
         self.n_remain_cards = self.remain_deployment.shape[1]
 
-        layer_workload = self.get_original_workload()
+        if expert_workload is not None:
+            layer_workload = expert_workload.copy()
+        else:
+            layer_workload = np.zeros((self.n_layer, self.n_experts))
 
         if self.n_remain_cards == 0:
             raise ValueError("All cards are faulty, no available cards.")
@@ -130,6 +115,10 @@ class FaultRearrangement(EplbPolicy):
 
             new_deployment, old_deployment, need_load_h2d = self._execute_allocation(cur_layer_deployment, cur_workload)
 
+            if layer_id == self.update_layer_id:
+                need_load_h2d = self.all_expert_load_in_cpu(new_deployment)
+                old_deployment = new_deployment
+
             new_deployment_list, old_deployment_list = self.constraint_expert_local_exchange(
                 old_deployment, new_deployment
             )
@@ -144,6 +133,15 @@ class FaultRearrangement(EplbPolicy):
             all_layer_need_load_h2d,
             self.n_add_expert_per_card,
         )
+
+    def all_expert_load_in_cpu(self, new_deployment):
+        need_load_h2d = defaultdict(list)
+
+        for card_id in range(self.n_remain_cards):
+            for index, expert_id in enumerate(new_deployment[card_id]):
+                need_load_h2d[card_id].append((index, int(expert_id)))
+
+        return need_load_h2d
 
     def expert_exchange_between_ranks(
         self,
@@ -263,15 +261,17 @@ class FaultRearrangement(EplbPolicy):
                 node_id = self.rank_id_to_node_id[card_id]
                 node_cards[node_id].append(card_id)
 
-        for cards in node_cards.values():
-            cards.sort(key=lambda c: len(redundant_expert_pos[c]), reverse=True)
+        for node_id in node_cards:
+            node_cards[node_id].sort(key=lambda c: (-len(redundant_expert_pos[c]), c))
 
         active_nodes = sorted(
-            node_cards.keys(), key=lambda n: sum(len(redundant_expert_pos[c]) for c in node_cards[n]), reverse=True
+            node_cards.keys(), key=lambda n: (-sum(len(redundant_expert_pos[c]) for c in node_cards[n]), n)
         )
         node_idx = 0
 
         need_load_h2d = defaultdict(list)
+
+        no_backup_experts.sort()
 
         while no_backup_experts and active_nodes:
             node_id = active_nodes[node_idx]
@@ -378,7 +378,8 @@ class FaultRearrangement(EplbPolicy):
                     n_exist_experts[expert_id] += 1
 
         num_redundant_experts = int(np.sum(np.maximum(n_exist_experts - 1, 0)))
-        sorted_expert_ids = np.argsort(n_exist_experts)
+        eid_arr = np.arange(self.n_experts)
+        sorted_expert_ids = np.lexsort((eid_arr, n_exist_experts))
 
         rank_route_expert = defaultdict(set)
         n_expert_per_rank = np.zeros(self.n_experts)

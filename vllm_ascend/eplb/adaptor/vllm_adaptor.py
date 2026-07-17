@@ -36,14 +36,13 @@ class VllmEplbAdaptor:
         self.num_moe_layers = self.model.config.num_hidden_layers - self.num_dense_layers
 
         self.expert_map_per_layer_cpu = dict()  # copy of expert map on CPU to avoid device synchronize frequently
+        self.global_expert_map_per_layer_cpu = dict()
 
         self.num_local_experts = self.model.model.layers[-1].mlp.experts.local_num_experts
         self.expert_param_per_layer = dict()
         self.init_expert_param_per_layer()
 
-        num_buffer_tensor = self.num_local_experts
-        self.buffer_tensor_list: list[list[Any]] = [[] for _ in range(num_buffer_tensor)]
-        self.init_buffer_tensor(num_buffer_tensor)
+        self.start_init_buffer_tensor()
 
         self.log2phy_map_per_layer = dict()
         for layer_idx in range(self.num_moe_layers):
@@ -58,6 +57,11 @@ class VllmEplbAdaptor:
                 expert_tensor = self.param_dict[complete_name][0]
                 buffer_tensor = torch.empty_like(expert_tensor)
                 self.buffer_tensor_list[buffer_id].append(buffer_tensor)
+
+    def start_init_buffer_tensor(self):
+        num_buffer_tensor = self.num_local_experts
+        self.buffer_tensor_list: list[list[Any]] = [[] for _ in range(num_buffer_tensor)]
+        self.init_buffer_tensor(num_buffer_tensor)
 
     def init_expert_param_per_layer(self):
         self.param_dict = dict()
@@ -121,10 +125,12 @@ class VllmEplbAdaptor:
                 json.dump(record, f, indent=4)
 
     def do_update_expert_map(self, layer_id, updated_expert_map):
-        self.expert_map_per_layer_cpu[layer_id].copy_(updated_expert_map)
+        self.expert_map_per_layer_cpu[layer_id].copy_(updated_expert_map[self.rank_id])
+        self.global_expert_map_per_layer_cpu[layer_id].copy_(updated_expert_map)
 
     def do_clone_update_expert_map(self, layer_id, updated_expert_map):
-        self.expert_map_per_layer_cpu[layer_id] = updated_expert_map.clone()
+        self.expert_map_per_layer_cpu[layer_id] = updated_expert_map[self.rank_id].clone()
+        self.global_expert_map_per_layer_cpu[layer_id] = updated_expert_map.clone()
 
     def do_update_expert_weight(self, layer_id, local_expert_to_replace, buffer_tensor_id):
         for expert_tensor, buffer_tensor in zip(
@@ -143,5 +149,14 @@ class VllmEplbAdaptor:
             map_cpu = self.model.model.layers[self.num_dense_layers + layer_id].mlp.experts.global_expert_map.cpu()
             all_layer_global_expert_map.append(map_cpu)
             self.expert_map_per_layer_cpu[self.num_dense_layers + layer_id] = map_cpu[self.rank_id]
+            self.global_expert_map_per_layer_cpu[self.num_dense_layers + layer_id] = map_cpu.clone()
 
         return torch.stack(all_layer_global_expert_map)
+
+    def get_concat_expert_map(self):
+        tensor_list = [
+            self.global_expert_map_per_layer_cpu[layer_id + self.num_dense_layers]
+            for layer_id in range(self.num_moe_layers)
+        ]
+        cur_global_expert_map = torch.stack(tensor_list)
+        return cur_global_expert_map

@@ -186,7 +186,7 @@ class NPUWorkerSentinel(BaseSentinel):
 
         # Phase 3：EPLB adaptor update
         if get_ascend_config().eplb_config.dynamic_eplb:
-            scale_down_helper.update_eplb_adaptor_info(num_add_experts_per_rank, new_dp_rank)
+            scale_down_helper.update_eplb_info(num_add_experts_per_rank, new_dp_rank)
 
         # Phase 4: Log2phy map generation
         if enable_d2d_rebalance:

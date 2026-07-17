@@ -35,6 +35,7 @@ class EplbUpdator:
         self.eplb_loader = loader
         self.eplb_process = eplb_process
         self.shared_dict = self.eplb_process.shared_dict
+        self.before_weight_transfer = False
 
     def set_adaptor(self, adaptor: VllmEplbAdaptor):
         self.adaptor = adaptor
@@ -73,6 +74,7 @@ class EplbUpdator:
 
     def update_iteration(self):
         self.cur_iterations += 1
+        self.before_weight_transfer = False
         if self.cur_iterations == (
             self.expert_heat_collection_interval + self.algorithm_execution_interval + self.num_moe_layers
         ):
@@ -94,10 +96,25 @@ class EplbUpdator:
         )
         return weight_update_counter >= 0 and weight_update_counter < self.num_moe_layers
 
+    def get_cur_update_layer_id(self):
+        weight_update_counter = self.cur_iterations - (
+            self.expert_heat_collection_interval + self.algorithm_execution_interval
+        )
+        if weight_update_counter >= 0 and weight_update_counter < self.num_moe_layers:
+            if self.before_weight_transfer:
+                return weight_update_counter
+            else:
+                return weight_update_counter - 1
+        if self.cur_iterations == 0 and not self.before_weight_transfer:
+            return self.num_moe_layers - 1
+        return -1
+
     def wakeup_eplb_worker(self):
         self.eplb_process.planner_q.put(1)
 
     def forward_before(self):
+        self.before_weight_transfer = True
+
         # Batch after eplb process being triggered, get update info provided by eplb process
         if self.get_update_info_flag():
             self.update_info_all = self.eplb_process.block_update_q.get()
@@ -107,11 +124,11 @@ class EplbUpdator:
             )
             log2phy_map_this_rank = torch.from_numpy(numpy.array(log2phy_map))
             self.eplb_loader.set_log2phy_map(log2phy_map_this_rank)
-            updated_expert_map_this_rank = torch.from_numpy(numpy.array(updated_expert_map))
+            global_updated_expert_map = torch.from_numpy(numpy.array(updated_expert_map))
             self.eplb_loader.generate_expert_d2d_transfer_task(
                 expert_send_info,
                 expert_recv_info,
-                updated_expert_map_this_rank,
+                global_updated_expert_map,
                 layer_id + self.adaptor.num_dense_layers,
             )
 

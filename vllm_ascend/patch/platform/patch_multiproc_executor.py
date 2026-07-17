@@ -275,7 +275,7 @@ class AscendWorkerProc(WorkerProc):
         daemon_mode = not (
             os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1")
             or os.getenv("EXPERT_MAP_RECORD", "false") == "true"
-            or vllm_config.parallel_config.enable_fault_tolerance
+            or os.getenv("FAULT_EPLB_ENABLE", "false").lower() in ("true", "1")
         )
         proc = context.Process(
             target=AscendWorkerProc.worker_main,
