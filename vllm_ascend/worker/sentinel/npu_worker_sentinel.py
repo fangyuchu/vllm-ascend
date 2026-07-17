@@ -33,19 +33,8 @@ def get_pause_event() -> threading.Event:
     return _GLOBAL_PAUSE_EVENT
 
 
-def is_fault_detected() -> bool:
-    """Check if a fault is detected."""
-    return _GLOBAL_FAULT_DETECTED.is_set()
-
-
-def set_fault_detected() -> None:
-    """Mark a fault detected."""
-    _GLOBAL_FAULT_DETECTED.set()
-
-
-def clear_fault_detected() -> None:
-    """Clear fault detected."""
-    _GLOBAL_FAULT_DETECTED.clear()
+def get_fault_detected_event() -> threading.Event:
+    return _GLOBAL_FAULT_DETECTED
 
 
 def evaluate_pause_condition() -> None:
@@ -243,6 +232,7 @@ class NPUWorkerSentinel(BaseSentinel):
 
     def clean_states(self):
         get_pause_event().clear()
+        get_fault_detected_event().clear()
         # clean device states
         NPUPlatform.set_device(self.device)
         torch_npu.npu.stop_device(self.device.index)

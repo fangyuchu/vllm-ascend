@@ -33,7 +33,7 @@ from vllm.v1.executor.multiproc_executor import (
 from vllm.v1.outputs import AsyncModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
-from vllm_ascend.worker.sentinel.npu_worker_sentinel import set_fault_detected
+from vllm_ascend.worker.sentinel.npu_worker_sentinel import get_fault_detected_event
 
 logger = init_logger(__name__)
 
@@ -314,7 +314,7 @@ class AscendWorkerProc(WorkerProc):
                 output = e
 
         if isinstance(output, Exception):
-            set_fault_detected()
+            get_fault_detected_event().set()
             result = (WorkerProc.ResponseStatus.FAILURE, str(output))
         else:
             result = (WorkerProc.ResponseStatus.SUCCESS, output)
@@ -334,7 +334,7 @@ class AscendWorkerProc(WorkerProc):
 
                 output = func(*args, **kwargs)
             except Exception as e:
-                set_fault_detected()
+                get_fault_detected_event().set()
                 # Notes have been introduced in python 3.11
                 if hasattr(e, "add_note"):
                     e.add_note(traceback.format_exc())
