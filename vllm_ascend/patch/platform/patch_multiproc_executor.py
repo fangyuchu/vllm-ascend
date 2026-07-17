@@ -13,7 +13,6 @@ from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
 from vllm.envs import enable_envs_cache
-from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.tracing import instrument
 from vllm.utils.network_utils import get_distributed_init_method, get_loopback_ip, get_open_port
@@ -27,8 +26,6 @@ from vllm.v1.executor.multiproc_executor import (
     set_multiprocessing_worker_envs,
 )
 from vllm.v1.worker.worker_base import WorkerWrapperBase
-
-logger = init_logger(__name__)
 
 
 class AscendMultiprocExecutor(MultiprocExecutor):
