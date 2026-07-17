@@ -81,6 +81,7 @@ def fault_detected_on_exception(func):
 
     return wrapper
 
+
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
 from torch._dynamo.variables import TorchInGraphFunctionVariable  # noqa: E402
 from vllm.utils.torch_utils import set_random_seed  # noqa: E402

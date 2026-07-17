@@ -5,10 +5,8 @@ import queue
 import weakref
 from collections import deque
 from collections.abc import Callable
-from functools import partial
 from multiprocessing.synchronize import Lock as LockType
 from threading import Thread
-from typing import Any
 
 import vllm.v1.executor.multiproc_executor
 from vllm import envs
