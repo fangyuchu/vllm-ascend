@@ -2,17 +2,22 @@ from __future__ import annotations
 
 import os
 import queue
+import traceback
 import weakref
 from collections import deque
 from collections.abc import Callable
+from functools import partial
 from multiprocessing.synchronize import Lock as LockType
 from threading import Thread
+from typing import Any
 
+import cloudpickle
 import vllm.v1.executor.multiproc_executor
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
 from vllm.envs import enable_envs_cache
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.tracing import instrument
 from vllm.utils.network_utils import get_distributed_init_method, get_loopback_ip, get_open_port
@@ -25,7 +30,12 @@ from vllm.v1.executor.multiproc_executor import (
     WorkerProc,
     set_multiprocessing_worker_envs,
 )
+from vllm.v1.outputs import AsyncModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerWrapperBase
+
+from vllm_ascend.worker.sentinel.npu_worker_sentinel import set_fault_detected
+
+logger = init_logger(__name__)
 
 
 class AscendMultiprocExecutor(MultiprocExecutor):
@@ -291,6 +301,52 @@ class AscendWorkerProc(WorkerProc):
         # Keep death_writer open in parent - when parent exits,
         # death_reader in child will get EOFError
         return UnreadyWorkerProcHandle(proc, rank, ready_reader, death_writer)
+
+    def enqueue_output(self, output: Any):
+        """Prepares output from the worker and enqueues it to the
+        worker_response_mq. If the output is an Exception, it is
+        converted to a FAILURE response.
+        """
+        if isinstance(output, AsyncModelRunnerOutput):
+            try:
+                output = output.get_output()
+            except Exception as e:
+                output = e
+
+        if isinstance(output, Exception):
+            set_fault_detected()
+            result = (WorkerProc.ResponseStatus.FAILURE, str(output))
+        else:
+            result = (WorkerProc.ResponseStatus.SUCCESS, output)
+        if (response_mq := self.worker_response_mq) is not None:
+            response_mq.enqueue(result)
+
+    def worker_busy_loop(self):
+        """Main busy loop for Multiprocessing Workers"""
+        assert self.rpc_broadcast_mq is not None
+        while True:
+            method, args, kwargs, output_rank = self.rpc_broadcast_mq.dequeue(indefinite=True)
+            try:
+                if isinstance(method, str):
+                    func = getattr(self.worker, method)
+                elif isinstance(method, bytes):
+                    func = partial(cloudpickle.loads(method), self.worker)
+
+                output = func(*args, **kwargs)
+            except Exception as e:
+                set_fault_detected()
+                # Notes have been introduced in python 3.11
+                if hasattr(e, "add_note"):
+                    e.add_note(traceback.format_exc())
+                logger.exception("WorkerProc hit an exception.")
+                # exception might not be serializable, so we convert it to
+                # string, only for logging purpose.
+                if output_rank is None or self.rank == output_rank:
+                    self.handle_output(e)
+                continue
+
+            if output_rank is None or self.rank == output_rank:
+                self.handle_output(output)
 
 
 vllm.v1.executor.multiproc_executor.MultiprocExecutor = AscendMultiprocExecutor
