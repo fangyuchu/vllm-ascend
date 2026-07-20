@@ -1,7 +1,6 @@
-import contextlib
 import socket
 import struct
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from copy import copy
 from datetime import timedelta
 from typing import TYPE_CHECKING
@@ -49,25 +48,21 @@ QUANT_WEIGHT_SUFFIXES = {
     "gate_proj.weight_scale",
 }
 # model_type → MTP weight path template mapping
-_MTP_WEIGHT_PATH_TEMPLATES: dict[frozenset[str], str] = {
-    frozenset(
-        {
-            "nemotron_h",
-            "nemotron_h_mtp",
-            "qwen3_next",
-            "qwen3_next_mtp",
-            "qwen3_5",
-            "qwen3_5_moe",
-            "qwen3_5_mtp",
-            "exaone_moe",
-            "exaone_moe_mtp",
-        }
-    ): "mtp.layers.{idx}.mlp.experts.{eid}.{suffix}",
-    frozenset({"glm_moe_dsa"}): "model.layers.{layer_id}.mlp.experts.{eid}.{suffix}",
-    frozenset({"longcat_flash", "longcat_flash_mtp"}): (
-        "model.mtp.layers.{idx}.transformer_layer.mlp.experts.{eid}.{suffix}"
-    ),
-    frozenset({"ernie4_5_moe", "ernie_mtp"}): "model.mtp_block.0.mlp.experts.{eid}.{suffix}",
+_MTP_WEIGHT_PATH_TEMPLATES: dict[str, str] = {
+    "nemotron_h": "mtp.layers.{idx}.mlp.experts.{eid}.{suffix}",
+    "nemotron_h_mtp": "mtp.layers.{idx}.mlp.experts.{eid}.{suffix}",
+    "qwen3_next": "mtp.layers.{idx}.mlp.experts.{eid}.{suffix}",
+    "qwen3_next_mtp": "mtp.layers.{idx}.mlp.experts.{eid}.{suffix}",
+    "qwen3_5": "mtp.layers.{idx}.mlp.experts.{eid}.{suffix}",
+    "qwen3_5_moe": "mtp.layers.{idx}.mlp.experts.{eid}.{suffix}",
+    "qwen3_5_mtp": "mtp.layers.{idx}.mlp.experts.{eid}.{suffix}",
+    "exaone_moe": "mtp.layers.{idx}.mlp.experts.{eid}.{suffix}",
+    "exaone_moe_mtp": "mtp.layers.{idx}.mlp.experts.{eid}.{suffix}",
+    "glm_moe_dsa": "model.layers.{layer_id}.mlp.experts.{eid}.{suffix}",
+    "longcat_flash": "model.mtp.layers.{idx}.transformer_layer.mlp.experts.{eid}.{suffix}",
+    "longcat_flash_mtp": "model.mtp.layers.{idx}.transformer_layer.mlp.experts.{eid}.{suffix}",
+    "ernie4_5_moe": "model.mtp_block.0.mlp.experts.{eid}.{suffix}",
+    "ernie_mtp": "model.mtp_block.0.mlp.experts.{eid}.{suffix}",
 }
 
 
@@ -102,108 +97,10 @@ def _get_mtp_weight_path(
     expert_id: int,
     suffix: str,
 ) -> str:
-    """Look up the MTP weight path template for the given model_type."""
-    for model_types, template in _MTP_WEIGHT_PATH_TEMPLATES.items():
-        if model_type in model_types:
-            return template.format(
-                idx=mtp_local_idx,
-                layer_id=layer_id,
-                eid=expert_id,
-                suffix=suffix,
-            )
+    template = _MTP_WEIGHT_PATH_TEMPLATES.get(model_type)
+    if template is not None:
+        return template.format(idx=mtp_local_idx, layer_id=layer_id, eid=expert_id, suffix=suffix)
     return f"model.layers.{layer_id}.mlp.experts.{expert_id}.{suffix}"
-
-
-def distribute_experts(global_num_expert: int, ep_size: int) -> dict[int, list[int]]:
-    distribution = {}
-    base = global_num_expert // ep_size
-    remainder = global_num_expert % ep_size
-
-    start_index = 0
-    for rank in range(ep_size):
-        num = base + (1 if rank < remainder else 0)
-        expert_ids = list(range(start_index, start_index + num))
-        distribution[rank] = expert_ids
-        start_index += num
-    return distribution
-
-
-def gen_global_log2phy_map(
-    num_logical_experts: int, num_npu: int, redundant_expert_list: list[int]
-) -> dict[int, list[int]]:
-    num_redundant_experts = len(redundant_expert_list)
-    assert (num_logical_experts + num_redundant_experts) % num_npu == 0, (
-        "the physical expert count must evenly divide across NPUs"
-    )
-    num_phy_exp_per_npu = (num_logical_experts + num_redundant_experts) // num_npu
-
-    # How many physical experts per NPU after placing redundancy
-    exp_distribution_without_redundancy = distribute_experts(num_logical_experts, num_npu)
-    num_routed_experts_list = []
-    num_redundant_experts_list = []
-    for rank in range(num_npu):
-        num_routed_experts_list.append(len(exp_distribution_without_redundancy[rank]))
-        num_redundant_experts_list.append(num_phy_exp_per_npu - len(exp_distribution_without_redundancy[rank]))
-
-    # Mapping: logical expert -> list of physical expert IDs assigned
-    global_log2phy_map: dict[int, list[int]] = {log_expert_id: [] for log_expert_id in range(num_logical_experts)}
-    log_experts_iter = iter(range(num_logical_experts))
-
-    global_pos = 0
-    re_exp_assign_map = [[exp_id, False] for exp_id in redundant_expert_list]
-
-    for rank in range(num_npu):
-        local_expert_map = []
-        for _ in range(num_routed_experts_list[rank]):
-            expert_id = next(log_experts_iter)
-            global_log2phy_map[expert_id].insert(0, global_pos)
-            global_pos += 1
-            local_expert_map.append(expert_id)
-
-        for _ in range(num_redundant_experts_list[rank]):
-            success = False
-            for i in range(len(re_exp_assign_map)):
-                eid, assigned = re_exp_assign_map[i]
-                if assigned:
-                    continue
-                if eid in local_expert_map:
-                    continue
-                global_log2phy_map[eid].append(global_pos)
-                global_pos += 1
-                local_expert_map.append(eid)
-                re_exp_assign_map[i][1] = True
-                success = True
-                break
-            if not success:
-                raise RuntimeError(
-                    "expert placement aborted. The distribution of redundant experts cannot"
-                    "satisfy the requirement that physical replicas of each logical expert are properly replicated."
-                )
-    return global_log2phy_map
-
-
-def init_global_expert_distribution(global_log2phy_map: dict[int, list[int]], ep_size: int) -> dict[int, list[int]]:
-    num_phy_experts = sum(map(len, global_log2phy_map.values()))
-    num_phy_exp_per_npu = num_phy_experts // ep_size
-    global_expert_distribution = {i: [-1 for _ in range(num_phy_exp_per_npu)] for i in range(ep_size)}
-    for log_eid, phy_expert_pos in global_log2phy_map.items():
-        for pos in phy_expert_pos:
-            rank = pos // num_phy_exp_per_npu
-            local_pos = pos - rank * num_phy_exp_per_npu
-            global_expert_distribution[rank][local_pos] = log_eid
-    return global_expert_distribution
-
-
-def generate_redundant_expert_ids(num_experts: int, ep_size: int, num_redundant_experts: int) -> list[int]:
-    assert num_redundant_experts % ep_size == 0
-    experts_per_ep_group = num_experts // ep_size
-    redundant_per_group = num_redundant_experts // ep_size
-    redundant_ids = []
-    for rank in range(ep_size):
-        start_id = rank * experts_per_ep_group
-        for i in range(redundant_per_group):
-            redundant_ids.append(start_id + i)
-    return redundant_ids
 
 
 def init_ep2dp_map(dp_size: int, tp_size: int) -> dict[int, int]:
@@ -214,37 +111,6 @@ def init_ep2dp_map(dp_size: int, tp_size: int) -> dict[int, int]:
         for ep_rank in range(ep_start, ep_end):
             ep2dp_map[ep_rank] = dp_rank
     return ep2dp_map
-
-
-def update_ep2dp_map(
-    ep2dp_map: dict[int, int],
-    excluded_dp_ranks: list[int],
-    rank_mapping: dict[int, int],
-) -> dict[int, int]:
-    for old_ep_rank, dp_rank in ep2dp_map.items():
-        if dp_rank != -1:
-            if dp_rank in excluded_dp_ranks:
-                ep2dp_map[old_ep_rank] = -1
-            else:
-                ep2dp_map[old_ep_rank] = rank_mapping[dp_rank]
-    return ep2dp_map
-
-
-def update_parallel_config(original_config: VllmConfig, update_config: dict[str, int]) -> None:
-    required_keys = {
-        "data_parallel_size",
-        "data_parallel_size_local",
-        "data_parallel_rank",
-        "data_parallel_master_port",
-    }
-    missing_keys = required_keys - set(update_config.keys())
-    if missing_keys:
-        raise ValueError(f"update parallel config failed missing keys: {missing_keys}")
-
-    original_config.parallel_config.data_parallel_size = update_config["data_parallel_size"]
-    original_config.parallel_config.data_parallel_size_local = update_config["data_parallel_size_local"]
-    original_config.parallel_config.data_parallel_rank = update_config["data_parallel_rank"]
-    original_config.parallel_config.data_parallel_master_port = update_config["data_parallel_master_port"]
 
 
 def init_elastic_info(
@@ -265,44 +131,6 @@ def init_elastic_info(
 
     elastic_info = torch.cat([base_config, table1, table2], dim=0).npu().contiguous()
     elastic_info.requires_grad_(False)
-    set_elastic_info(elastic_info)
-
-
-def update_elastic_info(
-    elastic_info: torch.Tensor,
-    expert_num: int,
-    raw_ep_size: int,
-    ep2dp: dict[int, int],
-    share_expert_num: int = 0,
-) -> None:
-    if elastic_info is None:
-        elastic_info = torch.full((4 + 2 * raw_ep_size,), -1, dtype=torch.int32).npu().contiguous()
-    raw_ep_ranks = sorted(ep2dp.keys())
-    valid_ep_ranks = [ep for ep in raw_ep_ranks if ep2dp[ep] != -1]
-    scaled_down_ep_size = len(valid_ep_ranks)
-    is_scaled_down = 1 if scaled_down_ep_size < raw_ep_size else 0
-
-    # Table1: epRankID -> localEpRankId(-1 indicates invalid）
-    table1 = torch.full((raw_ep_size,), -1, dtype=torch.int32, device="cpu")
-    for local_ep_rank, ep_rank in enumerate(valid_ep_ranks):
-        table1[ep_rank] = local_ep_rank
-
-    # Table2: localEpRankId -> epRankID(-1 indicates padding）
-    table2 = torch.full((raw_ep_size,), -1, dtype=torch.int32, device="cpu")
-    for local_ep_rank, ep_rank in enumerate(valid_ep_ranks):
-        if local_ep_rank < scaled_down_ep_size:
-            table2[local_ep_rank] = ep_rank
-
-    # update elastic_info
-    new_elastic_info_cpu = torch.cat(
-        [
-            torch.tensor([is_scaled_down, scaled_down_ep_size, share_expert_num, expert_num], dtype=torch.int32),
-            table1,
-            table2,
-        ],
-        dim=0,
-    )
-    elastic_info.copy_(new_elastic_info_cpu)
     set_elastic_info(elastic_info)
 
 
@@ -608,13 +436,49 @@ class ScaleDownHelper:
         return all_layer_log2phy_map
 
     def update_parallel_config(self, update_config: dict[str, int]) -> None:
-        update_parallel_config(self.vllm_config, update_config)
+        required_keys = {
+            "data_parallel_size",
+            "data_parallel_size_local",
+            "data_parallel_rank",
+            "data_parallel_master_port",
+        }
+        missing_keys = required_keys - set(update_config.keys())
+        if missing_keys:
+            raise ValueError(f"update parallel config failed missing keys: {missing_keys}")
+        pc = self.vllm_config.parallel_config
+        pc.data_parallel_size = update_config["data_parallel_size"]
+        pc.data_parallel_size_local = update_config["data_parallel_size_local"]
+        pc.data_parallel_rank = update_config["data_parallel_rank"]
+        pc.data_parallel_master_port = update_config["data_parallel_master_port"]
 
     def update_ep2dp_map(self, ep2dp_map, excluded_dp_ranks, rank_mapping):
-        return update_ep2dp_map(ep2dp_map, excluded_dp_ranks, rank_mapping)
+        for old_ep_rank, dp_rank in ep2dp_map.items():
+            if dp_rank != -1:
+                ep2dp_map[old_ep_rank] = -1 if dp_rank in excluded_dp_ranks else rank_mapping[dp_rank]
+        return ep2dp_map
 
     def update_elastic_info(self, elastic_info, expert_num, raw_ep_size, ep2dp, share_expert_num: int = 0):
-        update_elastic_info(elastic_info, expert_num, raw_ep_size, ep2dp, share_expert_num)
+        if elastic_info is None:
+            elastic_info = torch.full((4 + 2 * raw_ep_size,), -1, dtype=torch.int32).npu().contiguous()
+        valid_ep_ranks = [ep for ep in sorted(ep2dp) if ep2dp[ep] != -1]
+        scaled_down_ep_size = len(valid_ep_ranks)
+        is_scaled_down = 1 if scaled_down_ep_size < raw_ep_size else 0
+        table1 = torch.full((raw_ep_size,), -1, dtype=torch.int32, device="cpu")
+        table2 = torch.full((raw_ep_size,), -1, dtype=torch.int32, device="cpu")
+        for local_ep_rank, ep_rank in enumerate(valid_ep_ranks):
+            table1[ep_rank] = local_ep_rank
+            if local_ep_rank < scaled_down_ep_size:
+                table2[local_ep_rank] = ep_rank
+        new_elastic_info_cpu = torch.cat(
+            [
+                torch.tensor([is_scaled_down, scaled_down_ep_size, share_expert_num, expert_num], dtype=torch.int32),
+                table1,
+                table2,
+            ],
+            dim=0,
+        )
+        elastic_info.copy_(new_elastic_info_cpu)
+        set_elastic_info(elastic_info)
 
     def destroy_comm_group(self) -> None:
         get_dp_group().destroy_cpu_group()
@@ -622,63 +486,91 @@ class ScaleDownHelper:
             get_dynamic_eplb_group().destroy_cpu_group()
 
     def init_dp_cpu_group(self, coord_store, group_type="normal") -> None:
-        init_dp_cpu_group_impl(self.vllm_config, coord_store, group_type)
-
-    def reconfigure_moe(self, num_logical_expert, num_new_phy_experts, all_layer_log2phy):
-        reconfigure_moe(
-            self.model_runner,
-            self.vllm_config,
-            num_logical_expert,
-            num_new_phy_experts,
-            all_layer_log2phy,
-        )
-
-
-def init_dp_cpu_group_impl(vllm_config: VllmConfig, coord_store, group_type="normal") -> None:
-    """Initialize DP CPU group using TCP store for port coordination."""
-    listen_sockets = []
-    ports = []
-    if vllm_config.parallel_config.data_parallel_rank == 0:
-        for i in range(2):
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.bind((vllm_config.parallel_config.data_parallel_master_ip, 0))
-            sock.listen()
-            listen_sockets.append(sock)
-            ports.append(sock.getsockname()[1])
-        coord_store.set(STORE_KEY, struct.pack(_PORTS_FMT, *ports))
-    else:
-        ports = list(struct.unpack(_PORTS_FMT, coord_store.get(STORE_KEY)))
+        vllm_config = self.vllm_config
         listen_sockets = []
-
-    timeout = timedelta(seconds=vllm_config.parallel_config.gloo_timeout_seconds)
-
-    eplb_port, dp_port = ports
-    if get_ascend_config().eplb_config.dynamic_eplb:
-        get_dynamic_eplb_group().cpu_group = stateless_init_torch_distributed_process_group(
+        ports = []
+        if vllm_config.parallel_config.data_parallel_rank == 0:
+            for i in range(2):
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.bind((vllm_config.parallel_config.data_parallel_master_ip, 0))
+                sock.listen()
+                listen_sockets.append(sock)
+                ports.append(sock.getsockname()[1])
+            coord_store.set(STORE_KEY, struct.pack(_PORTS_FMT, *ports))
+        else:
+            ports = list(struct.unpack(_PORTS_FMT, coord_store.get(STORE_KEY)))
+        timeout = timedelta(seconds=vllm_config.parallel_config.gloo_timeout_seconds)
+        eplb_port, dp_port = ports
+        if get_ascend_config().eplb_config.dynamic_eplb:
+            get_dynamic_eplb_group().cpu_group = stateless_init_torch_distributed_process_group(
+                vllm_config.parallel_config.data_parallel_master_ip,
+                eplb_port,
+                vllm_config.parallel_config.data_parallel_rank,
+                vllm_config.parallel_config.data_parallel_size,
+                listen_socket=listen_sockets[0] if listen_sockets else None,
+                backend="gloo",
+                group_name=_get_unique_name("eplb_group"),
+            )
+            _set_pg_timeout(timeout=timeout, group=get_dynamic_eplb_group().cpu_group)
+        get_dp_group().cpu_group = stateless_init_torch_distributed_process_group(
             vllm_config.parallel_config.data_parallel_master_ip,
-            eplb_port,
+            dp_port,
             vllm_config.parallel_config.data_parallel_rank,
             vllm_config.parallel_config.data_parallel_size,
-            listen_socket=listen_sockets[0] if listen_sockets else None,
             backend="gloo",
-            group_name=_get_unique_name("eplb_group"),
+            listen_socket=listen_sockets[1] if listen_sockets else None,
+            group_name=_get_unique_name("dp_group"),
         )
-        _set_pg_timeout(timeout=timeout, group=get_dynamic_eplb_group().cpu_group)
+        _set_pg_timeout(timeout=timeout, group=get_dp_group().cpu_group)
+        for sock in listen_sockets:
+            with suppress(OSError):
+                sock.close()
 
-    get_dp_group().cpu_group = stateless_init_torch_distributed_process_group(
-        vllm_config.parallel_config.data_parallel_master_ip,
-        dp_port,
-        vllm_config.parallel_config.data_parallel_rank,
-        vllm_config.parallel_config.data_parallel_size,
-        backend="gloo",
-        listen_socket=listen_sockets[1] if listen_sockets else None,
-        group_name=_get_unique_name("dp_group"),
-    )
-    _set_pg_timeout(timeout=timeout, group=get_dp_group().cpu_group)
+    def reconfigure_moe(self, num_logical_expert, num_new_phy_experts, all_layer_log2phy):
+        import vllm.envs as envs
 
-    for sock in listen_sockets:
-        with contextlib.suppress(OSError):
-            sock.close()
+        model_runner = self.model_runner
+        vllm_config = self.vllm_config
+        parallel_config = vllm_config.parallel_config
+        new_ep_size = parallel_config.data_parallel_size * parallel_config.tensor_parallel_size
+        get_ascend_config().eplb_config.num_redundant_experts = num_new_phy_experts - num_logical_expert
+        moe_modules = [module for module in model_runner.get_model().modules() if isinstance(module, FusedMoE)]
+        draft_model = getattr(getattr(model_runner, "drafter", None), "model", None)
+        if draft_model is not None:
+            moe_modules.extend(module for module in draft_model.modules() if isinstance(module, FusedMoE))
+        for cur_layer_id, module in enumerate(moe_modules):
+            module.local_num_experts = num_new_phy_experts // new_ep_size
+            module.global_num_experts = num_new_phy_experts
+            module.global_redundant_expert_num = num_new_phy_experts - num_logical_expert
+            module.moe_parallel_config = FusedMoEParallelConfig.make(
+                tp_size_=get_tp_group().world_size,
+                pcp_size_=get_pcp_group().world_size,
+                dp_size_=get_dp_group().world_size,
+                vllm_parallel_config=parallel_config,
+                sp_size_=module.sp_size,
+            )
+            module.moe_config = FusedMoEConfig(
+                num_experts=module.global_num_experts,
+                experts_per_token=module.top_k,
+                hidden_dim=module.hidden_size,
+                intermediate_size_per_partition=module.intermediate_size_per_partition,
+                num_local_experts=module.local_num_experts,
+                num_logical_experts=num_logical_expert,
+                moe_parallel_config=module.moe_parallel_config,
+                in_dtype=module.vllm_config.model_config.dtype,
+                router_logits_dtype=None,
+                max_num_tokens=envs.VLLM_MOE_DP_CHUNK_SIZE,
+                has_bias=False,
+                is_act_and_mul=True,
+                is_lora_enabled=module.vllm_config.lora_config is not None,
+                activation=module.activation,
+                device=module.vllm_config.device_config.device,
+                routing_method=module.routing_method_type,
+            )
+            module.moe_config.num_experts = module.global_num_experts
+            module.moe_config.num_local_experts = module.local_num_experts
+            module.moe_config.global_redundant_expert_num = module.global_redundant_expert_num
+            module.log2phy.copy_(all_layer_log2phy[cur_layer_id].npu(), non_blocking=True)
 
 
 @contextmanager
@@ -721,57 +613,3 @@ def patch_get_all_weights(
         yield
     finally:
         DefaultModelLoader.get_all_weights = original_get_all_weights
-
-
-def reconfigure_moe(
-    model_runner: NPUModelRunner,
-    vllm_config: VllmConfig,
-    num_global_logical_experts: int,
-    num_global_new_phy_experts: int,
-    log2phy: torch.Tensor,
-):
-    import vllm.envs as envs
-
-    parallel_config = vllm_config.parallel_config
-    new_ep_size = parallel_config.data_parallel_size * parallel_config.tensor_parallel_size
-    get_ascend_config().eplb_config.num_redundant_experts = num_global_new_phy_experts - num_global_logical_experts
-
-    moe_modules = [module for module in model_runner.get_model().modules() if isinstance(module, FusedMoE)]
-    draft_model = getattr(getattr(model_runner, "drafter", None), "model", None)
-    if draft_model is not None:
-        moe_modules.extend(module for module in draft_model.modules() if isinstance(module, FusedMoE))
-
-    for cur_layer_id, module in enumerate(moe_modules):
-        module.local_num_experts = num_global_new_phy_experts // new_ep_size
-        module.global_num_experts = num_global_new_phy_experts
-        module.global_redundant_expert_num = num_global_new_phy_experts - num_global_logical_experts
-        sp_size = module.sp_size
-        module.moe_parallel_config = FusedMoEParallelConfig.make(
-            tp_size_=get_tp_group().world_size,
-            pcp_size_=get_pcp_group().world_size,
-            dp_size_=get_dp_group().world_size,
-            vllm_parallel_config=parallel_config,
-            sp_size_=sp_size,
-        )
-        module.moe_config = FusedMoEConfig(
-            num_experts=module.global_num_experts,
-            experts_per_token=module.top_k,
-            hidden_dim=module.hidden_size,
-            intermediate_size_per_partition=module.intermediate_size_per_partition,
-            num_local_experts=module.local_num_experts,
-            num_logical_experts=num_global_logical_experts,
-            moe_parallel_config=module.moe_parallel_config,
-            in_dtype=module.vllm_config.model_config.dtype,
-            router_logits_dtype=None,
-            max_num_tokens=envs.VLLM_MOE_DP_CHUNK_SIZE,
-            has_bias=False,
-            is_act_and_mul=True,
-            is_lora_enabled=module.vllm_config.lora_config is not None,
-            activation=module.activation,
-            device=module.vllm_config.device_config.device,
-            routing_method=module.routing_method_type,
-        )
-        module.moe_config.num_experts = module.global_num_experts
-        module.moe_config.num_local_experts = module.local_num_experts
-        module.moe_config.global_redundant_expert_num = module.global_redundant_expert_num
-        module.log2phy.copy_(log2phy[cur_layer_id].npu(), non_blocking=True)
