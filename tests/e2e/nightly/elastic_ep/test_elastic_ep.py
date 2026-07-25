@@ -178,7 +178,7 @@ class ElasticEPTestConfig:
 
 
 # Define common additional_config
-COMMON_ADDITIONAL_CONFIG = '{"eplb_config": {"dynamic_eplb": false, "num_redundant_experts": 128}}'
+COMMON_ADDITIONAL_CONFIG = '{"eplb_config": {"dynamic_eplb": false, "num_redundant_experts": 128}, "enable_elastic_ep: true"}'
 
 # Define test configurations — indexed by name for stable lookup
 CONFIG_QWEN3_30B_DEFAULT = ElasticEPTestConfig(
@@ -232,7 +232,7 @@ CONFIG_QWEN3_30B_TP4 = ElasticEPTestConfig(
     gpu_memory_utilization=0.7,
     num_redundant_experts=128,
     additional_config=(
-        '{"eplb_config": {"dynamic_eplb": false, "num_redundant_experts": 128}, "enable_flashcomm1": true}'
+        '{"eplb_config": {"dynamic_eplb": false, "num_redundant_experts": 128}, "enable_flashcomm1": true, "enable_elastic_ep": true}'
     ),
     scale_sequence=ScaleSequence(
         name="tp4_scaling",
@@ -264,7 +264,7 @@ CONFIG_QWEN3_30B_W8A8_TP4 = ElasticEPTestConfig(
     gpu_memory_utilization=0.7,
     num_redundant_experts=128,
     additional_config=(
-        '{"eplb_config": {"dynamic_eplb": false, "num_redundant_experts": 128}, "enable_flashcomm1": true}'
+        '{"eplb_config": {"dynamic_eplb": false, "num_redundant_experts": 128}, "enable_flashcomm1": true, "enable_elastic_ep": true}'
     ),
     quant=True,
     scale_sequence=ScaleSequence(
@@ -286,7 +286,7 @@ CONFIG_QWEN3_235B_TP2 = ElasticEPTestConfig(
     gpu_memory_utilization=0.9,
     num_redundant_experts=32,
     additional_config=(
-        '{"eplb_config": {"dynamic_eplb": false, "num_redundant_experts": 32}, "enable_flashcomm1": true}'
+        '{"eplb_config": {"dynamic_eplb": false, "num_redundant_experts": 32}, "enable_flashcomm1": true, "enable_elastic_ep": true}'
     ),
     scale_sequence=ScaleSequence(
         name="tp2_scaling",
@@ -313,12 +313,6 @@ def _build_vllm_args(config: ElasticEPTestConfig) -> list[str]:
         "--data-parallel-backend",
         "ray",
         "--enable-expert-parallel",
-        "--enable-elastic-ep",
-        "--enable-eplb",
-        "--eplb_config.use_async",
-        "false",
-        "--eplb_config.num_redundant_experts",
-        str(config.num_redundant_experts),
         "--tensor-parallel-size",
         str(config.tensor_parallel_size),
         "--gpu-memory-utilization",
