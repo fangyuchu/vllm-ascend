@@ -12,6 +12,7 @@ from vllm.distributed.stateless_coordinator import (
     stateless_destroy_torch_distributed_process_group,
     stateless_init_torch_distributed_process_group,
 )
+
 from vllm_ascend.distributed.device_communicators.npu_communicator import NPUCommunicator
 
 
@@ -96,7 +97,7 @@ def use_stateless_pg_with_world_registration():
         patch(
             "vllm.distributed.stateless_coordinator.CudaCommunicator",
             new=NPUCommunicator,
-        )
+        ),
     ):
         yield
 
