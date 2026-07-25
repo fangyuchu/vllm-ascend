@@ -12,6 +12,7 @@ from vllm.distributed.stateless_coordinator import (
     stateless_destroy_torch_distributed_process_group,
     stateless_init_torch_distributed_process_group,
 )
+from vllm_ascend.distributed.device_communicators.npu_communicator import NPUCommunicator
 
 
 def get_decode_context_model_parallel_world_size() -> int:
@@ -92,6 +93,10 @@ def use_stateless_pg_with_world_registration():
             "vllm.distributed.stateless_coordinator.stateless_destroy_torch_distributed_process_group",
             new=stateless_destroy_pg_with_world_cleanup,
         ),
+        patch(
+            "vllm.distributed.stateless_coordinator.CudaCommunicator",
+            new=NPUCommunicator,
+        )
     ):
         yield
 
