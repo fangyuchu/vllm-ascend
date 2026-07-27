@@ -258,6 +258,8 @@ class AscendConfig:
     msmonitor_use_daemon: bool = False
     enable_transpose_kv_cache_by_block: bool = True
     weight_nz_mode: int = 1
+    # NPU operator timeout (ms) used by fault tolerance retry; 0 = disable.
+    operator_timeout_ms: int = 0
 
     # ---- sub-configs (no vllm_config dep): pydantic dict→dataclass coercion ----
     ascend_compilation_config: AscendCompilationConfig = dataclasses.field(default_factory=AscendCompilationConfig)
@@ -425,6 +427,8 @@ class AscendConfig:
             logger.warning_once(
                 "MegaMoe is not supported for this model config, VLLM_ASCEND_ENABLE_FUSED_MC2 will be set to 0."
             )
+        # operator_timeout_ms is a declared AscendConfig field; it is populated
+        # from additional_config via the factory kwargs (see init_ascend_config).
 
         # PD tp_ratio / head_ratio / num_head_replica derivation
         if vc.kv_transfer_config is not None and vc.model_config is not None and not vc.model_config.is_deepseek_mla:
