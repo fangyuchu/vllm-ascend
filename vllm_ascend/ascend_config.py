@@ -280,27 +280,7 @@ class AscendConfig:
         self.rejection_sampler_config = RejectionSamplerConfig(rejection_sampler_config)
 
         parallel_config = vllm_config.parallel_config
-        enable_elastic_ep = additional_config.get("enable_elastic_ep", False)
-        if enable_elastic_ep:
-            parallel_config.enable_elastic_ep = True
-            parallel_config.enable_eplb = True
-            parallel_config.eplb_config.use_async = False
-            eplb_config = additional_config.get("eplb_config", {})
-            parallel_config.eplb_config.num_redundant_experts = eplb_config.get("num_redundant_experts", 0)
-
-            if parallel_config.pipeline_parallel_size > 1:
-                raise ValueError(
-                    "Elastic EP is not supported with pipeline parallelism "
-                    f"(pipeline_parallel_size={parallel_config.pipeline_parallel_size})."
-                )
-
-            if parallel_config.data_parallel_external_lb or parallel_config.data_parallel_hybrid_lb:
-                raise NotImplementedError(
-                    "Elastic EP is not compatible with data_parallel_external_lb "
-                    "or data_parallel_hybrid_lb. Elastic EP relies on a single API "
-                    "server and core client to coordinate scale up/down."
-                )
-
+        if parallel_config.enable_elastic_ep:
             from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
             if get_ascend_device_type() != AscendDeviceType.A3:
