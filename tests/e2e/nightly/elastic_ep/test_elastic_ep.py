@@ -179,7 +179,7 @@ class ElasticEPTestConfig:
 
 # Define common additional_config
 COMMON_ADDITIONAL_CONFIG = (
-    '{"eplb_config": {"dynamic_eplb": false, "num_redundant_experts": 128}, "enable_elastic_ep: true"}'
+    '{"eplb_config": {"dynamic_eplb": false, "num_redundant_experts": 128}, "enable_elastic_ep": true}'
 )
 
 # Define test configurations — indexed by name for stable lookup
