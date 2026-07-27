@@ -509,7 +509,31 @@
 #    Future Plan:
 #       Remove this patch once the supported vLLM version contains PR #44105.
 #
-# ** 20. File: platform/patch_use_v2_model_runner.py**
+# ** 20. File: platform/patch_elastic_ep.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.platforms.Platform.is_cuda_alike`
+#      `vllm.config.parallel.ParallelConfig.__init__`
+#    Why:
+#       ``--enable-elastic-ep`` requires ``enable_eplb=True`` and
+#       ``_validate_parallel_config`` gates ``enable_eplb`` behind
+#       ``is_cuda_alike()`` (False for NPUPlatform).  Temporary / flag-based
+#       overrides are ineffective inside pydantic v2's Rust ``SchemaValidator``.
+#    How：
+#       (a) Wrap ``ParallelConfig.__init__`` to auto-infer ``enable_eplb=True``
+#       from ``enable_elastic_ep=True``.  (b) Permanently override
+#       ``NPUPlatform.is_cuda_alike`` to return ``True`` when the call-site is
+#       ``_validate_parallel_config`` (detected via stack inspection), otherwise
+#       delegate to the original implementation.
+#    Related PR (if no, explain why):
+#       Requires upstream to either (a) accept a platform-specific EPLB
+#       capability hook, or (b) merge ``is_cuda_alike`` and ``supports_eplb``
+#       into separate methods.
+#    Future Plan:
+#       Remove this patch when upstream ``_validate_parallel_config`` uses a
+#       platform-overridable method (e.g. ``supports_eplb()``) instead of
+#       hard-coding ``is_cuda_alike()`` for the EPLB gate.
+#
+# ** 21. File: platform/patch_use_v2_model_runner.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.config.vllm.VllmConfig.use_v2_model_runner`
 #    Why:
@@ -534,7 +558,7 @@
 #       (model architecture, Triton, feature checks) without crashes or
 #       degraded functionality.
 #
-# ** 21. File: platform/patch_weight_transfer_engine.py**
+# ** 22. File: platform/patch_weight_transfer_engine.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.distributed.weight_transfer.factory.WeightTransferEngineFactory._registry["nccl"]`
 #    Why:

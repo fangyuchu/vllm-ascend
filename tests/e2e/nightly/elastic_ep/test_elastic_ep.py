@@ -179,7 +179,7 @@ class ElasticEPTestConfig:
 
 # Define common additional_config
 COMMON_ADDITIONAL_CONFIG = (
-    '{"eplb_config": {"dynamic_eplb": false, "num_redundant_experts": 128}, "enable_elastic_ep": true}'
+    '{"eplb_config": {"dynamic_eplb": false, "num_redundant_experts": 128}}'
 )
 
 # Define test configurations — indexed by name for stable lookup
@@ -234,7 +234,7 @@ CONFIG_QWEN3_30B_TP4 = ElasticEPTestConfig(
     gpu_memory_utilization=0.7,
     num_redundant_experts=128,
     additional_config=(
-        '{"eplb_config": {"dynamic_eplb": false, "num_redundant_experts": 128}, "enable_flashcomm1": true, "enable_elastic_ep": true}'
+        '{"eplb_config": {"dynamic_eplb": false, "num_redundant_experts": 128}, "enable_flashcomm1": true}'
     ),
     scale_sequence=ScaleSequence(
         name="tp4_scaling",
@@ -266,7 +266,7 @@ CONFIG_QWEN3_30B_W8A8_TP4 = ElasticEPTestConfig(
     gpu_memory_utilization=0.7,
     num_redundant_experts=128,
     additional_config=(
-        '{"eplb_config": {"dynamic_eplb": false, "num_redundant_experts": 128}, "enable_flashcomm1": true, "enable_elastic_ep": true}'
+        '{"eplb_config": {"dynamic_eplb": false, "num_redundant_experts": 128}, "enable_flashcomm1": true}'
     ),
     quant=True,
     scale_sequence=ScaleSequence(
@@ -288,7 +288,7 @@ CONFIG_QWEN3_235B_TP2 = ElasticEPTestConfig(
     gpu_memory_utilization=0.9,
     num_redundant_experts=32,
     additional_config=(
-        '{"eplb_config": {"dynamic_eplb": false, "num_redundant_experts": 32}, "enable_flashcomm1": true, "enable_elastic_ep": true}'
+        '{"eplb_config": {"dynamic_eplb": false, "num_redundant_experts": 32}, "enable_flashcomm1": true}'
     ),
     scale_sequence=ScaleSequence(
         name="tp2_scaling",
@@ -314,6 +314,7 @@ def _build_vllm_args(config: ElasticEPTestConfig) -> list[str]:
         str(config.data_parallel_size_local),
         "--data-parallel-backend",
         "ray",
+        "--enable-elastic-ep",
         "--enable-expert-parallel",
         "--tensor-parallel-size",
         str(config.tensor_parallel_size),
