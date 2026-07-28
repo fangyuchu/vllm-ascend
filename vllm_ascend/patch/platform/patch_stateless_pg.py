@@ -39,13 +39,12 @@ def _ascend_stateless_init_pg(**kwargs) -> ProcessGroup | tuple[ProcessGroup, St
         pg = _orig_stateless_init(**kwargs)
 
     if kwargs["backend"] == "hccl":
-        backend = "hccl"
         prefix_store = pg.get_group_store()
         group_name = pg.group_name
-        backend_config = BackendConfig(backend)
+        backend_config = BackendConfig(kwargs["backend"])
 
         _world.pg_group_ranks[pg] = {i: i for i in range(pg.size())}
-        _world.pg_map[pg] = (backend, prefix_store)
+        _world.pg_map[pg] = (kwargs["backend"], prefix_store)
         _world.pg_names[pg] = group_name
         _world.pg_backend_config[pg] = str(backend_config)
 

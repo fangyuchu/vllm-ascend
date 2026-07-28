@@ -600,6 +600,34 @@
 #       the code path that actually needs ray), so importing the IPC engine no
 #       longer requires the optional ray dependency.
 #
+# ** 23. File: platform/patch_stateless_pg.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.distributed.stateless_coordinator.stateless_init_torch_distributed_process_group`
+#      `vllm.distributed.stateless_coordinator.stateless_destroy_torch_distributed_process_group`
+#      `vllm.distributed.stateless_coordinator.CudaCommunicator`
+#    Why:
+#       Upstream ``StatelessGroupCoordinator`` uses ``CudaCommunicator`` for
+#       weight transfer and stateless PG helpers that do not register /
+#       unregister the process group in PyTorch's global ``_world.pg_map``.
+#       On Ascend NPU, HCCL requires the PG to be registered in
+#       ``_world.pg_map`` so that HCCL backend operations (e.g. broadcast
+#       inside ``HCCLWeightTransferEngine``) can look up the PG by name.
+#    How：
+#       Wrap ``stateless_init_torch_distributed_process_group`` to register
+#       the PG in ``_world.pg_map`` (and ``_world.default_pg`` when the
+#       group name contains "WORLD") for HCCL backends.  Wrap
+#       ``stateless_destroy_torch_distributed_process_group`` to clean up
+#       the corresponding ``_world`` entries.  Replace
+#       ``CudaCommunicator`` with ``NPUCommunicator`` so the coordinator
+#       constructs an HCCL-aware device communicator.
+#    Related PR (if no, explain why):
+#       No, NPU-specific HCCL PG registration requirement.
+#    Future Plan:
+#       Remove this patch if upstream ``StatelessGroupCoordinator`` gains a
+#       platform hook for PG registration / communicator selection, or if
+#       HCCL becomes compatible with the upstream stateless PG helpers
+#       without ``_world.pg_map`` registration.
+#
 # * Worker Patch:
 # ===============
 # Entries are listed in alphabetical order by file name.
