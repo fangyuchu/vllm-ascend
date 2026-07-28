@@ -511,27 +511,35 @@
 #
 # ** 20. File: platform/patch_elastic_ep.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#   1. `vllm.platforms.Platform.is_cuda_alike`
+#   1. `current_platform.is_cuda_alike` (temporarily)
 #      `vllm.config.parallel.ParallelConfig.__init__`
+#      `vllm.model_executor.layers.fused_moe.layer.FusedMoE`
 #    Why:
 #       ``--enable-elastic-ep`` requires ``enable_eplb=True`` and
 #       ``_validate_parallel_config`` gates ``enable_eplb`` behind
-#       ``is_cuda_alike()`` (False for NPUPlatform).  Temporary / flag-based
-#       overrides are ineffective inside pydantic v2's Rust ``SchemaValidator``.
+#       ``is_cuda_alike()`` (False for NPUPlatform).  After init,
+#       ``enable_eplb`` is restored to the user-provided value, but
+#       model construction later calls ``FusedMoE`` which asserts
+#       ``num_redundant_experts == 0`` when ``enable_eplb`` is False
+#       — conflicting with ``ascend_config.py`` having set
+#       ``num_redundant_experts > 0``.
 #    How：
-#       (a) Wrap ``ParallelConfig.__init__`` to auto-infer ``enable_eplb=True``
-#       from ``enable_elastic_ep=True``.  (b) Permanently override
-#       ``NPUPlatform.is_cuda_alike`` to return ``True`` when the call-site is
-#       ``_validate_parallel_config`` (detected via stack inspection), otherwise
-#       delegate to the original implementation.
+#       (a) Save original ``enable_eplb``, ``eplb_config.use_async``,
+#       and ``current_platform.is_cuda_alike``.  Temporarily set them
+#       to pass-validation values, call the original ``__init__``, then
+#       restore all three in a ``finally`` block.
+#       (b) Wrap ``FusedMoE`` (already patched by ``patch_fused_moe.py``)
+#       to force ``enable_eplb=True`` in kwargs when
+#       ``enable_elastic_ep`` is True, so the redundant-expert assertion
+#       passes during model construction.
 #    Related PR (if no, explain why):
 #       Requires upstream to either (a) accept a platform-specific EPLB
-#       capability hook, or (b) merge ``is_cuda_alike`` and ``supports_eplb``
-#       into separate methods.
+#       capability hook, or (b) merge ``is_cuda_alike`` and
+#       ``supports_eplb`` into separate methods.
 #    Future Plan:
-#       Remove this patch when upstream ``_validate_parallel_config`` uses a
-#       platform-overridable method (e.g. ``supports_eplb()``) instead of
-#       hard-coding ``is_cuda_alike()`` for the EPLB gate.
+#       Remove this patch when upstream ``_validate_parallel_config``
+#       uses a platform-overridable method (e.g. ``supports_eplb()``)
+#       instead of hard-coding ``is_cuda_alike()`` for the EPLB gate.
 #
 # ** 21. File: platform/patch_use_v2_model_runner.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -600,33 +608,22 @@
 #       the code path that actually needs ray), so importing the IPC engine no
 #       longer requires the optional ray dependency.
 #
-# ** 23. File: platform/patch_stateless_pg.py**
+# ** 23. File: platform/patch_stateless_coordinator.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#   1. `vllm.distributed.stateless_coordinator.stateless_init_torch_distributed_process_group`
-#      `vllm.distributed.stateless_coordinator.stateless_destroy_torch_distributed_process_group`
-#      `vllm.distributed.stateless_coordinator.CudaCommunicator`
+#   1. `vllm.distributed.stateless_coordinator.CudaCommunicator`
 #    Why:
 #       Upstream ``StatelessGroupCoordinator`` uses ``CudaCommunicator`` for
-#       weight transfer and stateless PG helpers that do not register /
-#       unregister the process group in PyTorch's global ``_world.pg_map``.
-#       On Ascend NPU, HCCL requires the PG to be registered in
-#       ``_world.pg_map`` so that HCCL backend operations (e.g. broadcast
-#       inside ``HCCLWeightTransferEngine``) can look up the PG by name.
+#       device communication. On Ascend NPU, the coordinator must construct
+#       an HCCL-aware device communicator instead.
 #    How：
-#       Wrap ``stateless_init_torch_distributed_process_group`` to register
-#       the PG in ``_world.pg_map`` (and ``_world.default_pg`` when the
-#       group name contains "WORLD") for HCCL backends.  Wrap
-#       ``stateless_destroy_torch_distributed_process_group`` to clean up
-#       the corresponding ``_world`` entries.  Replace
-#       ``CudaCommunicator`` with ``NPUCommunicator`` so the coordinator
-#       constructs an HCCL-aware device communicator.
+#       Replace ``CudaCommunicator`` with ``NPUCommunicator`` in the
+#       ``stateless_coordinator`` module so the coordinator constructs an
+#       HCCL-aware device communicator.
 #    Related PR (if no, explain why):
-#       No, NPU-specific HCCL PG registration requirement.
+#       No, NPU-specific HCCL communicator selection requirement.
 #    Future Plan:
 #       Remove this patch if upstream ``StatelessGroupCoordinator`` gains a
-#       platform hook for PG registration / communicator selection, or if
-#       HCCL becomes compatible with the upstream stateless PG helpers
-#       without ``_world.pg_map`` registration.
+#       platform hook for communicator selection.
 #
 # * Worker Patch:
 # ===============

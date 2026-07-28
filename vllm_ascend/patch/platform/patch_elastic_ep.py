@@ -16,15 +16,19 @@
 
 Upstream requires ``enable_eplb=True`` when ``enable_elastic_ep=True``,
 and ``enable_eplb`` is gated by ``current_platform.is_cuda_alike()``.
-Temporary / flag-based overrides of ``is_cuda_alike`` are ineffective
-inside pydantic v2's compiled Rust ``SchemaValidator``.
 
-The only approach that works is to permanently override
-``is_cuda_alike()`` on the ``NPUPlatform`` class to return ``True``
-when the call-site is inside ``_validate_parallel_config`` (detected
-via stack inspection) AND the ParallelConfig instance being validated
-has ``enable_elastic_ep=True``.  All other call-sites delegate to the
-original implementation, so normal platform detection is unaffected.
+.. important::
+   ``current_platform.is_cuda_alike``, ``enable_eplb``, and
+   ``eplb_config.use_async`` are modified **temporarily** (set to
+   ``True`` / ``True`` / ``False`` respectively) only to pass
+   ``_validate_parallel_config``, and are **restored** to the original
+   values in a ``finally`` block after ``__init__`` completes.  The
+   modified values never leak into runtime logic.
+
+   Additionally, the ``FusedMoE`` factory (called during model
+   construction) is wrapped to force ``enable_eplb=True`` when
+   ``enable_elastic_ep`` is True, because ``FusedMoE`` asserts
+   ``num_redundant_experts == 0`` when ``enable_eplb`` is False.
 
 .. note::
    This patch must be imported **before** any ``ParallelConfig`` is
@@ -32,62 +36,89 @@ original implementation, so normal platform detection is unaffected.
    inference will not take effect during validation.
 """
 
-import logging
-import sys
-
 from vllm.config.parallel import ParallelConfig, EPLBConfig
 from vllm.platforms import current_platform
 
-logger = logging.getLogger(__name__)
-
 # ---------------------------------------------------------------------------
-# Auto-infer enable_eplb=True from enable_elastic_ep=True.
+# When enable_elastic_ep=True, temporarily (a) replace
+# current_platform.is_cuda_alike with ``lambda: True``, (b) set
+# enable_eplb=True, and (c) set eplb_config.use_async=False, so that
+# _validate_parallel_config passes.  All three are restored to their
+# original values in a ``finally`` block after __init__ completes,
+# ensuring the modified values never leak into runtime logic.
 # ---------------------------------------------------------------------------
 _original_init = ParallelConfig.__init__
+_original_is_cuda_alike = current_platform.is_cuda_alike
 
 
 def _patched_init(self, **data: object):
     if data.get("enable_elastic_ep", False):
+        current_platform.is_cuda_alike = lambda: True
+
+        _orig_enable_eplb = data.get("enable_eplb", False)
+        _orig_eplb_cfg = data.get("eplb_config")
+        if _orig_eplb_cfg is None:
+            _orig_use_async = True
+        elif isinstance(_orig_eplb_cfg, EPLBConfig):
+            _orig_use_async = _orig_eplb_cfg.use_async
+        else:
+            _orig_use_async = _orig_eplb_cfg.get("use_async", True)
+
         data["enable_eplb"] = True
-        existing = data.get("eplb_config")
-        if existing is None:
+        if _orig_eplb_cfg is None:
             data["eplb_config"] = EPLBConfig(use_async=False)
-        elif isinstance(existing, EPLBConfig):
-            existing.use_async = False
-        elif isinstance(existing, dict):
-            existing["use_async"] = False
-    _original_init(self, **data)
+        elif isinstance(_orig_eplb_cfg, EPLBConfig):
+            _orig_eplb_cfg.use_async = False
+        else:
+            _orig_eplb_cfg["use_async"] = False
+
+        try:
+            _original_init(self, **data)
+        finally:
+            current_platform.is_cuda_alike = _original_is_cuda_alike
+            self.enable_eplb = _orig_enable_eplb
+            self.eplb_config.use_async = _orig_use_async
+    else:
+        _original_init(self, **data)
 
 
 ParallelConfig.__init__ = _patched_init
 
 
 # ---------------------------------------------------------------------------
-# Override NPUPlatform.is_cuda_alike permanently.  Only the immediate
-# caller frame is checked — sys._getframe(1) is O(1) vs inspect.stack().
+# Patch FusedMoE factory to force enable_eplb=True when
+# enable_elastic_ep=True.
+#
+# After __init__ restores enable_eplb to the user-provided value (or the
+# upstream default False), model construction calls FusedMoE, which
+# asserts ``num_redundant_experts == 0`` when enable_eplb is False
+# (layer.py:258).  Since ascend_config.py may have set
+# num_redundant_experts > 0 from additional_config, the assertion fires.
+#
+# We wrap the already-patched FusedMoE (set to _ascend_FusedMoE by
+# patch_fused_moe.py) so that enable_eplb=True is in effect for the
+# duration of the factory call, then the caller's original config value
+# persists for all other code paths.
 # ---------------------------------------------------------------------------
-_npu_cls = type(current_platform)
-_original_is_cuda_alike = _npu_cls.is_cuda_alike
+import vllm.model_executor.layers.fused_moe as _fused_moe_pkg
+import vllm.model_executor.layers.fused_moe.layer as _fused_moe_layer
 
-_VALIDATE_METHOD = "_validate_parallel_config"
-
-if not hasattr(ParallelConfig, _VALIDATE_METHOD):
-    logger.warning(
-        "ParallelConfig.%s not found. The elastic EP patch may be "
-        "ineffective after a vLLM upgrade.",
-        _VALIDATE_METHOD,
-    )
+_original_fused_moe = _fused_moe_layer.FusedMoE
 
 
-def _patched_is_cuda_alike(self) -> bool:
-    caller_frame = sys._getframe(1)
-    if caller_frame.f_code.co_name == _VALIDATE_METHOD:
-        caller_self = caller_frame.f_locals.get("self")
-        if caller_self is not None and getattr(
-            caller_self, "enable_elastic_ep", False
-        ):
-            return True
-    return _original_is_cuda_alike(self)
+def _patched_fused_moe(*args, **kwargs):
+    from vllm.config import get_current_vllm_config
+
+    try:
+        vllm_config = get_current_vllm_config()
+    except Exception:
+        vllm_config = None
+
+    if vllm_config is not None and vllm_config.parallel_config.enable_elastic_ep:
+        kwargs["enable_eplb"] = True
+
+    return _original_fused_moe(*args, **kwargs)
 
 
-_npu_cls.is_cuda_alike = _patched_is_cuda_alike
+_fused_moe_layer.FusedMoE = _patched_fused_moe
+_fused_moe_pkg.FusedMoE = _patched_fused_moe
