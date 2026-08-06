@@ -38,6 +38,9 @@ class _NpuAll2AllManager:
     def query_active_mask(self) -> torch.Tensor:
         return torch.zeros(1, dtype=torch.bool, device="cpu")
 
+    def clean_buffers(self) -> None:
+        """No-op: NPU registers no RDMA buffers or all2all mask state."""
+
 
 class NPUCommunicator(DeviceCommunicatorBase):
     # main2main compat: `use_all2all` was added to upstream
