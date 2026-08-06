@@ -260,6 +260,9 @@ class AscendConfig:
     weight_nz_mode: int = 1
     # NPU operator timeout (ms) used by fault tolerance retry; 0 = disable.
     operator_timeout_ms: int = 0
+    # Fault-tolerance comm op abort timeout (ms); 0 = disable. Injected via
+    # additional_config["ft_communication_ops_abort_timeout_ms"].
+    ft_communication_ops_abort_timeout_ms: int = 0
 
     # ---- sub-configs (no vllm_config dep): pydantic dict→dataclass coercion ----
     ascend_compilation_config: AscendCompilationConfig = dataclasses.field(default_factory=AscendCompilationConfig)
@@ -429,6 +432,8 @@ class AscendConfig:
             )
         # operator_timeout_ms is a declared AscendConfig field; it is populated
         # from additional_config via the factory kwargs (see init_ascend_config).
+        # ft_communication_ops_abort_timeout_ms is likewise a declared field
+        # (retry-based fault tolerance comm op abort timeout).
 
         # PD tp_ratio / head_ratio / num_head_replica derivation
         if vc.kv_transfer_config is not None and vc.model_config is not None and not vc.model_config.is_deepseek_mla:
