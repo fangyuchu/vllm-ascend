@@ -224,6 +224,20 @@
     - tests/e2e/pull_request/two_card/test_sequence_parallelism_moe.py
     - tests/e2e/pull_request/two_card/test_disaggregated_encoder.py
 
+# Fault Tolerance
+- name: fault_tolerance
+  optional: true
+  source_file_dependencies:
+    - vllm_ascend/worker/sentinel
+    - vllm_ascend/worker/worker.py
+    - vllm_ascend/worker/model_runner_v1.py
+    - vllm_ascend/distributed/device_communicators/npu_communicator.py
+    - vllm_ascend/patch/worker/patch_distributed.py
+    - vllm_ascend/ascend_config.py
+    - vllm_ascend/envs.py
+  tests:
+    - tests/e2e/fault_tolerance/test_fault_tolerance_e2e.py
+
 # EPLB
 - name: eplb
   optional: false
@@ -809,6 +823,7 @@ estimated_times:
   tests/e2e/pull_request/four_card/test_qwen3_next.py: 1180
   tests/e2e/pull_request/four_card/test_graph_mode.py: 480
   tests/e2e/pull_request/two_card/test_gemma4.py: 1200
+  tests/e2e/fault_tolerance/test_fault_tolerance_e2e.py: 1200
   tests/ut/attention/a2/test_attention_cp.py: 40
   tests/ut/attention/a2/test_attention_cp_precision.py: 30
   tests/ut/attention/a2/test_attention_v1.py: 30
@@ -860,6 +875,8 @@ runner_mapping:
   tests/e2e/pull_request/four_card:
     default: a3_x4
     310p: 310p_x4
+  tests/e2e/fault_tolerance:
+    default: a3_x4
   tests/ut/.+/a3_2:
     default: a3_x2
   tests/ut/.+/a2:
