@@ -319,6 +319,20 @@ class AscendConfig:
         )
         self._validate_sparse_c8_kv_offload_compatibility()
 
+        parallel_config = vllm_config.parallel_config
+        if parallel_config.enable_elastic_ep:
+            from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+            if get_ascend_device_type() != AscendDeviceType.A3:
+                raise ValueError("Elastic EP is only supported on A3.")
+
+            if self.eplb_config.dynamic_eplb:
+                raise RuntimeError(
+                    "Elastic EP with dynamic_eplb=True is temporarily unsupported. "
+                    "Set dynamic_eplb=False in eplb_config to use Elastic EP."
+                    "Or use EPLB in ModelRunnerV2 instead."
+                )
+
     def _validate_sparse_c8_kv_offload_compatibility(self) -> None:
         if self.sparse_kv_offload_config.enabled and self.enable_sparse_sfa_c8:
             raise NotImplementedError(

@@ -9,8 +9,12 @@ from inspect import signature
 from vllm.config import parallel as _parallel_config
 from vllm.distributed.eplb import eplb_communicator as _eplb_communicator
 from vllm.distributed.eplb import eplb_state as _eplb_state
+from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
 
-from vllm_ascend.distributed.eplb_communicator import HcclEplbCommunicator
+from vllm_ascend.distributed.eplb_communicator import (
+    HcclEplbCommunicator,
+    PyHcclEplbCommunicator,
+)
 from vllm_ascend.distributed.eplb_state import refresh_model_routing_tables
 
 _PATCH_MARKER = "_vllm_ascend_eplb_patch"
@@ -56,8 +60,19 @@ def _wrap_communicator_factory(original_factory):
     def _create_eplb_communicator(*args, **kwargs):
         bound = factory_signature.bind(*args, **kwargs)
         bound.apply_defaults()
+        group_coordinator = bound.arguments["group_coordinator"]
+        backend = bound.arguments["backend"]
+        if isinstance(group_coordinator, StatelessGroupCoordinator) or backend == "pynccl":
+            device_comm = getattr(group_coordinator, "device_communicator", None)
+            pyhccl_comm = getattr(device_comm, "pyhccl_comm", None)
+            if pyhccl_comm is None or pyhccl_comm.disabled or not pyhccl_comm.available:
+                raise ValueError(
+                    "Elastic EP EPLB requires a PyHcclCommunicator on the "
+                    "stateless EPLB group's device communicator, but got "
+                    f"pyhccl_comm={pyhccl_comm}."
+                )
+            return PyHcclEplbCommunicator(pyhccl_comm=pyhccl_comm)
         if bound.arguments["backend"] == "torch_nccl" and _is_npu_platform(_parallel_config.current_platform):
-            group_coordinator = bound.arguments["group_coordinator"]
             return HcclEplbCommunicator(group_coordinator.device_group)
         return original_factory(*args, **kwargs)
 

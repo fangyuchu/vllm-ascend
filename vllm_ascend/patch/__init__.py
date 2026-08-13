@@ -1136,7 +1136,7 @@
 #    Future Plan:
 #       Remove this patch when NPU support UVA.
 #
-# ** 34. File: platform/patch_vision.py**
+# ** 31. File: platform/patch_vision.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.model_executor.models.vision.FusedInputNorm.forward`
 #    Why:
@@ -1155,4 +1155,77 @@
 #    Future Plan:
 #       Remove this patch once vllm-ascend's bundled PyTorch >= 2.13.0
 #       (which, like upstream, allows eps >= 0 for inference).
+#
+# ** 32. File: platform/patch_elastic_ep.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.config.vllm.VllmConfig._get_v2_model_runner_unsupported_features`
+#    Why:
+#       Upstream lists "elastic expert parallelism" as unsupported by the
+#       V2 model runner (vllm/config/vllm.py:2185-2186), so with
+#       ``--enable-elastic-ep`` the V2 model runner either falls back to
+#       V1 or raises during ``_validate_v2_model_runner()``.  On Ascend
+#       the V2 model runner supports elastic EP.
+#    How：
+#       Wrap ``_get_v2_model_runner_unsupported_features`` and drop the
+#       "elastic expert parallelism" entry from the returned list.
+#    Related PR (if no, explain why):
+#       No, NPU V2 model runner supports elastic EP.
+#    Future Plan:
+#       Remove this patch when upstream V2 model runner supports elastic
+#       EP on non-CUDA backends.
+#
+# ** 33. File: platform/patch_stateless_coordinator.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.distributed.utils.stateless_init_torch_distributed_process_group`
+#      `vllm.distributed.utils.stateless_destroy_torch_distributed_process_group`
+#    Why:
+#       The upstream stateless PG helpers create a ProcessGroup without
+#       touching torch's global ``_world`` state, so the created group is
+#       invisible to the standard torch.distributed collective APIs. For
+#       the HCCL backend on Ascend, the group must be registered into
+#       ``_world`` to be usable with those APIs.
+#    How：
+#       Wrap the stateless init helper to register HCCL process groups into
+#       torch's global ``_world`` state (``pg_map`` / ``pg_names`` /
+#       ``pg_group_ranks`` / ``pg_backend_config``), setting the WORLD group
+#       as the default process group. Wrap the destroy helper to remove the
+#       corresponding entries after the group is destroyed.
+#    Related PR (if no, explain why):
+#       No, NPU-specific HCCL stateless process-group registration.
+#    Future Plan:
+#       Remove this patch if upstream registers stateless HCCL process
+#       groups into torch's global ``_world`` state.
+#   2. `vllm.distributed.stateless_coordinator.CudaCommunicator`
+#    Why:
+#       Upstream ``StatelessGroupCoordinator`` uses ``CudaCommunicator`` for
+#       device communication. On Ascend NPU, the coordinator must construct
+#       an HCCL-aware device communicator instead.
+#    How：
+#       Replace ``CudaCommunicator`` with ``NPUCommunicator`` in the
+#       ``stateless_coordinator`` module so the coordinator constructs an
+#       HCCL-aware device communicator.
+#    Related PR (if no, explain why):
+#       No, NPU-specific HCCL communicator selection requirement.
+#    Future Plan:
+#       Remove this patch if upstream ``StatelessGroupCoordinator`` gains a
+#       platform hook for communicator selection.
+#
+# ** 34. File: platform/patch_standby_state.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.distributed.elastic_ep.standby_state.create_standby_groups`
+#    Why:
+#       During elastic expert-parallel (EP) expansion, upstream vLLM builds
+#       standby communication groups (world / dp / ep / eplb) for the new set
+#       of ranks. Ascend additionally needs MC2 and dynamic-EPLB standby
+#       groups, which upstream vLLM does not create.
+#    How：
+#       Wrap ``create_standby_groups`` to first run the original upstream logic,
+#       then call
+#       ``vllm_ascend.distributed.elastic_ep.standby_state.create_ascend_standby_groups``
+#       to build the Ascend-specific MC2 and dynamic-EPLB standby groups.
+#    Related PR (if no, explain why):
+#       No, NPU-specific standby-group requirement.
+#    Future Plan:
+#       Remove this patch if upstream ``create_standby_groups`` gains a platform
+#       hook for creating backend-specific standby groups.
 #

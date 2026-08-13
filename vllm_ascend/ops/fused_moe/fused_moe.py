@@ -16,6 +16,7 @@
 #
 import torch
 import torch.nn.functional as F
+import vllm.envs as envs
 from vllm.distributed import get_dp_group, get_ep_group, get_tp_group
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig, FusedMoERouter
 from vllm.model_executor.layers.fused_moe.layer import MoERunner
@@ -78,7 +79,8 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                 self._quant_method,
             )
 
-        setup_moe_comm_method(self.moe_config)
+        if not envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
+            setup_moe_comm_method(self.moe_config)
 
     @property
     def is_internal_router(self) -> bool:

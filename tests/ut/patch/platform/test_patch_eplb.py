@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 from vllm.config import EPLBConfig, ParallelConfig, VllmConfig
 from vllm.config import parallel as parallel_module
 from vllm.platforms import current_platform
@@ -118,6 +119,57 @@ def test_communicator_factory_forwards_other_backends_and_additive_parameters():
             {"mode": "future"},
         )
     ]
+
+
+def test_communicator_factory_uses_pyhccl_for_stateless_groups(monkeypatch):
+    communicator = object()
+    communicator_cls = MagicMock(return_value=communicator)
+    monkeypatch.setattr(patch_eplb, "PyHcclEplbCommunicator", communicator_cls)
+    pyhccl_comm = MagicMock(disabled=False, available=True)
+    coordinator = object.__new__(patch_eplb.StatelessGroupCoordinator)
+    coordinator.device_communicator = MagicMock(pyhccl_comm=pyhccl_comm)
+
+    result = patch_eplb._eplb_communicator.create_eplb_communicator(
+        coordinator,
+        "torch_nccl",
+        [[object()]],
+        [object()],
+    )
+
+    assert result is communicator
+    communicator_cls.assert_called_once_with(pyhccl_comm=pyhccl_comm)
+
+
+def test_communicator_factory_uses_pyhccl_for_pynccl_backend(monkeypatch):
+    communicator = object()
+    communicator_cls = MagicMock(return_value=communicator)
+    monkeypatch.setattr(patch_eplb, "PyHcclEplbCommunicator", communicator_cls)
+    pyhccl_comm = MagicMock(disabled=False, available=True)
+    coordinator = MagicMock()
+    coordinator.device_communicator = MagicMock(pyhccl_comm=pyhccl_comm)
+
+    result = patch_eplb._eplb_communicator.create_eplb_communicator(
+        coordinator,
+        "pynccl",
+        [[object()]],
+        [object()],
+    )
+
+    assert result is communicator
+    communicator_cls.assert_called_once_with(pyhccl_comm=pyhccl_comm)
+
+
+def test_communicator_factory_raises_when_pyhccl_unavailable():
+    coordinator = object.__new__(patch_eplb.StatelessGroupCoordinator)
+    coordinator.device_communicator = MagicMock(pyhccl_comm=None)
+
+    with pytest.raises(ValueError, match="PyHcclCommunicator"):
+        patch_eplb._eplb_communicator.create_eplb_communicator(
+            coordinator,
+            "torch_nccl",
+            [[object()]],
+            [object()],
+        )
 
 
 def test_async_workspace_wrapper_refreshes_committed_layer(monkeypatch):

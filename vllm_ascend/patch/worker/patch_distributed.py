@@ -119,6 +119,7 @@ class GroupCoordinatorPatch(GroupCoordinator):
             use_device_communicator: bool,  # whether to use device communicator
             use_message_queue_broadcaster: bool = False,
             group_name: str | None = None,
+            use_all2all: bool = False,
         ):
             group_name = group_name or "anonymous"
             self.unique_name = _get_unique_name(group_name)
