@@ -288,11 +288,15 @@ def reload_experts_from_disk(
     reloaded = 0
     for layer_idx, assignments in sorted(reload_plan.items()):
         routed = routed_layers[layer_idx]
-        reloader = _RELOADERS.get(type(routed.quant_method))
+        # Quantized layers carry the AscendFusedMoEMethod wrapper; the actual
+        # scheme (the _RELOADERS key) lives in its .quant_method attribute.
+        # Unquantized layers hold the bare scheme, so fall back to the object
+        # itself (same idiom as AscendRoutedExperts.quant_type).
+        quant_method = getattr(routed.quant_method, "quant_method", routed.quant_method)
+        reloader = _RELOADERS.get(type(quant_method))
         if reloader is None:
             raise NotImplementedError(
-                f"[FT] scale_down weight reload is not implemented for quant "
-                f"method {type(routed.quant_method).__name__}."
+                f"[FT] scale_down weight reload is not implemented for quant method {type(quant_method).__name__}."
             )
         for slot, logical_id in assignments:
             tensors = buckets[(layer_idx, logical_id)]
