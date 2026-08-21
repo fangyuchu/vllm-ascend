@@ -57,14 +57,12 @@ class _NpuAll2AllManager:
         self._device = device
         self._dead: set[int] = set()
         self._num_physical_experts: int = 0
-        # Allocated lazily on first FT use. `_elastic_info_host` is the
-        # host-side build buffer for elastic_info (the mask may be queried
-        # while a fault is being probed and the NPU can hang, so host state
-        # is kept off-device); `_elastic_info` is the device tensor handed to
-        # the MC2 operators. It is allocated once and only ever copied into,
-        # so storage captured by graphs stays valid.
-        self._elastic_info_host: torch.Tensor | None = None
-        self._elastic_info: torch.Tensor | None = None
+
+        size = _ELASTIC_INFO_HEADER_SIZE + _ELASTIC_INFO_RANK_TABLE_NUM * ep_world_size
+        self._elastic_info_host = torch.zeros(size, dtype=torch.int32)
+        if device is None:
+            device = torch.device("npu", torch.npu.current_device())
+        self._elastic_info = torch.zeros(size, dtype=torch.int32, device=device)
 
     def update_mask(self, rank: int, masked: bool = True) -> None:
         """Mark an EP rank dead/alive and rebuild elastic_info in place."""
@@ -106,8 +104,6 @@ class _NpuAll2AllManager:
 
     def get_elastic_info(self) -> torch.Tensor:
         """The device elastic_info tensor for the next MC2 dispatch/combine."""
-        self._ensure_elastic_info_tensors()
-        assert self._elastic_info is not None
         return self._elastic_info
 
     def set_num_physical_experts(self, num_physical_experts: int) -> None:
@@ -124,22 +120,10 @@ class _NpuAll2AllManager:
             table[orig_rank] = dense_rank
         return table
 
-    def _ensure_elastic_info_tensors(self) -> None:
-        if self._elastic_info is not None:
-            return
-        size = _ELASTIC_INFO_HEADER_SIZE + _ELASTIC_INFO_RANK_TABLE_NUM * self._ep_world_size
-        self._elastic_info_host = torch.zeros(size, dtype=torch.int32)
-        device = self._device
-        if device is None:
-            device = torch.device("npu", torch.npu.current_device())
-        self._elastic_info = torch.zeros(size, dtype=torch.int32, device=device)
-
     def _rebuild_elastic_info(self) -> None:
         """Rebuild elastic_info from the dead set and copy it into the
         existing device tensor (never reallocates, so captured graphs keep
         pointing at valid storage)."""
-        self._ensure_elastic_info_tensors()
-        assert self._elastic_info_host is not None and self._elastic_info is not None
         if not self._dead or self._num_physical_experts <= 0:
             # Keep the flag at 0 so the kernel degrades to a normal dispatch.
             # A dead set without the shrunk expert count is transient: the
