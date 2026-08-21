@@ -379,10 +379,7 @@ class NPUWorker(WorkerBase):
                 # abort_timeout - 1.
                 os.environ.setdefault("HCCL_EVENT_TIMEOUT", str(abort_timeout))
                 os.environ.setdefault("HCCL_EXEC_TIMEOUT", str(abort_timeout - 1))
-                if (
-                    int(os.environ["HCCL_EVENT_TIMEOUT"])
-                    <= int(os.environ["HCCL_EXEC_TIMEOUT"])
-                ):
+                if int(os.environ["HCCL_EVENT_TIMEOUT"]) <= int(os.environ["HCCL_EXEC_TIMEOUT"]):
                     raise ValueError(
                         f"HCCL_EVENT_TIMEOUT ({os.environ['HCCL_EVENT_TIMEOUT']}) "
                         "must be greater than HCCL_EXEC_TIMEOUT "

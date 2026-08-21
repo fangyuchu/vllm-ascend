@@ -205,9 +205,7 @@ class AscendConfig:
         # this many seconds. Drives HCCL_EVENT_TIMEOUT / HCCL_EXEC_TIMEOUT
         # (= timeout - 1) and set_op_timeout_ms(timeout * 1000). 0 disables.
         abort_timeout = additional_config.get("ft_communication_abort_timeout", 0)
-        if not isinstance(abort_timeout, int) or not (
-            abort_timeout == 0 or abort_timeout >= 2
-        ):
+        if not isinstance(abort_timeout, int) or not (abort_timeout == 0 or abort_timeout >= 2):
             raise ValueError(
                 "ft_communication_abort_timeout must be 0 (disabled) or an "
                 f"integer of at least 2 seconds, "
