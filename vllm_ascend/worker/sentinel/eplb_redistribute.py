@@ -13,14 +13,19 @@ Ascend-specific pieces:
   quant scales), so captured graphs keep working.
 
 The EPLB structures (physical_to_logical / logical_to_physical /
-logical_replica_count / expert_replica_routing_table) keep the upstream slot
-model end to end: full width, original physical ids. After redistribution
-every surviving slot's original id still routes to its owning (alive) rank —
-``expert_id // num_local_experts`` is the original owner and
-``expert_id % num_local_experts`` is the local slot — so no id-space
-translation is needed anywhere above the MC2 operators. Densified rank
-numbering lives only in the elastic_info tensor (table1/table2, consumed by
-the kernels) and in the rebuilt gloo cpu groups, exactly like upstream.
+logical_replica_count) keep the upstream slot model end to end: full width,
+original physical ids. The one exception is the kernel-facing
+``expert_replica_routing_table`` values: in scale-down mode the MC2 kernels
+override their world view from elastic_info (dense ep size / dense physical
+expert count / own rank = table1[orig]) and route each token via
+``table2[expert_id // num_local]``, while the combine kernel silently drops
+any id >= the shrunk physical expert count — so the ids consumed by the
+kernels must live in the densified space ``dense_rank * num_local + slot``
+(see ``densify_routing_table_physical_ids``). Only the table *values* are
+renumbered; shapes never change and updates are in-place, so captured graphs
+stay valid. Densified rank numbering otherwise lives only in the elastic_info
+tensor (table1/table2, consumed by the kernels) and in the rebuilt gloo cpu
+groups, exactly like upstream.
 
 All functions are deterministic with stable iteration order, so every
 surviving rank running them with the same inputs produces bit-identical
@@ -56,6 +61,7 @@ __all__ = [
     "build_local_reload_plan",
     "check_redundancy_sufficient",
     "compute_dead_ep_ranks",
+    "densify_routing_table_physical_ids",
     "mark_dead_expert_slots_inplace",
     "rebuild_logical_expert_maps",
     "redistribute_expert_placement",
@@ -69,6 +75,49 @@ _W13_WEIGHT_SUFFIXES = ("gate_up_proj.weight", "gate_proj.weight", "up_proj.weig
 _W2_WEIGHT_SUFFIX = "down_proj.weight"
 _W13_SCALE_SUFFIXES = ("gate_up_proj.weight_scale", "gate_proj.weight_scale", "up_proj.weight_scale")
 _W2_SCALE_SUFFIX = "down_proj.weight_scale"
+
+
+def densify_routing_table_physical_ids(
+    routing_table: torch.Tensor,
+    orig_to_dense_rank: torch.Tensor,
+    num_local_experts: int,
+) -> None:
+    """Renumber a routing table's physical ids into the densified id space.
+
+    In scale-down mode the MC2 dispatch kernel computes a token's destination
+    as ``table2[expert_id // num_local]`` and the combine kernel drops any id
+    >= the shrunk physical expert count, so the ids produced by the EPLB
+    mapping must be dense-rank-major: ``dense_rank * num_local + slot``.
+    Keeping original ids only works when the dead ranks happen to be a suffix
+    (then table2 is the identity on the alive prefix); a dead rank in the
+    middle misroutes tokens or crashes the kernel on a -1 rank lookup.
+
+    The update is an in-place ``copy_`` with an unchanged shape, so captured
+    graphs keep pointing at valid storage.
+
+    Args:
+        routing_table: ``expert_replica_routing_table`` of one MoE layer
+            (device, int32), holding original global physical ids.
+        orig_to_dense_rank: ``[ep_world_size]`` original EP rank -> densified
+            rank (-1 for dead ranks), i.e. elastic_info's table1.
+        num_local_experts: physical slots per EP rank (unchanged by
+            scale-down).
+    """
+    ids = routing_table.to(torch.int64)
+    if bool((ids < 0).any()):
+        raise RuntimeError(
+            "[FT] expert replica routing table references empty slots after "
+            "redistribution; every logical expert must have a live replica."
+        )
+    orig_rank = torch.div(ids, num_local_experts, rounding_mode="floor")
+    dense_rank = orig_to_dense_rank.to(device=ids.device, dtype=torch.int64)[orig_rank]
+    if bool((dense_rank < 0).any()):
+        raise RuntimeError(
+            "[FT] expert replica routing table references dead EP ranks after "
+            "redistribution; the placement did not vacate the dead ranks."
+        )
+    dense_ids = dense_rank * num_local_experts + ids % num_local_experts
+    routing_table.copy_(dense_ids.to(routing_table.dtype))
 
 
 def build_local_reload_plan(

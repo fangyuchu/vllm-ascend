@@ -18,6 +18,7 @@ from vllm_ascend.worker.sentinel.eplb_redistribute import (
     build_local_reload_plan,
     check_redundancy_sufficient,
     compute_dead_ep_ranks,
+    densify_routing_table_physical_ids,
     mark_dead_expert_slots_inplace,
     rebuild_logical_expert_maps,
     redistribute_expert_placement,
@@ -171,6 +172,19 @@ class WorkerSentinel(GPUWorkerSentinel):
         # table shape is unchanged so this copy_'s into the storage captured
         # by graphs.
         refresh_model_routing_tables(eplb_model_state)
+
+        # The MC2 kernels require the densified physical-id space while scaled
+        # down (dispatch routes via table2[expert_id // num_local]; combine
+        # silently drops ids >= the shrunk physical expert count). The refresh
+        # above rebuilds the tables with original full-width ids, so renumber
+        # the kernel-facing values in place. Original ids only route correctly
+        # when the dead ranks are a suffix; a dead rank in the middle would
+        # misroute tokens or crash the kernel on a -1 rank lookup.
+        orig_to_dense_rank = get_ep_all2all_manager().to_densified_rank_table()
+        for layer in eplb_model_state.model.moe_layers:
+            routing_table = getattr(getattr(layer, "eplb_state", None), "expert_replica_routing_table", None)
+            if routing_table is not None:
+                densify_routing_table_physical_ids(routing_table, orig_to_dense_rank, num_local_experts)
 
         reload_plan = build_local_reload_plan(p2l_before, p2l.cpu(), ep_rank, num_local_experts)
         if reload_plan:
