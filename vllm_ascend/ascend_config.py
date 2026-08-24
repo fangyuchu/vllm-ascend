@@ -258,10 +258,9 @@ class AscendConfig:
     msmonitor_use_daemon: bool = False
     enable_transpose_kv_cache_by_block: bool = True
     weight_nz_mode: int = 1
-    # Fault-tolerance comm op abort timeout (seconds); 0 = disable. When fault
-    # tolerance is enabled and > 0, a hung NPU comm op is aborted after this
-    # many seconds. Drives HCCL_EVENT_TIMEOUT / HCCL_EXEC_TIMEOUT (= timeout - 1)
-    # and set_op_timeout_ms(timeout * 1000). Validated to be 0 or >= 2.
+    # ---- fault-tolerance: comm op abort timeout (s); 0 = disable ----
+    # Drives HCCL_EVENT_TIMEOUT / HCCL_EXEC_TIMEOUT (= timeout - 1) and
+    # set_op_timeout_ms(timeout * 1000). Validated to be 0 or >= 2.
     ft_communication_abort_timeout: int = 0
 
     # ---- sub-configs (no vllm_config dep): pydantic dict→dataclass coercion ----
@@ -327,11 +326,6 @@ class AscendConfig:
     def _validate_user_input_ranges(self):
         if self.weight_nz_mode not in (0, 1, 2):
             raise ValueError(f"weight_nz_mode must be one of 0, 1, or 2; got {self.weight_nz_mode}")
-        if not (self.ft_communication_abort_timeout == 0 or self.ft_communication_abort_timeout >= 2):
-            raise ValueError(
-                "ft_communication_abort_timeout must be 0 (disabled) or an "
-                f"integer of at least 2 seconds, got {self.ft_communication_abort_timeout}"
-            )
         return self
 
     # ---- derivations + cross-config downgrades/mutex ----
@@ -435,9 +429,6 @@ class AscendConfig:
             logger.warning_once(
                 "MegaMoe is not supported for this model config, VLLM_ASCEND_ENABLE_FUSED_MC2 will be set to 0."
             )
-        # ft_communication_abort_timeout is a declared AscendConfig field; it is
-        # populated from additional_config via the factory kwargs
-        # (see init_ascend_config) and validated by _validate_user_input_ranges.
 
         # PD tp_ratio / head_ratio / num_head_replica derivation
         if vc.kv_transfer_config is not None and vc.model_config is not None and not vc.model_config.is_deepseek_mla:
@@ -524,6 +515,17 @@ class AscendConfig:
 
         # sparse KV offload vs sparse SFA C8 main cache mutex
         self._validate_sparse_c8_kv_offload_compatibility()
+
+        # ft_communication_abort_timeout only takes effect when fault tolerance
+        # is enabled, so validate it only then: a stray value in additional_config
+        # must not fail startup for non-FT runs.
+        if vc.parallel_config.enable_fault_tolerance and (
+            self.ft_communication_abort_timeout != 0 and self.ft_communication_abort_timeout < 2
+        ):
+            raise ValueError(
+                f"ft_communication_abort_timeout must be 0 (disabled) or an integer of at least "
+                f"2 seconds, got {self.ft_communication_abort_timeout}"
+            )
         return self
 
     def _validate_mc2_hierarchy_comm(self, vllm_config: VllmConfig) -> None:
