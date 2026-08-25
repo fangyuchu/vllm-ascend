@@ -124,6 +124,7 @@ from vllm_ascend.utils import (
     register_device_print,
     setup_ascend_local_comm_res,
 )
+from vllm_ascend.worker.sentinel.npu_worker_sentinel import WorkerSentinel, fault_barrier_wrapper
 
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
@@ -139,7 +140,6 @@ def get_kv_cache_groups(
 ) -> list[KVCacheGroupSpec]:
     return get_kv_cache_config_builder(vllm_config).get_kv_cache_groups(vllm_config, kv_cache_spec)
 
-from vllm_ascend.worker.sentinel.npu_worker_sentinel import WorkerSentinel
 
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
 from torch._dynamo.variables import TorchInGraphFunctionVariable  # noqa: E402
@@ -1008,6 +1008,7 @@ class NPUWorker(GPUWorker):
             self.torch_allocated / GiB_bytes,
         )
 
+    @fault_barrier_wrapper
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1065,6 +1066,7 @@ class NPUWorker(GPUWorker):
         return None
 
     @torch.inference_mode()
+    @fault_barrier_wrapper
     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
         output = self.model_runner.sample_tokens(grammar_output)
         return output
