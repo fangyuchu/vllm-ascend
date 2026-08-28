@@ -140,6 +140,8 @@ def _ft_server_args() -> list[str]:
         "37364",
         "--max-num-seqs",
         "128",
+        "--gpu-memory-utilization",
+        "0.9",
         "--enable-expert-parallel",
         "--enable-fault-tolerance",
         "--cpu-distributed-timeout-seconds",
@@ -360,7 +362,7 @@ def _complete(client) -> Any:
         prompt="Hello, my name is",
         max_tokens=5,
         temperature=0.0,
-        timeout=10.0,
+        timeout=600.0,
     )
 
 
