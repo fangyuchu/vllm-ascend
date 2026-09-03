@@ -29,6 +29,11 @@ def _patched_get_unsupported_features(self) -> list[str]:
     unsupported_feature = support.unsupported_feature if support is not None else None
     if unsupported_feature is not None and unsupported_feature in unsupported:
         unsupported.remove(unsupported_feature)
+    # Upstream EEP (elastic expert parallelism) does not support the V2 model
+    # runner, so it is listed as unsupported; Ascend's V2 runner supports
+    # elastic EP, so drop that entry here.
+    if "elastic expert parallelism" in unsupported:
+        unsupported.remove("elastic expert parallelism")
     return unsupported
 
 

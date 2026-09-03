@@ -6,6 +6,7 @@
 from functools import wraps
 from inspect import signature
 
+import vllm.distributed.nixl_utils as _nixl_utils
 from vllm.config import parallel as _parallel_config
 from vllm.distributed.eplb import eplb_communicator as _eplb_communicator
 from vllm.distributed.eplb import eplb_state as _eplb_state
@@ -18,6 +19,12 @@ from vllm_ascend.distributed.eplb.state import (
 )
 
 _PATCH_MARKER = "_vllm_ascend_eplb_patch"
+
+# Ascend does not use NIXL; EPLB is routed to torch_gloo (the stateless gloo
+# cpu_group is registered into torch's global _world). Pretend NIXL is
+# available so vLLM's "elastic EP + async EPLB requires NIXL" check passes;
+# the communicator is normalized back to torch_gloo in _validate_eplb_config.
+_nixl_utils.is_nixl_available = lambda: True
 
 
 class _DeferredConsumedEvent:

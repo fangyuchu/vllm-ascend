@@ -16,6 +16,7 @@
 #
 import torch
 import torch.nn.functional as F
+import vllm.envs as envs
 from vllm.distributed import (
     get_dp_group,
     get_ep_group,
@@ -86,16 +87,17 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                 self._quant_method,
             )
 
-        setup_moe_comm_method(self.moe_config)
-        alltoall_comm = get_moe_comm_method(MoECommType.ALLTOALL)
-        if alltoall_comm is not None:
-            expert_ids_per_ep_rank = getattr(alltoall_comm.token_dispatcher, "expert_ids_per_ep_rank", None)
-            if expert_ids_per_ep_rank is not None:
-                self.routed_experts.register_buffer(
-                    "expert_ids_per_ep_rank",
-                    expert_ids_per_ep_rank,
-                    persistent=False,
-                )
+        if not envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
+            setup_moe_comm_method(self.moe_config)
+            alltoall_comm = get_moe_comm_method(MoECommType.ALLTOALL)
+            if alltoall_comm is not None:
+                expert_ids_per_ep_rank = getattr(alltoall_comm.token_dispatcher, "expert_ids_per_ep_rank", None)
+                if expert_ids_per_ep_rank is not None:
+                    self.routed_experts.register_buffer(
+                        "expert_ids_per_ep_rank",
+                        expert_ids_per_ep_rank,
+                        persistent=False,
+                    )
 
     @property
     def is_internal_router(self) -> bool:

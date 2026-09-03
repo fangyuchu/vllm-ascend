@@ -3,7 +3,6 @@
 
 """Ascend-owned extensions for the upstream EPLB state."""
 
-import inspect
 from dataclasses import fields
 from typing import Any
 
@@ -15,11 +14,6 @@ from vllm.distributed.eplb import eplb_state as _eplb_state
 from vllm_ascend.ops.fused_moe import eplb as _eplb_ops
 
 ASYNC_EPLB_CYCLE_COMMITTED_LOG = "Ascend async EPLB cycle committed"
-
-
-def _upstream_from_mapping_accepts_valid_expert_count() -> bool:
-    """Return whether the selected vLLM uses the release mapping contract."""
-    return "num_valid_physical_experts" in inspect.signature(_eplb_state.EplbState.from_mapping).parameters
 
 
 class AscendEplbLayerState(_eplb_state.EplbLayerState):
@@ -152,28 +146,15 @@ class AscendEplbState(_eplb_state.EplbState):
             self._has_fresh_recorded_load = False
         return result
 
-    @classmethod
-    def from_mapping(
-        cls,
-        model,
-        model_config,
-        device: torch.device,
-        parallel_config,
+    def update_mapping(
+        self,
+        model_config: Any,
         expanded_physical_to_logical: torch.Tensor,
-        num_valid_physical_experts: int | None = None,
-    ) -> "AscendEplbState":
-        from_mapping_kwargs: dict[str, Any] = {
-            "model": model,
-            "model_config": model_config,
-            "device": device,
-            "parallel_config": parallel_config,
-            "expanded_physical_to_logical": expanded_physical_to_logical,
-        }
-        if _upstream_from_mapping_accepts_valid_expert_count():
-            if num_valid_physical_experts is None:
-                raise TypeError("num_valid_physical_experts is required by the selected vLLM release mapping contract")
-            from_mapping_kwargs["num_valid_physical_experts"] = num_valid_physical_experts
-        state = super().from_mapping(**from_mapping_kwargs)
-        for model_state in state.model_states.values():
+    ) -> None:
+        # Elastic EP reconfiguration (vLLM #51885) updates the expert mapping
+        # in place via update_mapping — from_mapping for new workers included —
+        # instead of the pre-#51885 num_valid_physical_experts contract, so the
+        # graph-stable replica routing tables must be refreshed here too.
+        super().update_mapping(model_config, expanded_physical_to_logical)
+        for model_state in self.model_states.values():
             refresh_model_routing_tables(model_state)
-        return state

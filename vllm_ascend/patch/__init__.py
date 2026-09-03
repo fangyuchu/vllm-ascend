@@ -560,6 +560,15 @@
 #       (model architecture, Triton, feature checks) without crashes or
 #       degraded functionality.
 #
+#   2. `vllm.config.vllm.VllmConfig._get_v2_model_runner_unsupported_features`
+#    Why:
+#       Ascend V2 runner supports elastic EP, which upstream lists as
+#       unsupported (vllm/config/vllm.py). Drop it from the returned list.
+#    Related PR (if no, explain why):
+#       No, NPU V2 model runner supports elastic EP.
+#    Future Plan:
+#       Remove when upstream V2 runner supports elastic EP on non-CUDA backends.
+#
 # * Worker Patch:
 # ===============
 # Entries are listed in alphabetical order by file name.
@@ -1147,4 +1156,29 @@
 #    Future Plan:
 #       Remove this patch once vllm-ascend's bundled PyTorch >= 2.13.0
 #       (which, like upstream, allows eps >= 0 for inference).
+#
+# ** 35. File: platform/patch_stateless_coordinator.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.distributed.utils.stateless_init_torch_distributed_process_group`
+#      `vllm.distributed.utils.stateless_destroy_torch_distributed_process_group`
+#    Why:
+#       Stateless PG helpers do not register the group into torch's global
+#       ``_world``, so HCCL groups are unusable with torch.distributed APIs.
+#    How:
+#       Register HCCL groups into ``_world`` on init; remove on destroy.
+#    Related PR (if no, explain why):
+#       No, NPU-specific HCCL stateless process-group registration.
+#    Future Plan:
+#       Remove if upstream registers stateless HCCL groups into ``_world``.
+#   2. `vllm.distributed.stateless_coordinator.CudaCommunicator`
+#    Why:
+#       Upstream hardcodes ``CudaCommunicator``; Ascend needs an HCCL-aware
+#       device communicator.
+#    How:
+#       Replace ``CudaCommunicator`` with ``NPUCommunicator`` in the module.
+#    Related PR (if no, explain why):
+#       No, NPU-specific HCCL communicator selection requirement.
+#    Future Plan:
+#       Remove if upstream ``StatelessGroupCoordinator`` gains a platform
+#       hook for communicator selection.
 #

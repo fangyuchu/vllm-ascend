@@ -192,7 +192,6 @@ class TestAscendEPLBController(unittest.TestCase):
                 model=model,
                 model_config=model_config,
                 expanded_physical_to_logical=mapping,
-                old_num_physical_experts=2,
             )
 
         unwrap_moe.assert_called_once_with(model)
@@ -202,7 +201,6 @@ class TestAscendEPLBController(unittest.TestCase):
             device=controller.device,
             parallel_config=controller.parallel_config,
             expanded_physical_to_logical=mapping,
-            num_valid_physical_experts=2,
         )
         self.assertIs(controller.state, state)
         self.assertTrue(controller._has_registered_models)
@@ -226,7 +224,6 @@ class TestAscendEPLBController(unittest.TestCase):
                 model=model,
                 model_config=SimpleNamespace(),
                 expanded_physical_to_logical=torch.tensor([0]),
-                old_num_physical_experts=1,
             )
 
 

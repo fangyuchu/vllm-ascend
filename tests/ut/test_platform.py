@@ -232,6 +232,21 @@ class TestNPUPlatform(TestBase):
         ):
             _validate_eplb_config(vllm_config)
 
+    def test_validate_eplb_config_normalizes_pynccl_to_gloo_for_elastic_ep(self):
+        vllm_config = self.mock_vllm_config()
+        vllm_config.use_v2_model_runner = True
+        vllm_config.parallel_config.enable_eplb = True
+        vllm_config.parallel_config.enable_elastic_ep = True
+        vllm_config.parallel_config.eplb_config.communicator = "pynccl"
+
+        with patch.dict("os.environ", {}, clear=True):
+            _validate_eplb_config(vllm_config)
+
+        self.assertEqual(
+            vllm_config.parallel_config.eplb_config.communicator,
+            "torch_gloo",
+        )
+
     def test_validate_eplb_config_allows_load_collection_phase_with_dbo_and_spec_decode(
         self,
     ):

@@ -4,7 +4,6 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import pytest
 import torch
 from vllm.distributed.eplb import eplb_state as upstream_eplb_state
 
@@ -95,98 +94,30 @@ def test_async_rearrange_defers_routing_refresh_to_workspace_hook(monkeypatch):
     refresh.assert_not_called()
 
 
-def test_from_mapping_refreshes_final_mapping(monkeypatch):
-    model_state = object()
+def test_update_mapping_refreshes_all_model_routing_tables(monkeypatch):
+    model_states = {"model": object()}
+    received_args = {}
 
-    def upstream_from_mapping(cls, **kwargs):
-        state = cls.__new__(cls)
-        state.model_states = {"model": model_state}
-        return state
+    def upstream_update_mapping(self, model_config, expanded_physical_to_logical):
+        received_args["model_config"] = model_config
+        received_args["mapping"] = expanded_physical_to_logical
 
     refresh = MagicMock()
     monkeypatch.setattr(
         upstream_eplb_state.EplbState,
-        "from_mapping",
-        classmethod(upstream_from_mapping),
+        "update_mapping",
+        upstream_update_mapping,
     )
     monkeypatch.setattr(eplb_state, "refresh_model_routing_tables", refresh)
+    state = AscendEplbState.__new__(AscendEplbState)
+    state.model_states = model_states
 
-    state = AscendEplbState.from_mapping(
-        model=object(),
-        model_config=object(),
-        device=torch.device("cpu"),
-        parallel_config=object(),
-        expanded_physical_to_logical=torch.zeros(1),
-    )
+    mapping = torch.zeros((1, 2))
+    state.update_mapping("model_config", mapping)
 
-    assert isinstance(state, AscendEplbState)
-    refresh.assert_called_once_with(model_state)
-
-
-def test_from_mapping_forwards_release_valid_expert_count(monkeypatch):
-    received_count = None
-
-    def upstream_from_mapping(
-        cls,
-        model,
-        model_config,
-        device,
-        parallel_config,
-        expanded_physical_to_logical,
-        num_valid_physical_experts,
-    ):
-        del model, model_config, device, parallel_config
-        del expanded_physical_to_logical
-        nonlocal received_count
-        received_count = num_valid_physical_experts
-        state = cls.__new__(cls)
-        state.model_states = {}
-        return state
-
-    monkeypatch.setattr(
-        upstream_eplb_state.EplbState,
-        "from_mapping",
-        classmethod(upstream_from_mapping),
-    )
-
-    AscendEplbState.from_mapping(
-        model=object(),
-        model_config=object(),
-        device=torch.device("cpu"),
-        parallel_config=object(),
-        expanded_physical_to_logical=torch.zeros((1, 2)),
-        num_valid_physical_experts=1,
-    )
-
-    assert received_count == 1
-
-
-def test_from_mapping_requires_release_valid_expert_count(monkeypatch):
-    def upstream_from_mapping(
-        cls,
-        model,
-        model_config,
-        device,
-        parallel_config,
-        expanded_physical_to_logical,
-        num_valid_physical_experts,
-    ):
-        raise AssertionError("release mapping must receive a valid count")
-
-    monkeypatch.setattr(
-        upstream_eplb_state.EplbState,
-        "from_mapping",
-        classmethod(upstream_from_mapping),
-    )
-
-    with pytest.raises(TypeError, match="required by the selected vLLM release"):
-        AscendEplbState.from_mapping(
-            model=object(),
-            model_config=object(),
-            device=torch.device("cpu"),
-            parallel_config=object(),
-            expanded_physical_to_logical=torch.zeros((1, 2)),
-        )
+    assert received_args["model_config"] == "model_config"
+    assert received_args["mapping"] is mapping
+    refresh.assert_called_once_with(model_states["model"])
 
 
 def test_init_sets_cuda_device_index_for_npu(monkeypatch):
