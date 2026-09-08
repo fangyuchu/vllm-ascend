@@ -633,7 +633,18 @@ class NPUPlatform(Platform):
 
         pg = ProcessGroup(prefix_store, group_rank, group_size)
 
+        # Agree on one unique comm label for this group via the group store:
+        # identical on every rank and fresh per group creation, so repeated
+        # elastic scaling rounds never reuse a label.
+        if group_rank == 0:
+            hccl_comm_name = uuid4().hex
+            pg.get_group_store().set("hccl_comm_name", hccl_comm_name)
+        else:
+            hccl_comm_name = pg.get_group_store().get("hccl_comm_name").decode("utf-8")
+
         backend_options = ProcessGroupHCCL.Options()
+
+        backend_options.group_id = hccl_comm_name
         backend_options._timeout = timeout
 
         # Create Backend object
@@ -651,15 +662,8 @@ class NPUPlatform(Platform):
         backend_class._set_sequence_number_for_group()
         backend_type = ProcessGroup.BackendType.CUSTOM
         pg._register_backend(device, backend_type, backend_class)
-        if group_rank == 0:
-            hccl_comm_name = uuid4().hex
-            pg.get_group_store().set("hccl_comm_name", hccl_comm_name)
-        else:
-            hccl_comm_name = pg.get_group_store().get("hccl_comm_name").decode("utf-8")
-        if hccl_comm_name is not None:
-            group_desc = "undefined"
-            backend_class._set_hccl_comm_name(hccl_comm_name)
-            pg._set_group_desc(group_desc)
+        backend_class._set_hccl_comm_name(hccl_comm_name)
+        pg._set_group_desc("undefined")
 
         return pg
 

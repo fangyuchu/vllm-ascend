@@ -148,11 +148,14 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
             yield
 
     def prepare_reconfiguration(self, reconfig_request: ReconfigureDistributedRequest, use_all2all: bool) -> None:
-        # Reuse the upstream implementation to build the world / dp / ep / eplb
-        # standby groups and run the eager-mode preparation steps (staging,
-        # EPLB communicator creation, weight transfer, group warm-up), then
-        # create the Ascend-specific MC2 standby group.
-        super().prepare_reconfiguration(reconfig_request, use_all2all)
+        # Create the Ascend-specific MC2 standby group FIRST. After a2257f95
+        # the upstream preparation runs transfer_weights internally (a P2P
+        # send that blocks until the new worker's prepare_new_worker joins),
+        # and the new worker's boot blocks at its own MC2 rendezvous
+        # (init_ascend_model_parallel), which can only complete once our
+        # standby MC2 group exists. Creating the MC2 standby group after
+        # super() would therefore deadlock: the existing workers wait in the
+        # weight transfer, the new worker waits in the MC2 rendezvous.
         create_ascend_standby_groups(
             new_dp_size=reconfig_request.new_data_parallel_size,
             new_world_size_across_dp=(
@@ -161,6 +164,11 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
             master_ip=reconfig_request.new_data_parallel_master_ip,
             coord_store_port=reconfig_request.coord_store_port,
         )
+        # Reuse the upstream implementation to build the world / dp / ep / eplb
+        # standby groups and run the eager-mode preparation steps (staging,
+        # EPLB communicator creation, weight transfer; group warm-up is
+        # disabled on Ascend, see _warm_target_groups).
+        super().prepare_reconfiguration(reconfig_request, use_all2all)
 
     def transfer_weights(self, old_dp_size: int, new_dp_size: int) -> None:
         with _PATCH_LOCK, self._use_ascend_transfer_impl():
@@ -230,23 +238,30 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
             super().prepare_new_worker()
 
     def _warm_target_groups(self, dp_group, ep_group) -> None:
-        # torch_npu's ProcessGroupHCCL binds each communicator to the INPUT
-        # TENSOR's device (getDeviceList -> OptionalNPUGuard ->
-        # hcclCommInitRootInfoConfig); Options._device and the thread's
-        # current device are ignored. StatelessGroupCoordinator.device comes
-        # from the world group's device_index, which is 0 in every Ray actor
-        # process, so a tensor allocated there makes all ranks bind the same
-        # physical NPU (HCCL EI0015 ranktable error). Warm from this worker's
-        # own (dp-shifted) device instead.
-        assert dp_group is not None and ep_group is not None
-        device = self.worker.device
-        current_platform.set_device(device)
-        stream = torch.Stream(device=device)
-        with stream:
-            tensor = torch.zeros(1, dtype=torch.int32, device=device)
-            for group in (dp_group, ep_group):
-                torch.distributed.all_reduce(tensor, group=group.device_group)
-                stream.synchronize()
+        # Disabled on Ascend. Upstream (vLLM a2257f95) warms the freshly
+        # created standby groups with a dummy all_reduce on a dedicated
+        # stream, so the HCCL link is established during the prepare phase
+        # instead of inside the commit (downtime) window. This does not hold
+        # for NPU today:
+        #   * ProcessGroupHCCL creates its communicator lazily at the first
+        #     collective, and running that first collective under the warm's
+        #     torch.Stream context trips HCCL/NPU stream errors (EI0015
+        #     ranktable detect, HCCL_E_PTR during comm init) that do not
+        #     occur when the same collective runs on the default stream.
+        #   * Steady-state serving never issues torch.distributed
+        #     collectives on the stateless dp/ep device groups anyway: DP
+        #     batch coordination runs on CPU (gloo), MoE dispatch runs on
+        #     MC2 kernels with their own communicators, and EPLB expert
+        #     transfers use the gloo CPU-staging communicator. There is no
+        #     pre-established link to preserve.
+        # Trade-off: if a future code path collects on these groups, its
+        # first call pays the link setup inside the commit window. Revisit
+        # this no-op when torch_npu stream handling tolerates the upstream
+        # warm pattern.
+        #
+        # Kept as a no-op override so both upstream call sites
+        # (prepare_reconfiguration / prepare_new_worker) work unchanged.
+        return
 
     def warmup_local_kernels(self) -> None:
         pass
