@@ -33,6 +33,7 @@ from vllm_ascend.distributed.elastic_ep.standby_state import (
     pop_ascend_standby_groups,
 )
 from vllm_ascend.distributed.parallel_state import (
+    GroupCoordinator,
     _replace_ascend_active_groups,
     get_mc2_group,
 )
@@ -146,10 +147,12 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         ):
             yield
 
-    def create_standby_groups(self, reconfig_request: ReconfigureDistributedRequest, use_all2all: bool) -> None:
+    def prepare_reconfiguration(self, reconfig_request: ReconfigureDistributedRequest, use_all2all: bool) -> None:
         # Reuse the upstream implementation to build the world / dp / ep / eplb
-        # standby groups, then create the Ascend-specific MC2 standby group.
-        super().create_standby_groups(reconfig_request, use_all2all)
+        # standby groups and run the eager-mode preparation steps (staging,
+        # EPLB communicator creation, weight transfer, group warm-up), then
+        # create the Ascend-specific MC2 standby group.
+        super().prepare_reconfiguration(reconfig_request, use_all2all)
         create_ascend_standby_groups(
             new_dp_size=reconfig_request.new_data_parallel_size,
             new_world_size_across_dp=(
@@ -195,11 +198,13 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
 
     def switch_and_remove(self) -> None:
         super().switch_and_remove()
-        _replace_ascend_active_groups(mc2=None)
+        retired_mc2 = _replace_ascend_active_groups(mc2=None)
+        if retired_mc2 is not None:
+            retired_mc2.destroy()
 
-    def switch_and_prepare(self) -> None:
-        super().switch_and_prepare()
-        _replace_ascend_active_groups(**pop_ascend_standby_groups())
+    def switch_and_prepare(self) -> tuple[GroupCoordinator | None, ...]:
+        retired_groups = super().switch_and_prepare()
+        retired_mc2 = _replace_ascend_active_groups(**pop_ascend_standby_groups())
         self.worker.model_runner.dp_size = self.worker.parallel_config.data_parallel_size
         self.worker.model_runner.dp_rank = self.worker.parallel_config.data_parallel_rank
         moe_modules = [module for module in self.worker.model_runner.model.modules() if is_moe_layer(module)]
@@ -209,15 +214,39 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
             module.moe_config.ep_group = get_ep_group()
             module.moe_config.mc2_group = get_mc2_group()
         self._setup_moe_comm_and_quant_method()
+        if retired_mc2 is not None:
+            # The retired MC2 group joins the upstream retired groups so the
+            # executor's async cleanup thread destroys it after the switch.
+            return (*retired_groups, retired_mc2)
+        return retired_groups
 
-    def receive_expert_mapping(self) -> tuple[torch.Tensor, int, int]:
-        mapping, num_logical_experts, num_valid_experts = super().receive_expert_mapping()
+    def receive_expert_mapping(self) -> torch.Tensor:
+        mapping = super().receive_expert_mapping()
         self._setup_moe_comm_and_quant_method()
-        return mapping, num_logical_experts, num_valid_experts
+        return mapping
 
-    def receive_weights(self) -> None:
+    def prepare_new_worker(self) -> None:
         with _PATCH_LOCK, self._use_ascend_transfer_impl():
-            super().receive_weights()
+            super().prepare_new_worker()
+
+    def _warm_target_groups(self, dp_group, ep_group) -> None:
+        # torch_npu's ProcessGroupHCCL binds each communicator to the INPUT
+        # TENSOR's device (getDeviceList -> OptionalNPUGuard ->
+        # hcclCommInitRootInfoConfig); Options._device and the thread's
+        # current device are ignored. StatelessGroupCoordinator.device comes
+        # from the world group's device_index, which is 0 in every Ray actor
+        # process, so a tensor allocated there makes all ranks bind the same
+        # physical NPU (HCCL EI0015 ranktable error). Warm from this worker's
+        # own (dp-shifted) device instead.
+        assert dp_group is not None and ep_group is not None
+        device = self.worker.device
+        current_platform.set_device(device)
+        stream = torch.Stream(device=device)
+        with stream:
+            tensor = torch.zeros(1, dtype=torch.int32, device=device)
+            for group in (dp_group, ep_group):
+                torch.distributed.all_reduce(tensor, group=group.device_group)
+                stream.synchronize()
 
     def warmup_local_kernels(self) -> None:
         pass

@@ -175,12 +175,15 @@ def init_ascend_model_parallel(
 def _replace_ascend_active_groups(
     *,
     mc2: GroupCoordinator | None,
-) -> None:
-    """Replace the current MC2 group; all ranks must call this together."""
+) -> GroupCoordinator | None:
+    """Replace the current MC2 group and return the group it replaced.
+
+    The caller must destroy the returned MC2 group collectively.
+    """
     global _MC2
-    if _MC2 is not None:
-        _MC2.destroy()
+    retired_mc2 = _MC2
     _MC2 = mc2
+    return retired_mc2
 
 
 def model_parallel_initialized():
