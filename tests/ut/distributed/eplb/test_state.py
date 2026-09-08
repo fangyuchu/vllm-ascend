@@ -189,6 +189,28 @@ def test_from_mapping_requires_release_valid_expert_count(monkeypatch):
         )
 
 
+def test_update_mapping_refreshes_routing_tables(monkeypatch):
+    model_state = object()
+
+    def upstream_update_mapping(self, model_config, expanded_physical_to_logical):
+        assert expanded_physical_to_logical.shape == (1, 2)
+
+    refresh = MagicMock()
+    monkeypatch.setattr(
+        upstream_eplb_state.EplbState,
+        "update_mapping",
+        upstream_update_mapping,
+    )
+    monkeypatch.setattr(eplb_state, "refresh_model_routing_tables", refresh)
+    model_config = SimpleNamespace(compute_hash=lambda: "model")
+    state = AscendEplbState.__new__(AscendEplbState)
+    state.model_states = {"model": model_state}
+
+    state.update_mapping(model_config, torch.zeros((1, 2)))
+
+    refresh.assert_called_once_with(model_state)
+
+
 def test_init_sets_cuda_device_index_for_npu(monkeypatch):
     parallel_config = MagicMock()
     monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 5)
