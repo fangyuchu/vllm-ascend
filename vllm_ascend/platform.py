@@ -685,6 +685,7 @@ class NPUPlatform(Platform):
         backend_type = ProcessGroup.BackendType.CUSTOM
         pg._register_backend(device, backend_type, backend_class)
         backend_class._set_hccl_comm_name(hccl_comm_name)
+        pg._set_group_desc("undefined")
 
         return pg
 
@@ -947,7 +948,11 @@ def _validate_eplb_config(vllm_config: VllmConfig) -> None:
             raise ValueError("additional_config.eplb_config.load_collection_phase requires --enable-eplb.")
         if vllm_config.parallel_config.enable_eplb:
             upstream_eplb_config = vllm_config.parallel_config.eplb_config
-            if upstream_eplb_config.communicator not in (None, "torch_gloo"):
+            # vLLM presets "pynccl" (or "nixl" when NIXL is detected) when
+            # elastic EP is enabled; Ascend uses the torch_gloo CPU-staging
+            # communicator for both regular and elastic EP, so normalize
+            # "pynccl"/"nixl" to "torch_gloo" here.
+            if upstream_eplb_config.communicator not in (None, "torch_gloo", "pynccl", "nixl"):
                 raise ValueError(
                     "Async EPLB on Ascend requires the torch_gloo communicator "
                     f"(CPU staging), but got {upstream_eplb_config.communicator!r}. "
@@ -960,7 +965,7 @@ def _validate_eplb_config(vllm_config: VllmConfig) -> None:
                     "action: forcing asynchronous EPLB."
                 )
                 upstream_eplb_config.use_async = True
-                upstream_eplb_config.communicator = "torch_gloo"
+            upstream_eplb_config.communicator = "torch_gloo"
     elif "load_collection_phase" in eplb_config:
         raise ValueError(
             "additional_config.eplb_config.load_collection_phase is only supported by "
