@@ -747,6 +747,7 @@ class NPUPlatform(Platform):
         backend_type = ProcessGroup.BackendType.CUSTOM
         pg._register_backend(device, backend_type, backend_class)
         backend_class._set_hccl_comm_name(hccl_comm_name)
+        pg._set_group_desc("undefined")
 
         return pg
 
@@ -1072,7 +1073,7 @@ def _validate_eplb_config(vllm_config: VllmConfig) -> None:
             raise ValueError("additional_config.eplb_config.load_collection_phase requires --enable-eplb.")
         if vllm_config.parallel_config.enable_eplb:
             upstream_eplb_config = vllm_config.parallel_config.eplb_config
-            if upstream_eplb_config.communicator not in (None, "torch_gloo", "hixl"):
+            if upstream_eplb_config.communicator not in (None, "torch_gloo", "hixl", "pynccl", "nixl"):
                 raise ValueError(
                     "Async EPLB on Ascend requires the torch_gloo or hixl communicator "
                     f"but got {upstream_eplb_config.communicator!r}. "
