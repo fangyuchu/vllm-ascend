@@ -86,6 +86,12 @@ def build_token_dispatch_input_fixture(
 
 class TestTokenDispatcherWithMC2(TestBase):
     def setUp(self):
+        self.v3_env_patcher = patch(
+            "vllm_ascend.ops.fused_moe.token_dispatcher.envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3",
+            False,
+            create=True,
+        )
+        self.v3_env_patcher.start()
         self.config_patcher = patch("vllm_ascend.ops.fused_moe.token_dispatcher.get_current_vllm_config")
         self.mock_get_config = self.config_patcher.start()
 
@@ -98,6 +104,7 @@ class TestTokenDispatcherWithMC2(TestBase):
         mock_config.speculative_config = None
 
         mock_config.parallel_config.tensor_parallel_size = 1
+        mock_config.parallel_config.enable_fault_tolerance = False
 
         self.mock_get_config.return_value = mock_config
         self.mc2_tokens_capacity = 128
@@ -157,6 +164,7 @@ class TestTokenDispatcherWithMC2(TestBase):
         self.dispatcher = TokenDispatcherWithMC2(**kwargs)
 
     def tearDown(self):
+        self.v3_env_patcher.stop()
         self.config_patcher.stop()
         self.mc2_capacity_patch.stop()
         self.mc2_group_patch.stop()
@@ -854,6 +862,10 @@ class TestTokenDispatcherWithAll2AllV(TestBase):
         self.mock_ep_group_prop = patcher1.start()
         self.mock_ep_rank_prop = patcher2.start()
         self.mock_ep_size_prop = patcher3.start()
+        group = MagicMock(rank_in_group=0, world_size=2)
+        group_lookup = patch("vllm_ascend.ops.fused_moe.token_dispatcher.get_ep_group", return_value=group)
+        group_lookup.start()
+        self.addCleanup(group_lookup.stop)
 
         # TokenDispatcherWithAll2AllV obtains the local rank while building
         # the HCCL group name.  A MagicMock group alone is not sufficient on

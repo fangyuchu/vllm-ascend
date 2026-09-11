@@ -26,8 +26,12 @@ from vllm.v1.worker.sentinel.gpu_worker_sentinel import (
     WorkerSentinel as GPUWorkerSentinel,
 )
 
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.eplb.state import refresh_model_routing_tables
+from vllm_ascend.distributed.parallel_state import (
+    set_v3_elastic_info_from_ep,
+)
 from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.worker.sentinel.eplb_redistribute import (
     build_orig_to_dense_rank_table,
@@ -43,16 +47,7 @@ _sentinel: "WorkerSentinel | None" = None
 
 
 def fault_barrier_wrapper(func: Callable):
-    """Barrier between device faults and the async step loop.
-
-    On the first device-touching fault (e.g. an EP-group allreduce failing on a
-    dead peer that poisons the model stream) it quarantines the worker and
-    resets the device immediately, before any tensor teardown on the broken
-    stream can std::terminate the process. While quarantined, wrapped methods
-    short-circuit with an empty output so in-flight async steps drain safely
-    without re-hitting the device; retry lifts the quarantine only after the
-    groups are rebuilt.
-    """
+    """Quarantine and reset the worker, then propagate its first fault."""
 
     def wrapped(self, *args, **kwargs):
         sentinel = _sentinel
@@ -167,7 +162,9 @@ class WorkerSentinel(GPUWorkerSentinel):
             raise ValueError(
                 "[FT] scale_down (elastic_info) is mutually exclusive with mc2 hierarchy comm (comm_alg='hierarchy')."
             )
-        if not hasattr(torch_npu, "npu_moe_distribute_dispatch_v2"):
+        if not envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3 and not hasattr(
+            torch_npu, "npu_moe_distribute_dispatch_v2"
+        ):
             raise ValueError(
                 "[FT] scale_down requires npu_moe_distribute_dispatch_v2 "
                 "(aclnn V3+); please upgrade the CANN/torch_npu version."
@@ -213,6 +210,8 @@ class WorkerSentinel(GPUWorkerSentinel):
         # their ids into the densified space for the MC2 kernels.
         refresh_model_routing_tables(eplb_model_state)
         self._densify_routing_tables(eplb_model_state)
+        if envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3:
+            set_v3_elastic_info_from_ep(get_ep_all2all_manager().get_elastic_info())
 
     def _densify_routing_tables(self, eplb_model_state) -> None:
         """Renumber the kernel-facing routing tables into the densified id space.

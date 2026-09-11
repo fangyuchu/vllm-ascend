@@ -82,6 +82,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Emit per-layer KVPool ranged transfer audit events. Default: 0 (disabled).
     # Valid values: 0 or 1. This configuration is not sensitive.
     "VLLM_ASCEND_KVPOOL_RANGE_DEBUG": lambda: _strict_binary_env("VLLM_ASCEND_KVPOOL_RANGE_DEBUG"),
+    # Whether to use MoeDistribute V3 low-latency dispatch/combine for the
+    # MC2 MoE communication path. 0 (default): disabled; 1: enabled. This is
+    # currently supported on Ascend A3 for external Elastic EP validation.
+    # Valid values are 0 and 1; not sensitive.
+    "VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3", "0"))),
 }
 
 # end-env-vars-definition
