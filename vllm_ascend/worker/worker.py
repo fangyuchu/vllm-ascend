@@ -222,6 +222,12 @@ class NPUWorker(WorkerBase):
             signal.signal(signal.SIGTERM, signal_handler)
             signal.signal(signal.SIGINT, signal_handler)
 
+    def set_elastic_ep_dp_collective_state(self, state: torch.Tensor) -> None:
+        """Expose serving DP collective progress to the EngineCore process."""
+        from vllm.v1.worker.gpu.dp_utils import configure_dp_collective_state
+
+        configure_dp_collective_state(state)
+
     def handle_ft_command(self, ft_request):
         assert self.worker_sentinel is not None
         return self.worker_sentinel.handle_command(ft_request)
@@ -407,6 +413,12 @@ class NPUWorker(WorkerBase):
         # shift self.local_rank by dp_local_rank * tp_pp_world_size so
         # that each DP group binds to a distinct set of NPUs.
         parallel_config = self.parallel_config
+        logger.info(
+            "[FT_DIAG] NPU worker initializing: worker_rank=%s, dp_rank=%s, enable_fault_tolerance=%s",
+            self.rank,
+            parallel_config.data_parallel_rank,
+            parallel_config.enable_fault_tolerance,
+        )
         if self.parallel_config.enable_fault_tolerance:
             if self.use_v2_model_runner:
                 # Model Runner V2 + fault tolerance task queue
@@ -547,6 +559,11 @@ class NPUWorker(WorkerBase):
         self._init_worker_distributed_environment()
         if self.parallel_config.enable_fault_tolerance:
             self.worker_sentinel = WorkerSentinel(worker=self, device=device)
+            logger.info(
+                "[FT_DIAG] NPU WorkerSentinel created: worker_rank=%s, dp_rank=%s",
+                self.rank,
+                self.parallel_config.data_parallel_rank,
+            )
         # Set random seed.
         set_random_seed(self.model_config.seed)
         # Initialize device properties used by triton kernels.

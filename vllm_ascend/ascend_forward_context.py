@@ -11,6 +11,7 @@ from vllm.distributed import get_dp_group, get_ep_group, get_tensor_model_parall
 from vllm.forward_context import BatchDescriptor, get_forward_context, set_forward_context
 from vllm.logger import logger
 
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config, is_mega_moe_supported
 from vllm_ascend.device.hardware_profile import (
     HardwareCapability,
@@ -402,6 +403,8 @@ def select_moe_comm_method(
         # is a single fused C++ op. This covers both normal model
         # forward and _dummy_run during profile_run.
         moe_comm_type = MoECommType.ALLTOALL
+    elif moe_comm_policy is MoECommPolicy.FUSED_OR_CAPACITY and envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3:
+        moe_comm_type = MoECommType.MC2
     elif moe_comm_policy is MoECommPolicy.ALLGATHER:
         moe_comm_type = MoECommType.ALLGATHER
     else:

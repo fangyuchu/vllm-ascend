@@ -26,7 +26,7 @@ from uuid import uuid4
 
 import torch
 import vllm.envs as envs_vllm
-from torch.distributed.distributed_c10d import Backend, PrefixStore, ProcessGroup
+from torch.distributed.distributed_c10d import PrefixStore, ProcessGroup
 from vllm.logger import logger
 from vllm.platforms import Platform, PlatformEnum
 
@@ -650,44 +650,50 @@ class NPUPlatform(Platform):
         group_size: int,
         timeout: timedelta,
     ) -> ProcessGroup:
-        """Create a stateless HCCL ProcessGroup"""
+        """Create a stateless HCCL process group for Elastic EP."""
+        if backend != "hccl":
+            raise ValueError(f"NPU stateless process groups require HCCL, got {backend!r}.")
+
         from torch_npu._C._distributed_c10d import ProcessGroupHCCL
 
-        pg = ProcessGroup(prefix_store, group_rank, group_size)
-
-        # Agree on one unique comm label for this group via the group store:
-        # identical on every rank and fresh per group creation, so repeated
-        # elastic scaling rounds never reuse a label.
+        process_group = ProcessGroup(prefix_store, group_rank, group_size)
+        group_store = process_group.get_group_store()
         if group_rank == 0:
             hccl_comm_name = uuid4().hex
-            pg.get_group_store().set("hccl_comm_name", hccl_comm_name)
+            group_store.set("hccl_comm_name", hccl_comm_name)
         else:
-            hccl_comm_name = pg.get_group_store().get("hccl_comm_name").decode("utf-8")
+            hccl_comm_name = group_store.get("hccl_comm_name").decode("utf-8")
 
         backend_options = ProcessGroupHCCL.Options()
 
         backend_options.group_id = hccl_comm_name
         backend_options._timeout = timeout
-
-        # Create Backend object
-        backend = Backend("hccl")
-
-        # Set default backend for ProcessGroup
-        pg._set_default_backend(Backend.backend_type_map[backend])
-
-        device = torch.device("npu")
+        if hasattr(backend_options, "group_id"):
+            # ProcessGroupHCCL derives its internal HCCL group name in the
+            # constructor. Set a unique ID before construction so concurrently
+            # prepared standby DP/EP/EPLB groups do not share ``group_name_``.
+            backend_device = torch.device("npu")
+        comm_device = torch.device(f"npu:{torch.npu.current_device()}")
         if hasattr(backend_options, "_device"):
-            backend_options._device = device
+            # Elastic EP creates stateless groups from a background thread.
+            # Bind HCCL to the NPU already selected by this worker.
+            backend_options._device = comm_device
 
-        backend_class = ProcessGroupHCCL(prefix_store, group_rank, group_size, backend_options)
+        hccl_backend = ProcessGroupHCCL(
+            prefix_store,
+            group_rank,
+            group_size,
+            backend_options,
+        )
 
-        backend_class._set_sequence_number_for_group()
         backend_type = ProcessGroup.BackendType.CUSTOM
-        pg._register_backend(device, backend_type, backend_class)
-        backend_class._set_hccl_comm_name(hccl_comm_name)
-        pg._set_group_desc("undefined")
+        process_group._set_default_backend(backend_type)
+        hccl_backend._set_sequence_number_for_group()
+        process_group._register_backend(backend_device, backend_type, hccl_backend)
 
-        return pg
+        hccl_backend._set_hccl_comm_name(hccl_comm_name)
+        process_group._set_group_desc("undefined")
+        return process_group
 
 
 def _fix_incompatible_config(vllm_config: VllmConfig) -> None:

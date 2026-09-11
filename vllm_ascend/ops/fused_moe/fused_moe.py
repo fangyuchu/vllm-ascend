@@ -118,7 +118,12 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         self.moe_config.dp_group = get_dp_group()
         if self.moe_config.ep_size > 1:
             self.moe_config.ep_group = get_ep_group()
-            self.moe_config.mc2_group = get_mc2_group()
+            # A newly launched elastic-EP worker loads its dummy model before
+            # prepare_new_worker creates and activates the expanded MC2 group.
+            # Defer binding MC2 until that prepare phase; regular workers have
+            # already initialized MC2 and bind it here as usual.
+            if not envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
+                self.moe_config.mc2_group = get_mc2_group()
 
         # Internal-router: precast weight_fp32 at load to avoid hot-path Cast.
         # Use ctor `gate` (not self.is_internal_router): Module.__getattr__ shadows during init.
