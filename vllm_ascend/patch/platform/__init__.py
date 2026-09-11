@@ -77,6 +77,8 @@ import vllm_ascend.patch.platform.patch_example_connector  # noqa
 #       Remove this patch when upstream's `is_cuda_alike()` covers Ascend NPU
 #       or when the device-index qualification is applied unconditionally.
 #
+import vllm_ascend.patch.platform.patch_stateless_coordinator  # noqa
+
 # ** File: platform/patch_kv_cache_utils.py **
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.v1.core.kv_cache_utils` (v0.32.0) /

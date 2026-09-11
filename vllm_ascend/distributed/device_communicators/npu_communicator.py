@@ -150,9 +150,32 @@ class NPUCommunicator(DeviceCommunicatorBase):
         # get_ep_all2all_manager()); the rest stay dormant.
         self.all2all_manager = _NpuAll2AllManager(dist.get_world_size(cpu_group), device)
 
+    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        if self.pyhccl_comm is not None:
+            if dim < 0:
+                # Convert negative dim to positive.
+                dim += input_.dim()
+            input_size = input_.size()
+            # Use concat-style all-gather: stack-style has torch.compile
+            # compatibility issues (pytorch/pytorch#138795).
+            output_size = (input_size[0] * self.world_size,) + input_size[1:]
+            # Allocate output tensor.
+            output_tensor = torch.empty(output_size, dtype=input_.dtype, device=input_.device)
+            # All-gather.
+            output_tensor = self.pyhccl_comm.all_gather(input_, output_tensor)
+            # Reshape
+            output_tensor = output_tensor.reshape((self.world_size,) + input_size)
+            output_tensor = output_tensor.movedim(0, dim)
+            output_tensor = output_tensor.reshape(
+                input_size[:dim] + (self.world_size * input_size[dim],) + input_size[dim + 1 :]
+            )
+            return output_tensor
+        else:
+            return super().all_gather(input_, dim)
+
     def destroy(self):
         if self.pyhccl_comm is not None:
-            self.pyhccl_comm.close()
+            self.pyhccl_comm.destroy()
             self.pyhccl_comm = None
 
     def batch_isend_irecv(self, p2p_ops: list):
