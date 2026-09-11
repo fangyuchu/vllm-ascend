@@ -72,6 +72,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Whether to use MoeDistribute V3 low-latency dispatch/combine for the
+    # MC2 MoE communication path. 0 (default): disabled; 1: enabled. This is
+    # currently supported on Ascend A3 for external Elastic EP validation.
+    # Valid values are 0 and 1; not sensitive.
+    "VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3", "0"))),
 }
 
 # end-env-vars-definition
