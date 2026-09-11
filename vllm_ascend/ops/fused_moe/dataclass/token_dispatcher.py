@@ -43,6 +43,9 @@ class MoEMC2CombineMetadata:
     expand_scales: torch.Tensor | None
     quant: MoEQuantParams
     mc2_mask: torch.Tensor | None = None
+    # MoeDistribute V3 combine consumes the original dispatch input. V2 keeps
+    # this unset/unused, so adding the field is backward compatible.
+    ori_x: torch.Tensor | None = None
 
 
 @dataclass(frozen=True, slots=True)
