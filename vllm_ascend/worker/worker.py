@@ -933,7 +933,8 @@ class NPUWorker(WorkerBase):
         with context, set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model(load_dummy_weights)
 
-        if self.worker_sentinel is not None and self.use_v2_model_runner:
+        # Scale-up dummy loads defer EPLB and sentinel setup to the scaling executor.
+        if self.worker_sentinel is not None and self.use_v2_model_runner and not load_dummy_weights:
             self.worker_sentinel.init_num_local_experts()
 
         if self.vllm_config.weight_transfer_config is not None:

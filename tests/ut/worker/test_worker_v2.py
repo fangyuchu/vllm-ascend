@@ -8,6 +8,47 @@ from tests.ut.base import TestBase
 
 
 class TestNPUWorkerV2(TestBase):
+    @patch("vllm_ascend.worker.worker.set_current_vllm_config")
+    @patch("vllm_ascend.worker.sentinel.npu_worker_sentinel.get_ep_group")
+    @patch("vllm_ascend.worker.sentinel.npu_worker_sentinel.get_ep_all2all_manager")
+    def test_load_model_initializes_expert_count_after_eplb_registration(
+        self, mock_get_manager, mock_get_ep_group, mock_set_config
+    ):
+        """Dummy loads defer expert-count setup until the scale-up mapping arrives."""
+        from vllm_ascend.worker.sentinel.npu_worker_sentinel import WorkerSentinel
+        from vllm_ascend.worker.worker import NPUWorker
+
+        mock_get_ep_group.return_value.world_size = 4
+        for load_dummy_weights in (False, True):
+            with self.subTest(load_dummy_weights=load_dummy_weights):
+                mock_get_manager.reset_mock()
+                worker = NPUWorker.__new__(NPUWorker)
+                worker.use_v2_model_runner = True
+                worker.vllm_config = SimpleNamespace(
+                    model_config=SimpleNamespace(enable_sleep_mode=False),
+                    weight_transfer_config=None,
+                )
+                model_state = SimpleNamespace(physical_to_logical_map=SimpleNamespace(shape=(1, 256)))
+                model_states = {} if load_dummy_weights else {"model": model_state}
+                model_config = MagicMock()
+                model_config.compute_hash.return_value = "model"
+
+                worker.model_runner = SimpleNamespace(
+                    load_model=MagicMock(),
+                    model_config=model_config,
+                    eplb_state=SimpleNamespace(model_states=model_states),
+                )
+                worker.worker_sentinel = WorkerSentinel(worker, device=MagicMock())
+
+                worker.load_model(load_dummy_weights=load_dummy_weights)
+
+                worker.model_runner.load_model.assert_called_once_with(load_dummy_weights)
+                if load_dummy_weights:
+                    mock_get_manager.assert_not_called()
+                    model_states["model"] = model_state
+                    worker.worker_sentinel.init_num_local_experts()
+                mock_get_manager.return_value.set_num_local_physical_experts.assert_called_once_with(64)
+
     @patch("vllm_ascend.worker.worker.get_ascend_config")
     @patch("vllm_ascend.worker.worker.enable_sp", return_value=False)
     @patch("vllm_ascend.worker.worker.get_pp_group")
