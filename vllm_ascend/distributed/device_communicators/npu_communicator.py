@@ -100,9 +100,13 @@ class _NpuAll2AllManager:
         self._num_local_experts = num_local_experts
         self._rebuild_elastic_info()
 
+    @torch.inference_mode()
     def _rebuild_elastic_info(self) -> None:
         """Rebuild elastic_info from the dead set into the existing device
-        tensor (never reallocates, so captured graphs stay valid)."""
+        tensor (never reallocates, so captured graphs stay valid).
+
+        The device tensor may have been created during inference-mode warmup.
+        """
 
         world_size = self._ep_world_size
         alive = sorted(set(range(world_size)) - self._dead)
