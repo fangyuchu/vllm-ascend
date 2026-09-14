@@ -57,12 +57,13 @@ from vllm_ascend.core.profiling_chunk_predictor import (
     _start_profiling_chunk_timing,
 )
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
-from vllm_ascend.utils import lmhead_tp_enable, set_potential_max_tokens
+from vllm_ascend.utils import lmhead_tp_enable, set_potential_max_tokens, vllm_version_is
 from vllm_ascend.worker.utils import disable_compilation
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
 from vllm_ascend.worker.v2.eplb import AscendEPLBController
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
+from vllm_ascend.worker.v2.kvpp import KVPPRuntime
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 from vllm_ascend.worker.v2.pp_utils import (
     bypass_upstream_spec_pp_guard,
@@ -88,6 +89,7 @@ class NPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
+        self.kvpp = KVPPRuntime()
         # FusedMoE can be constructed by the parent initializer and reads this
         # capacity while setting up MC2 communication.
         set_potential_max_tokens(vllm_config)
@@ -151,7 +153,7 @@ class NPUModelRunner(GPUModelRunner):
             vocab_size=self.vocab_size,
             device=self.device,
         )
-        if self.use_spec_pp:
+        if self.use_spec_pp and vllm_version_is("0.28.0"):
             from vllm_ascend.patch.worker.patch_v2.patch_spec_pp import (
                 install_spec_pp_token_broadcast,
             )
@@ -232,10 +234,8 @@ class NPUModelRunner(GPUModelRunner):
 
         self._restore_replicated_draft_target_states()
         output = super().sample_tokens(grammar_output)
-
-        if self.use_spec_pp and self.is_last_pp_rank:
+        if vllm_version_is("0.28.0") and self.use_spec_pp and self.is_last_pp_rank:
             assert self.pp_handler is not None
-            # Wait until propose() has populated this step's draft tokens.
             self.pp_handler.broadcast_draft_tokens()
         return output
 
@@ -251,6 +251,13 @@ class NPUModelRunner(GPUModelRunner):
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
 
+        self.kvpp = KVPPRuntime.create_from_kv_cache(
+            vllm_config=self.vllm_config,
+            kv_cache_config=self.kv_cache_config,
+            static_forward_context=self.compilation_config.static_forward_context,
+        )
+        self.model_state.kvpp_runtime = self.kvpp
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -260,6 +267,7 @@ class NPUModelRunner(GPUModelRunner):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
         context_len: int = 0,
+        valid_dummy_state_slots: bool = False,
     ):
         self._cpp_execution_time_ms = None
         profiling_config = self.ascend_config.scheduler_config.profiling_chunk_config
@@ -268,6 +276,7 @@ class NPUModelRunner(GPUModelRunner):
             scheduler_output,
         )
 
+        self.model_state.kvpp_is_dummy_run = dummy_run or is_profile
         output = super().execute_model(
             scheduler_output,
             intermediate_tensors=intermediate_tensors,
@@ -275,7 +284,10 @@ class NPUModelRunner(GPUModelRunner):
             skip_attn_for_dummy_run=skip_attn_for_dummy_run,
             is_profile=is_profile,
             context_len=context_len,
+            **({} if vllm_version_is("0.28.0") else {"valid_dummy_state_slots": valid_dummy_state_slots}),
         )
+        self.model_state.kvpp_is_dummy_run = False
+        self.kvpp.complete_forward()
 
         self._cpp_execution_time_ms = _finish_profiling_chunk_timing(
             profiling_config,
@@ -467,11 +479,6 @@ class NPUModelRunner(GPUModelRunner):
         )
         seq_lens_cpu_upper_bound = torch.from_numpy(seq_lens_cpu_upper_bound_np)
 
-        max_seq_len_np = None
-        if self.use_pp:
-            # max_seq_len is only consumed by the PP `compute_need_sampled_mask`
-            max_seq_len_np = self.req_states.max_seq_len[idx_mapping_np]
-
         prompt_lens = None
         if self.model_config.rswa_window is not None:
             # prompt_lens is only used in R-SWA case.
@@ -500,7 +507,11 @@ class NPUModelRunner(GPUModelRunner):
             num_computed_prefill_tokens_np=batch_req_state.num_computed_prefill_tokens_np,
             is_prefilling_np=batch_req_state.is_prefilling_np,
             has_prefill=batch_req_state.has_prefill,
-            max_seq_len_np=max_seq_len_np,
+            **(
+                {"max_seq_len_np": self.req_states.max_seq_len[idx_mapping_np] if self.use_pp else None}
+                if vllm_version_is("0.28.0")
+                else {}
+            ),
             input_ids=self.input_buffers.input_ids[:num_tokens_after_padding],
             positions=self.input_buffers.positions[:num_tokens_after_padding],
             is_padding=self.input_buffers.is_padding[:num_tokens_after_padding],
@@ -515,16 +526,40 @@ class NPUModelRunner(GPUModelRunner):
             attn_state=attn_state,
         )
 
-        input_batch = vllm_model_runner.pcp.maybe_partition_pcp_batch(
-            self.pcp_manager,
-            input_batch,
-            padded_num_tokens=batch_desc.num_tokens,
-        )
+        # vLLM #53515 / #15196 pass padded_num_tokens into PCP partition on main;
+        # v0.28.0 maybe_partition_pcp_batch does not accept that kwarg.
+        if vllm_version_is("0.28.0"):
+            input_batch = vllm_model_runner.pcp.maybe_partition_pcp_batch(
+                self.pcp_manager,
+                input_batch,
+            )
+        else:
+            input_batch = vllm_model_runner.pcp.maybe_partition_pcp_batch(
+                self.pcp_manager,
+                input_batch,
+                padded_num_tokens=batch_desc.num_tokens,
+            )
 
         # For mla/sfa, update cos/sin. Here is for execute_model.
         update_cos_sin(input_batch.positions)
 
         return input_batch
+
+    def prepare_dummy_attn(
+        self, input_batch: AscendInputBatch, valid_state_slots: bool = False
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        if self.pcp_manager is None:
+            return super().prepare_dummy_attn(
+                input_batch,
+                **({} if vllm_version_is("0.28.0") else {"valid_state_slots": valid_state_slots}),
+            )
+        block_tables, slot_mappings = self.pcp_manager.prepare_dummy_attn(input_batch)
+        if not vllm_version_is("0.28.0") and valid_state_slots:
+            # Match the upstream state-slot contract in the persistent PCP views.
+            for block_table in block_tables:
+                state_slots = torch.arange(1, block_table.shape[0] + 1, dtype=torch.int32, device=block_table.device)
+                block_table[:, 0].copy_(state_slots)
+        return block_tables, slot_mappings
 
     def _lmhead_tp_max_num_logits(self) -> int:
         """Logits row capacity shared by every rank of the lmhead-TP group.
@@ -702,15 +737,27 @@ class NPUModelRunner(GPUModelRunner):
         """
         # TODO: need refactor later, related to vllm PR #34043 this pr delete func
         # relax_for_mixed_batch_cudagraphs, num_reqs no longer equals the actual number of requests.
+        descriptor_num_reqs = batch_desc_num_reqs if batch_desc_num_reqs is not None else num_reqs_padded
+        # This checks query lengths, not request phase: short prefills can also
+        # match. Graph dispatch is responsible for excluding incompatible prefills.
+        has_uniform_decode_query_lens = np.all(np.diff(query_start_loc_np[: num_reqs + 1]) == self.decode_query_len)
+        matches_uniform_decode_graph_shape = (
+            has_uniform_decode_query_lens and num_tokens_padded == descriptor_num_reqs * self.decode_query_len
+        )
         if (
             cudagraph_runtime_mode == CUDAGraphMode.FULL
             and self.compilation_config.cudagraph_mode == CUDAGraphMode.FULL
+            and not matches_uniform_decode_graph_shape
         ):
             num_reqs_padded = num_reqs
         else:
-            num_reqs_padded = batch_desc_num_reqs if batch_desc_num_reqs is not None else num_reqs
+            # Preserve the captured request shape for uniform decode graphs.
+            # GDN full graphs capture metadata at request granularity, so
+            # collapsing all padded tokens into one request changes the graph
+            # topology between capture and replay.
+            num_reqs_padded = descriptor_num_reqs
 
-        if num_tokens_padded == num_reqs_padded * self.decode_query_len:
+        if has_uniform_decode_query_lens and num_tokens_padded == num_reqs_padded * self.decode_query_len:
             # Uniform-batch case: num_reqs must be no greater than num_reqs_padded
             assert num_reqs <= num_reqs_padded
 

@@ -19,6 +19,7 @@ from vllm_ascend._310p.worker.v2.model_state import (
     Ascend310PModelState,
 )
 from vllm_ascend._310p.worker.v2.sampler import Ascend310PSampler
+from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 from vllm_ascend.worker.v2.model_states.default import AscendModelState
 from vllm_ascend.worker.v2.model_states.mamba_hybrid import AscendMambaHybridModelState
@@ -180,6 +181,9 @@ def test_kv_cache_allocation_qwen35_mamba_stays_nd() -> None:
         kv_cache_tensors=[
             SimpleNamespace(
                 size=160,
+                # vLLM #51718 renamed shared_by to layers; expose both fields
+                # so this focused 310P fixture stays valid on main and 0.28.0.
+                shared_by=[layer_name],
                 layers=[layer_name],
             )
         ],
@@ -202,6 +206,10 @@ def test_kv_cache_allocation_qwen35_mamba_stays_nd() -> None:
     assert states[0].untyped_storage().nbytes() == 160
 
 
+@pytest.mark.skipif(
+    vllm_version_is("0.28.0"),
+    reason="vLLM #51718 only changed main descriptors",
+)
 def test_main_mamba_descriptor_allocates_private_per_layer_pages() -> None:
     class FakeMambaSpec:
         block_size = 1
@@ -227,6 +235,7 @@ def test_main_mamba_descriptor_allocates_private_per_layer_pages() -> None:
         kv_cache_tensors=[
             SimpleNamespace(
                 size=4096,
+                shared_by=layer_names,
                 layers=layer_names,
             )
         ],
@@ -331,10 +340,19 @@ def test_config_rejects_non_tp_parallelism(setting: str) -> None:
         NPUModelRunner310V2._validate_config(config)
 
 
+def test_config_accepts_mtp_and_rejects_non_mtp() -> None:
+    """310P MRv2 allows method=mtp only."""
+    NPUModelRunner310V2._validate_config(
+        _make_vllm_config(speculative_config=SimpleNamespace(method="mtp", num_speculative_tokens=1))
+    )
+    with pytest.raises(NotImplementedError, match="only supported via MTP"):
+        NPUModelRunner310V2._validate_config(_make_vllm_config(speculative_config=SimpleNamespace(method="eagle")))
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("speculative_config", object(), "Speculative decoding"),
+        ("speculative_config", object(), "only supported via MTP"),
         ("kv_transfer_config", object(), "KV cache transfer"),
         ("lora_config", object(), "LoRA"),
     ],
@@ -342,6 +360,26 @@ def test_config_rejects_non_tp_parallelism(setting: str) -> None:
 def test_config_rejects_out_of_scope_features(field, value, message) -> None:
     with pytest.raises(NotImplementedError, match=message):
         NPUModelRunner310V2._validate_config(_make_vllm_config(**{field: value}))
+
+
+def test_copy_kv_cache_blocks_flattens_mamba_lists() -> None:
+    """Prefix-cache CoW must flatten list[Tensor] mamba layers for upstream copy."""
+    runner = object.__new__(NPUModelRunner310V2)
+    runner._attn_kv_copy_params = []
+    t0 = torch.zeros(4, 2)
+    t1 = torch.zeros(4, 2)
+    runner.kv_caches = [[t0, t1], torch.zeros(2)]  # hybrid: mamba list + other
+    runner.kv_cache_config = SimpleNamespace(num_blocks=4)
+    copies = [SimpleNamespace(src_block_id=0, dst_block_id=1)]
+
+    with patch.object(model_runner_module, "copy_kv_cache_blocks_inplace") as mock_copy:
+        NPUModelRunner310V2._copy_kv_cache_blocks_310p(runner, copies)
+
+    mock_copy.assert_called_once()
+    tensors_arg, num_blocks, copies_arg = mock_copy.call_args[0]
+    assert tensors_arg == [t0, t1]
+    assert num_blocks == 4
+    assert copies_arg is copies
 
 
 def test_sampler_rejects_random_sampling_parameters() -> None:
@@ -416,6 +454,9 @@ def test_kv_cache_allocation_uses_separate_nz_k_and_v() -> None:
         kv_cache_tensors=[
             SimpleNamespace(
                 size=8192,
+                # vLLM #51718 renamed shared_by to layers; expose both fields
+                # so this focused 310P fixture stays valid on main and 0.28.0.
+                shared_by=["model.layers.0.self_attn"],
                 layers=["model.layers.0.self_attn"],
             )
         ],
@@ -445,6 +486,10 @@ def test_kv_cache_allocation_uses_separate_nz_k_and_v() -> None:
     assert all(allocation[3] == model_runner_module.ACL_FORMAT_FRACTAL_NZ for allocation in allocations)
 
 
+@pytest.mark.skipif(
+    vllm_version_is("0.28.0"),
+    reason="vLLM #51718 only changed main descriptors",
+)
 def test_main_attention_descriptor_allocates_private_kv_per_layer() -> None:
     class FakeAttentionSpec:
         block_size = 128
@@ -489,6 +534,7 @@ def test_main_attention_descriptor_allocates_private_kv_per_layer() -> None:
         kv_cache_tensors=[
             SimpleNamespace(
                 size=spec.page_size_bytes * 100,
+                shared_by=layer_names,
                 layers=layer_names,
             )
         ],

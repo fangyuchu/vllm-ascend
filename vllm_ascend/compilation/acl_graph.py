@@ -4,7 +4,7 @@
 import dataclasses
 import weakref
 from collections.abc import Callable
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from typing import Any
 from unittest.mock import patch
@@ -20,17 +20,34 @@ from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import logger
 from vllm.platforms import current_platform
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 
 from ..utils import weak_ref_tensors
 
 _acl_graph_wrappers: weakref.WeakSet[Any] = weakref.WeakSet()
+# Global graph pool handle.
+# In Elastic EP, recompilation and capture must switch the pool to avoid resource reference counting issues.
+_acl_graph_pool: tuple[int, int] | None = None
 _STREAM_RESOURCE_ERROR_CODE = "207008"
 _STREAM_RESOURCE_ERROR_MARKERS = (
     "insufficient_stream_resources",
     "stream resources are insufficient",
 )
 _OLD_HDK_CAPTURE_ERROR_MARKERS = ("alloc sq cq fail",)
+
+
+@contextmanager
+def _super_kernel_scope(scope: str, enabled: bool):
+    if not enabled:
+        yield
+        return
+
+    torch.npu.super_kernel_scope_begin(scope)
+    try:
+        yield
+    finally:
+        torch.npu.super_kernel_scope_end(scope)
 
 
 def _is_stream_resource_capture_error(exc: RuntimeError) -> bool:
@@ -82,6 +99,20 @@ class ACLGraphWrapper:
     guaranteed when VLLM_LOGGING_LEVEL == "DEBUG".
     """
 
+    @classmethod
+    def clear_all_graphs(cls) -> None:
+        global _acl_graph_pool
+        _acl_graph_pool = None
+        for instance in list(_acl_graph_wrappers):
+            instance.clear_graphs()
+
+    @classmethod
+    def get_graph_pool(cls):
+        global _acl_graph_pool
+        if _acl_graph_pool is None:
+            _acl_graph_pool = current_platform.graph_pool_handle()
+        return _acl_graph_pool
+
     def __init__(
         self,
         runnable: Callable,
@@ -95,7 +126,13 @@ class ACLGraphWrapper:
         self.runnable = runnable
         self.vllm_config = vllm_config
         self.runtime_mode = runtime_mode
+
+        # A NONE runtime mode does not use ACL Graph, so avoid initializing
+        # graph-specific state (including the Ascend config lookup).
+        assert self.runtime_mode != CUDAGraphMode.NONE
+
         self.compilation_config = vllm_config.compilation_config
+        self.enable_super_kernel = get_ascend_config().ascend_compilation_config.enable_super_kernel
 
         self.first_run_finished = False
         self.is_debugging_mode = envs.VLLM_LOGGING_LEVEL == "DEBUG"
@@ -104,7 +141,7 @@ class ACLGraphWrapper:
         # assert runtime_mode is not NONE(no aclgraph), otherwise, we don't
         # need to initialize a ACLGraphWrapper.
         assert self.runtime_mode != CUDAGraphMode.NONE
-        self.graph_pool = current_platform.get_global_graph_pool()
+        self.graph_pool = ACLGraphWrapper.get_graph_pool()
 
         if cudagraph_options is None:
             cudagraph_options = CUDAGraphOptions()
@@ -129,6 +166,10 @@ class ACLGraphWrapper:
     def unwrap(self) -> Callable:
         # in case we need to access the original runnable.
         return self.runnable
+
+    def clear_graphs(self) -> None:
+        self.concrete_aclgraph_entries.clear()
+        self.graph_pool = ACLGraphWrapper.get_graph_pool()
 
     def __call__(self, *args, **kwargs):
         forward_context = get_forward_context()
@@ -186,7 +227,8 @@ class ACLGraphWrapper:
                 try:
                     with torch.npu.graph(aclgraph, pool=self.graph_pool):
                         # `output` is managed by pytorch's aclgraph pool
-                        output = self.runnable(*args, **kwargs)
+                        with _super_kernel_scope("full_model", self.enable_super_kernel):
+                            output = self.runnable(*args, **kwargs)
                         # Join offloader's copy stream after forward to avoid
                         # unjoined stream error. The last layer's start_prefetch
                         # forks copy_stream, but wait_prefetch only happens in
@@ -218,6 +260,13 @@ class ACLGraphWrapper:
                             f"Original error:\n{exc}"
                         ) from exc
                     raise
+
+            if self.enable_super_kernel:
+                aclgraph.super_kernel_optimize(
+                    optimize_options={
+                        "dcci_after_kernel_end": [".*"],
+                    },
+                )
 
             # here we always use weak ref for the workspaces
             # to save memory
@@ -311,6 +360,13 @@ class GraphParams:
 
 
 _graph_params: GraphParams | None = None
+
+
+def reset_graph_params():
+    global _graph_params, _draft_graph_params, _draft_graph_prefill_params
+    _graph_params = None
+    _draft_graph_params = None
+    _draft_graph_prefill_params = None
 
 
 def set_graph_params(aclgraph_capture_sizes: list[int]):
