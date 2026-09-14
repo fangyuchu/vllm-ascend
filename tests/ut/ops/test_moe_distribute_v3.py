@@ -232,13 +232,16 @@ def test_dispatcher_keeps_captured_physical_expert_capacity():
     assert dispatcher.v3_adapter.dispatch.call_args_list[1].args[1] == 4
 
 
-def test_ft_elastic_info_tracks_live_capacity_without_reallocating():
+@pytest.mark.parametrize("created_in_inference_mode", [False, True])
+def test_ft_elastic_info_tracks_live_capacity_without_reallocating(created_in_inference_mode):
     from vllm_ascend.distributed.device_communicators.npu_communicator import _NpuAll2AllManager
 
-    manager = _NpuAll2AllManager(4, torch.device("cpu"))
-    manager.set_num_local_physical_experts(4)
-    info = manager.get_elastic_info()
+    with torch.inference_mode(created_in_inference_mode):
+        manager = _NpuAll2AllManager(4, torch.device("cpu"))
+        info = manager.get_elastic_info()
     address = info.data_ptr()
+    assert info.is_inference() == created_in_inference_mode
+    manager.set_num_local_physical_experts(4)
     assert info[:4].tolist() == [0, 4, 0, 16]
     manager.update_mask(1)
     assert info.tolist() == [1, 3, 0, 12, 0, -1, 1, 2, 0, 2, 3, -1]
