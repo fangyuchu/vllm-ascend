@@ -316,6 +316,44 @@ def test_setup_moe_comm_refreshes_deferred_quant_group_name():
     setup_moe_comm_method.assert_called_once_with(module.moe_config)
 
 
+@pytest.mark.parametrize("has_quant_group_name", [True, False], ids=["existing-rank", "new-rank"])
+def test_setup_moe_comm_initializes_groups_in_same_order(monkeypatch, has_quant_group_name):
+    """All ranks must enter lazy HCCL initialization in the same order."""
+    initialized_groups = []
+
+    def initialize_group(name):
+        if name not in initialized_groups:
+            initialized_groups.append(name)
+        return f"new-{name}-group"
+
+    backend = MagicMock()
+    backend.get_hccl_comm_name.side_effect = lambda _: initialize_group("MC2")
+    device_group = MagicMock()
+    device_group._get_backend.return_value = backend
+    mc2_group = SimpleNamespace(device_group=device_group, rank_in_group=3)
+    quant_method = SimpleNamespace()
+    if has_quant_group_name:
+        quant_method.moe_all_to_all_group_name = "old-MC2-group"
+    module = SimpleNamespace(
+        routed_experts=SimpleNamespace(quant_method=SimpleNamespace(quant_method=quant_method)),
+        moe_config=SimpleNamespace(ep_size=4),
+    )
+
+    comm_module = "vllm_ascend.ops.fused_moe.moe_comm_method"
+    monkeypatch.setattr(f"{comm_module}._MoECommMethods", {})
+    monkeypatch.setattr(f"{comm_module}.AlltoAllCommImpl", lambda _: initialize_group("EP"))
+    monkeypatch.setattr(f"{comm_module}.AllGatherCommImpl", MagicMock())
+    monkeypatch.setattr(f"{comm_module}.MC2CommImpl", lambda _: initialize_group("MC2"))
+    monkeypatch.setattr(f"{comm_module}.FusedMC2CommImpl", lambda _: initialize_group("MC2"))
+    monkeypatch.setattr("vllm_ascend.distributed.elastic_ep.elastic_execute.get_mc2_group", lambda: mc2_group)
+
+    setup_moe_comm_and_quant_method(module)
+
+    assert initialized_groups == ["EP", "MC2"]
+    if has_quant_group_name:
+        assert quant_method.moe_all_to_all_group_name == "new-MC2-group"
+
+
 def test_match_peer_parameters_is_deterministic_on_mismatch():
     parameters = [object(), object(), object()]
 

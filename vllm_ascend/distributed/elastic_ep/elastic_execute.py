@@ -208,6 +208,9 @@ def ascend_batch_transfer_weights(
 
 
 def setup_moe_comm_and_quant_method(module: nn.Module) -> None:
+    # Initialize EP and MC2 in the same order on existing and new ranks;
+    # scale-up quant methods may not have a cached MC2 group name yet.
+    setup_moe_comm_method(module.moe_config)
     quant_method = getattr(module.routed_experts.quant_method, "quant_method", None)
     if hasattr(quant_method, "moe_all_to_all_group_name"):
         try:
@@ -217,7 +220,6 @@ def setup_moe_comm_and_quant_method(module: nn.Module) -> None:
             quant_method.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
         except AttributeError:
             quant_method.moe_all_to_all_group_name = ""
-    setup_moe_comm_method(module.moe_config)
 
 
 class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
