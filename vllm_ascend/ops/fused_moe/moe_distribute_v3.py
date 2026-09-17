@@ -31,6 +31,7 @@ from vllm_ascend.ops.fused_moe.dataclass.token_dispatcher import (
     MoETokenDispatchInput,
     MoETokenDispatchOutput,
 )
+from vllm_ascend.ops.fused_moe.v3_context_debug import trace_adapter_context
 
 if TYPE_CHECKING:
     from vllm.distributed.parallel_state import GroupCoordinator
@@ -197,6 +198,7 @@ class MoeDistributeV3Adapter:
         self._buffer_rank = mc2_group.rank_in_group
         self._ccl_buffer_size = ccl_buffer_size
         self._elastic_info_signature = self._current_elastic_info_signature()
+        trace_adapter_context(self, "buffer_created", get_v3_elastic_info(), read_device=True)
         logger.info(
             "Initialized MoeDistribute V3 buffer: ep_rank=%s, ep_size=%s, hidden_size=%s, experts=%s, topk=%s",
             mc2_group.rank_in_group,
@@ -258,6 +260,7 @@ class MoeDistributeV3Adapter:
         self._buffer_key = (id(mc2_group.device_group), *self._buffer_key[1:])
         self._context_group = mc2_group
         self._elastic_info_signature = elastic_info_signature
+        trace_adapter_context(self, "after_context_update", get_v3_elastic_info(), read_device=True)
         return True
 
     @staticmethod
@@ -441,6 +444,12 @@ class MoeDistributeV3Adapter:
             kwargs["elastic_info"] = elastic_info
         combine = self._get_buffer_method(buffer, "low_latency_combine")
         return combine(**kwargs)
+
+
+def trace_moe_distribute_v3_contexts(stage: str, *, read_device: bool) -> None:
+    for adapter in list(MoeDistributeV3Adapter._INSTANCES):
+        if adapter._buffer is not None:
+            trace_adapter_context(adapter, stage, get_v3_elastic_info(), read_device=read_device)
 
 
 def update_moe_distribute_v3_contexts(mc2_group=None) -> int:

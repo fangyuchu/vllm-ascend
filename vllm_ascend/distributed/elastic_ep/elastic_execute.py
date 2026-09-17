@@ -1532,8 +1532,13 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         return mapping
 
     def _warm_target_groups(self, dp_group, ep_group) -> None:
-        # Ascend uses CPU DP sync, Gloo EPLB and a separate MC2 group.
-        pass
+        # MoE setup constructs the AlltoAll dispatcher even on the V3 path.
+        # Its get_hccl_comm_name() lazily initializes the target EP group.
+        # Pair that initialization on old and new ranks here, before old
+        # ranks enter MC2 update_ctx while new ranks construct their buffers.
+        # DP synchronization uses the CPU group and needs no device warmup.
+        assert ep_group is not None
+        self._materialize_hccl_group(ep_group, "EP")
 
     def prepare_new_worker(
         self,
