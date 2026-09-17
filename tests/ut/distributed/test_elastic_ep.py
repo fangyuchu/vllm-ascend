@@ -354,6 +354,43 @@ def test_setup_moe_comm_initializes_groups_in_same_order(monkeypatch, has_quant_
         assert quant_method.moe_all_to_all_group_name == "new-MC2-group"
 
 
+def test_target_ep_is_ready_before_new_rank_moe_setup(monkeypatch):
+    """New-rank AlltoAll setup must not need old ranks already in update_ctx."""
+    executor, _ = _executor_and_worker()
+    materialized = set()
+    phase = "warmup"
+    ep_device_group = MagicMock()
+
+    def get_ep_name(rank):
+        assert rank == 3
+        if "EP" not in materialized:
+            assert phase == "warmup", "New rank waits on EP while old ranks wait on MC2 update_ctx"
+            materialized.add("EP")
+        return "target-ep"
+
+    ep_device_group._get_backend.return_value.get_hccl_comm_name.side_effect = get_ep_name
+    ep_group = SimpleNamespace(device_group=ep_device_group, cpu_group=object(), rank_in_group=3, world_size=4)
+    module_name = "vllm_ascend.distributed.elastic_ep.elastic_execute"
+    monkeypatch.setattr(f"{module_name}.torch.distributed.barrier", MagicMock())
+    monkeypatch.setattr(f"{module_name}.torch.npu.synchronize", MagicMock())
+    # Passing no DP group also checks we do not initialize an unused DP device group.
+    executor._warm_target_groups(None, ep_group)
+    phase = "old_ranks_in_update_ctx"
+
+    comm_module = "vllm_ascend.ops.fused_moe.moe_comm_method"
+    monkeypatch.setattr(f"{comm_module}._MoECommMethods", {})
+    monkeypatch.setattr(f"{comm_module}.AlltoAllCommImpl", lambda _: get_ep_name(3))
+    monkeypatch.setattr(f"{comm_module}.AllGatherCommImpl", MagicMock())
+    monkeypatch.setattr(f"{comm_module}.MC2CommImpl", MagicMock())
+    monkeypatch.setattr(f"{comm_module}.FusedMC2CommImpl", MagicMock())
+    module = SimpleNamespace(
+        routed_experts=SimpleNamespace(quant_method=SimpleNamespace(quant_method=None)),
+        moe_config=SimpleNamespace(ep_size=4),
+    )
+    setup_moe_comm_and_quant_method(module)
+    assert materialized == {"EP"}
+
+
 def test_match_peer_parameters_is_deterministic_on_mismatch():
     parameters = [object(), object(), object()]
 
