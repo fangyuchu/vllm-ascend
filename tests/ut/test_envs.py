@@ -14,6 +14,7 @@
 
 import inspect
 import os
+from unittest.mock import patch
 
 import vllm_ascend.envs as envs_ascend
 from tests.ut.base import TestBase
@@ -37,6 +38,8 @@ class TestEnvVariables(TestBase):
                     handler_source = inspect.getsource(var_handler)
                     if var_name == "VLLM_ASCEND_KVPOOL_RANGE_DEBUG":
                         test_vals = ["0", "1"]
+                    elif var_name == "VLLM_ASCEND_FT_REPLAY_DEBUG":
+                        test_vals = ["0", "1", "2"]
                     elif "int(" in handler_source:
                         test_vals = ["123", "456"]
                     elif "bool(int(" in handler_source:
@@ -59,6 +62,19 @@ class TestEnvVariables(TestBase):
         for var_name in self.env_vars:
             with self.subTest(var=var_name):
                 getattr(envs_ascend, var_name)
+
+    def test_ft_replay_debug_defaults_off_and_rejects_invalid_modes(self):
+        name = "VLLM_ASCEND_FT_REPLAY_DEBUG"
+        with patch.dict(os.environ):
+            os.environ.pop(name, None)
+            self.assertEqual(getattr(envs_ascend, name), 0)
+            for value in ("0", "1", "2"):
+                os.environ[name] = value
+                self.assertEqual(getattr(envs_ascend, name), int(value))
+            for value in ("", "3", "-1", "true"):
+                os.environ[name] = value
+                with self.assertRaises(ValueError):
+                    getattr(envs_ascend, name)
 
     def test_kvpool_range_debug_is_strict_and_disabled_by_default(self):
         name = "VLLM_ASCEND_KVPOOL_RANGE_DEBUG"

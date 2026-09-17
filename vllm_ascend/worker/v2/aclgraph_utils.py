@@ -163,6 +163,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         self.breakable_cg_runner: BreakableACLGraphWrapper | None = None
         self.model_runner = model_runner
         self.update_stream = self.model_runner.update_stream
+        self.ft_replay_debug = 0
         self.capture_sizes = collect_sorted_captured_token_sizes(self._capture_descs)
         if super().needs_capture():
             set_graph_params(self.capture_sizes)
@@ -179,11 +180,29 @@ class ModelAclGraphManager(ModelCudaGraphManager):
             attn_backend = _get_graph_update_backend(self.model_runner.attn_groups)
         attn_metadata = self.model_runner.model_state.attn_metadata
 
-        if use_updatable_graph(attn_backend):
-            return self._updatable_graph_replay(desc, attn_metadata)
-        else:
-            # This will be removed once the refactoring is fully complete.
-            return self._graph_relay(attn_backend, desc, num_tokens, attn_metadata)
+        trace = self.ft_replay_debug
+        updatable = use_updatable_graph(attn_backend)
+        if trace:
+            logger.info("[FT_REPLAY] fullgraph.begin num_tokens=%s updatable=%s", num_tokens, updatable)
+        try:
+            if updatable:
+                output = self._updatable_graph_replay(desc, attn_metadata)
+            else:
+                # This will be removed once the refactoring is fully complete.
+                output = self._graph_relay(attn_backend, desc, num_tokens, attn_metadata)
+            if trace:
+                logger.info("[FT_REPLAY] fullgraph.replay_and_updates.submitted")
+            if trace == 2:
+                # Replay waits for events recorded by graph.update(). Never
+                # synchronize between submitting replay and those updates.
+                logger.info("[FT_REPLAY] update_stream.sync.begin")
+                self.update_stream.synchronize()
+                logger.info("[FT_REPLAY] update_stream.sync.done; compute_stream.sync.begin")
+                torch.npu.current_stream().synchronize()
+                logger.info("[FT_REPLAY] compute_stream.sync.done")
+            return output
+        finally:
+            self.ft_replay_debug = 0
 
     def _graph_relay(self, attn_backend, desc, num_tokens, attn_metadata):
         self.update_stream.wait_stream(torch.npu.current_stream())
@@ -226,10 +245,21 @@ class ModelAclGraphManager(ModelCudaGraphManager):
     def _updatable_graph_replay(self, desc, attn_metadata):
         graph = self.graphs[desc]
         assert isinstance(graph, UpdatableGraph)
+        trace = bool(self.ft_replay_debug)
+        if trace:
+            logger.info("[FT_REPLAY] resolve_tasks.begin captured_tasks=%d", len(graph.tasks))
         resolved_tasks = graph.resolve_tasks(ContextSource(attn_metadata))
+        if trace:
+            logger.info("[FT_REPLAY] resolve_tasks.done; update_stream.wait.begin")
         self.update_stream.wait_stream(torch.npu.current_stream())
+        if trace:
+            logger.info("[FT_REPLAY] update_stream.wait.submitted; graph.replay.begin")
         ret = super().run_fullgraph(desc)
-        graph.update(self.update_stream, resolved_tasks)
+        if trace:
+            logger.info("[FT_REPLAY] graph.replay.submitted; graph.update.begin")
+        graph.update(self.update_stream, resolved_tasks, trace=trace)
+        if trace:
+            logger.info("[FT_REPLAY] graph.update.submitted")
         return ret
 
     def capture(

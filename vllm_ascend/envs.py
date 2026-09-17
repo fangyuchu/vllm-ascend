@@ -35,6 +35,14 @@ def _strict_binary_env(name: str, default: str = "0") -> bool:
     return value == "1"
 
 
+def _ft_replay_debug_level() -> int:
+    name = "VLLM_ASCEND_FT_REPLAY_DEBUG"
+    value = os.getenv(name, "0")
+    if value not in {"0", "1", "2"}:
+        raise ValueError(f"{name} must be '0', '1', or '2', got {value!r}")
+    return int(value)
+
+
 env_variables: dict[str, Callable[[], Any]] = {
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
@@ -92,6 +100,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # currently supported on Ascend A3 for external Elastic EP validation.
     # Valid values are 0 and 1; not sensitive.
     "VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3", "0"))),
+    # Diagnose the first MRV2 full-graph replay after each FT device reset.
+    # 0 (default): off; 1: host-stage logs; 2: also synchronize the update
+    # and compute streams after all graph updates have been submitted.
+    # Both enabled levels also snapshot V3 context at construction/recovery
+    # boundaries (device reads only after reset or before graph execution).
+    # Diagnostics change timing. Logs include runtime addresses, not weights.
+    "VLLM_ASCEND_FT_REPLAY_DEBUG": _ft_replay_debug_level,
 }
 
 # end-env-vars-definition
