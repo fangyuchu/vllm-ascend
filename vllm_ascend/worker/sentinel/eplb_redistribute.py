@@ -475,9 +475,7 @@ def reload_experts_from_disk(
     loader = get_model_loader(vllm_config.load_config)
     if not (
         isinstance(loader, DefaultModelLoader)
-        and _collect_matching_weights(
-            loader, vllm_config, model, normalize, wanted, wanted_suffixes, buckets, matched
-        )
+        and _collect_matching_weights(loader, vllm_config, model, normalize, wanted, wanted_suffixes, buckets, matched)
     ):
         # Non-safetensors or custom loader: fall back to the full scan.
         full_scan(loader.get_all_weights(vllm_config.model_config, model))
