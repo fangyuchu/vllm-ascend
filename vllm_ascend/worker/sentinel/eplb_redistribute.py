@@ -7,17 +7,10 @@ Reuses the upstream placement math and adds the Ascend-specific pieces:
 layout) and ``densify_routing_table_physical_ids`` (kernel-facing routing id
 renumbering).
 
-The reload runs under hard preconditions, listed on
-``reload_experts_from_disk``. It deliberately does not degrade: an unsupported
-checkpoint, weight layout or quant scheme raises. Every fallback that used to
-sit here read the entire checkpoint, or wrote tensors that did not match the
-runtime layout, on paths that could not actually succeed -- so the failure now
-surfaces where it happens instead of as a corrupt expert later.
-
-Weights are read by walking safetensors shard headers directly, resolved
-through the same public helpers ``DefaultModelLoader`` wraps rather than
-through a loader instance, so the reload does not care which load format
-produced the model.
+The reload deliberately does not degrade: a checkpoint, weight layout or quant
+scheme it cannot handle raises. Every fallback that used to sit here read the
+whole checkpoint, or wrote tensors that did not match the runtime layout, on
+paths that could not succeed anyway.
 """
 
 import glob
@@ -60,6 +53,20 @@ _W13_WEIGHT_SUFFIXES = ("gate_up_proj.weight", "gate_proj.weight", "up_proj.weig
 _W2_WEIGHT_SUFFIX = "down_proj.weight"
 _W13_SCALE_SUFFIXES = ("gate_up_proj.weight_scale", "gate_proj.weight_scale", "up_proj.weight_scale")
 _W2_SCALE_SUFFIX = "down_proj.weight_scale"
+
+# Quant schemes the reload supports (gated in _reload_batched).
+_SUPPORTED_QUANT_TYPES = {
+    AscendUnquantizedFusedMoEMethod,
+    AscendW8A8DynamicFusedMoEMethod,
+}
+
+# (layer, slot) pairs per device batch: a larger chunk amortises the device
+# rounds further but grows the stack's transient device memory.
+_RELOAD_CHUNK_SIZE = 32
+
+# Threads assembling one chunk; bounded because worker processes share host
+# memory bandwidth.
+_GATHER_MAX_WORKERS = 8
 
 
 def _get_ckpt_name_mapper(model: torch.nn.Module) -> Callable[[str], str]:
@@ -183,30 +190,14 @@ def _gather_w13_scale(
     return torch.cat([_shard_row(gate, tp_rank, tp_size), _shard_row(up, tp_rank, tp_size)], dim=0).view(-1)
 
 
-# Quant schemes supported by the scale_down reload (gate in _reload_batched).
-_SUPPORTED_QUANT_TYPES = {
-    AscendUnquantizedFusedMoEMethod,
-    AscendW8A8DynamicFusedMoEMethod,
-}
-
-# Max (layer, slot) pairs per device batch. A larger chunk amortises the
-# device rounds further but multiplies the stacked batch's transient
-# device memory; 32 keeps both reasonable.
-_RELOAD_CHUNK_SIZE = 32
-
-# Threads assembling one chunk in parallel; bounded because multiple worker
-# processes share the host's memory bandwidth.
-_GATHER_MAX_WORKERS = 8
-
-
 def _assemble_entry(
     entry: tuple[int, int, int],
     routed_layers: list,
     buckets: dict[tuple[int, int], dict[str, torch.Tensor]],
     w8a8: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-    """CPU assembly of one entry's (w13, w2[, scales]); thread-safe
-    (read-only shared state). Scales are None for the unquantized scheme."""
+    """Assemble one entry's (w13, w2[, scales]) on the CPU; thread-safe, as it
+    only reads shared state. Scales are None for the unquantized scheme."""
     layer_idx, logical_id, _slot = entry
     routed = routed_layers[layer_idx]
     if not w8a8 and (getattr(routed, "w13_bias", None) is not None or getattr(routed, "w2_bias", None) is not None):
@@ -228,12 +219,8 @@ def _reload_batched(
     """Reload all local (layer, slot) pairs in uniformly-laid-out batches.
 
     Every entry shares one quant scheme, weight shape and dtype, so a chunk
-    of them stacks into a single tensor: e.g. 43 layers x 8 reassigned
-    experts = 344 pairs of one shape/quant scheme become
-    ceil(344 / 32) = 11 chunks instead of 344 per-expert reloads.
-
-    The uniformity is asserted, not assumed away by grouping -- see the
-    ``layouts`` check below.
+    stacks into one tensor, e.g. DeepSeek-V4 43-layers 8 experts, 344 pairs
+    become ceil(344 / 32) = 11 chunks instead of 344 per-expert reloads.
     """
     entries: list[tuple[int, int, int]] = []
     layouts: set[tuple] = set()
@@ -256,12 +243,6 @@ def _reload_batched(
         layouts.add((type(quant_method), w13_shape, w13_dtype, w2_shape, w2_dtype))
         entries.append((layer_idx, logical_id, slot))
 
-    # A chunk is stacked into one tensor, and the device phase picks its
-    # device/dtype from the first entry, so a mixed batch would either fail in
-    # torch.stack or silently reinterpret another layout's weights. Grouping by
-    # layout instead would paper over a real modelling error: one EP group
-    # builds every MoE layer from the same quant config, so a healthy model
-    # only ever produces one layout.
     if len(layouts) != 1:
         raise RuntimeError(
             f"[FT] scale_down weight reload requires exactly one expert layout, "
@@ -281,22 +262,15 @@ def _reload_chunk(
     entries: list[tuple[int, int, int]],
     buckets: dict[tuple[int, int], dict[str, torch.Tensor]],
 ) -> int:
-    """Apply one chunk of entries that share a single quant scheme and layout.
+    """Apply one chunk of entries sharing a quant scheme and layout.
 
-    A chunk of 32 entries (= _RELOAD_CHUNK_SIZE) is handled as: assemble
-    the 32 (w13, w2) pairs on the CPU in parallel, stack them into
-    [32, H, 2I], then pay one H2D + one format cast for the whole stack
-    and scatter it back with 32 non-blocking slot copies drained by a
-    single sync.
+    Assemble the chunk's (w13, w2) pairs on the CPU in parallel, stack them,
+    then pay one H2D + one format cast for the whole stack and scatter it with
+    one non-blocking copy per slot, drained by a single sync. Per entry that
+    replaces a CPU transpose-copy plus its own H2D, cast and scatter.
 
-    Cost this replaces, per entry: one serial CPU transpose-copy of the
-    whole [H, 2I] matrix (plus the gate/up concat), then its own H2D +
-    format cast + scatter, interleaved so the CPU and device phases wait
-    on each other.
-
-    The stacking and the device-side dtype cast both rely on the caller
-    having checked layout uniformity (``_reload_batched``); entries of
-    differing shapes are not handled here.
+    Shapes must match (see ``_reload_batched``); stacking and the device-side
+    cast assume it.
     """
     w13s: list[torch.Tensor] = []
     w2s: list[torch.Tensor] = []
@@ -393,19 +367,7 @@ def _match_weight_name(
 
 
 def _resolve_safetensors_shards(vllm_config: VllmConfig, model: torch.nn.Module) -> list[str]:
-    """List the checkpoint's safetensors shards, downloading them if needed.
-
-    Mirrors the safetensors half of ``DefaultModelLoader._prepare_weights``
-    through the public helpers that method wraps. The format-specific pattern
-    table and the mistral probe choosing between its branches are left out:
-    the reload can do nothing with a ``.bin``/``.pt`` checkpoint, so asking
-    for safetensors is the only useful resolution. Returns an empty list when
-    the checkpoint has none, leaving the caller to reject it.
-
-    Not depending on the loader keeps this working under load formats whose
-    loader offers no way to list shards (rfork, netloader), as long as a
-    safetensors checkpoint is what lies on disk.
-    """
+    """List the checkpoint's safetensors shards, downloading them if needed."""
     model_config = vllm_config.model_config
     load_config = vllm_config.load_config
     model_path = maybe_download_from_modelscope(model_config.model, model_config.revision) or model_config.model
@@ -456,16 +418,9 @@ def _collect_matching_weights(
 ) -> None:
     """Read only the wanted experts' tensors by walking safetensors shard headers.
 
-    ``safe_open(...).keys()`` reads a shard's JSON header alone, so a name that
-    ``_match_weight_name`` rejects never reaches ``get_tensor``: disk reads are
-    limited to the wanted experts plus one header per shard, where reading the
-    checkpoint back through the upstream weight iterator would read all of it.
-    Nothing here depends on the loader that populated the model, and raw
-    checkpoint namings the upstream ``local_expert_ids`` filter cannot parse
-    (e.g. DeepSeek-V4 ``.ffn.``) are matched after ``normalize``.
-
-    A wanted pair missing from every shard is reported through ``matched``
-    rather than raised here.
+    ``safe_open(...).keys()`` reads a shard's JSON header alone, so a name
+    ``_match_weight_name`` rejects never reaches ``get_tensor``: reads are
+    limited to the wanted experts plus one header per shard.
     """
     for st_file in shards:
         with safe_open(st_file, framework="pt") as f:
@@ -487,34 +442,11 @@ def reload_experts_from_disk(
     """Reload reassigned (moe_layer_idx, logical_expert_id) weights from disk.
 
     Ascend keeps expert weights in runtime layout (transposed, NZ-cast,
-    per-slot lists, derived quant scales), so the standard
-    ``model.load_weights`` path cannot write them back. Only reassigned
-    experts whose replica lands in this rank's physical block are reloaded,
-    and the slot written for each one is read from
-    ``eplb_state.logical_to_physical_map`` -- so call this after the new
-    placement is in place (upstream ``rebuild_model_expert_maps``), not
-    before. A rank whose block receives no reassigned expert returns 0
-    without touching the disk.
-
-    Ascend's own reloader for the upstream ``_redistribute_experts`` hook; the
-    two signatures match, so no upstream change is needed.
-
-    Requirements -- each is enforced with an exception, none has a fallback:
-
-    * The layer state carries an EPLB placement map, i.e. EPLB owns the layer.
-    * A safetensors checkpoint, reachable at ``model_config.model`` or through
-      the HF cache. ``.bin``/``.pt`` raise rather than degrade into a full
-      checkpoint read; object-storage paths are not resolved.
-    * Checkpoint names shaped ``<layer_name>.<expert_id>.<suffix>`` with every
-      reassigned pair present. Layouts that do not name experts that way
-      (e.g. fused experts) raise.
-    * One uniform expert layout (quant scheme, w13/w2 shape and dtype) across
-      every reloaded pair; see ``_reload_batched``.
-    * A quant scheme in ``_SUPPORTED_QUANT_TYPES``, and no expert bias.
-
-    Raises:
-        RuntimeError: any requirement above is not met.
-        NotImplementedError: unsupported quant scheme or expert bias.
+    per-slot lists, derived quant scales), so ``model.load_weights`` cannot
+    write them back. Only reassigned experts whose replica lands in this
+    rank's physical block are reloaded, into the slot given by
+    ``eplb_state.logical_to_physical_map`` -- hence the call must follow the
+    upstream ``rebuild_model_expert_maps``.
     """
     if not reassignments:
         return 0
@@ -526,10 +458,8 @@ def reload_experts_from_disk(
     local_slots: dict[tuple[int, int], int] = {}
     for layer_idx, logical_id in reassignments:
         layer_state = getattr(moe_layers[layer_idx], "eplb_state", None)
-        # Without a placement map the slot to write is unknown, and skipping
-        # the layer is not an option: the rebuilt routing table already points
-        # at this expert, so its slot would keep the previous occupant's
-        # weights and feed wrong experts silently.
+        # Skipping is not an option: the rebuilt routing table already points
+        # at this expert, so its slot would silently keep the old occupant's.
         l2p = getattr(layer_state, "logical_to_physical_map", None)
         if l2p is None:
             raise RuntimeError(
@@ -568,8 +498,8 @@ def reload_experts_from_disk(
             f"{vllm_config.model_config.model} has none."
         )
     _collect_matching_weights(shards, normalize, wanted, wanted_suffixes, buckets, matched)
-    # Same reasoning as the missing placement map: a pair with no checkpoint
-    # weight would leave its slot holding the previous occupant's weights.
+    # Same reasoning: a pair with no checkpoint weight would leave its slot
+    # holding the previous occupant's weights.
     unmatched = [pair for pair in local_slots if pair not in matched]
     if unmatched:
         raise RuntimeError(
