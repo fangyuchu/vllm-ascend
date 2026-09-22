@@ -2,11 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
 """NPU expert redistribution and weight reload for fault-tolerance scale-down.
 
-Reuses the upstream placement math and adds the Ascend-specific pieces:
-``reload_experts_from_disk`` (checkpoint reload that mirrors the runtime weight
-layout) and ``densify_routing_table_physical_ids`` (kernel-facing routing id
-renumbering).
-
 The reload deliberately does not degrade: a checkpoint, weight layout or quant
 scheme it cannot handle raises. Every fallback that used to sit here read the
 whole checkpoint, or wrote tensors that did not match the runtime layout, on
@@ -27,10 +22,7 @@ from vllm.config import VllmConfig
 from vllm.distributed import get_ep_group
 from vllm.logger import logger
 from vllm.model_executor.model_loader.weight_utils import (
-    download_safetensors_index_file_from_hf,
-    download_weights_from_hf,
     filter_duplicate_safetensors_files,
-    maybe_download_from_modelscope,
 )
 
 from vllm_ascend.ops.fused_moe.routed_experts import AscendUnquantizedFusedMoEMethod
@@ -54,14 +46,14 @@ _W2_WEIGHT_SUFFIX = "down_proj.weight"
 _W13_SCALE_SUFFIXES = ("gate_up_proj.weight_scale", "gate_proj.weight_scale", "up_proj.weight_scale")
 _W2_SCALE_SUFFIX = "down_proj.weight_scale"
 
-# Quant schemes the reload supports (gated in _reload_batched).
+# Quant schemes the reload supports (gated in _reload_local_slots).
 _SUPPORTED_QUANT_TYPES = {
     AscendUnquantizedFusedMoEMethod,
     AscendW8A8DynamicFusedMoEMethod,
 }
 
-# (layer, slot) pairs per device batch: a larger chunk amortises the device
-# rounds further but grows the stack's transient device memory.
+# (layer, expert) pairs per chunk: a larger chunk amortises the device rounds
+# further but grows the stack's transient device memory.
 _RELOAD_CHUNK_SIZE = 32
 
 # Threads assembling one chunk; bounded because worker processes share host
@@ -190,17 +182,19 @@ def _gather_w13_scale(
     return torch.cat([_shard_row(gate, tp_rank, tp_size), _shard_row(up, tp_rank, tp_size)], dim=0).view(-1)
 
 
-def _assemble_entry(
-    entry: tuple[int, int, int],
+def _assemble_expert(
+    pair: tuple[int, int],
     routed_layers: list,
     buckets: dict[tuple[int, int], dict[str, torch.Tensor]],
     w8a8: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-    """Assemble one entry's (w13, w2[, scales]) on the CPU; thread-safe, as it
-    only reads shared state. Scales are None for the unquantized scheme."""
-    layer_idx, logical_id, _slot = entry
+    """Assemble one expert's (w13, w2, w13_scale, w2_scale) on the CPU; thread-safe,
+    as it does not modify shared state. Both scales are None for the unquantized
+    scheme; the w2 scale is a view into its bucket, so callers must not write it.
+    """
+    layer_idx, logical_id = pair
     routed = routed_layers[layer_idx]
-    if not w8a8 and (getattr(routed, "w13_bias", None) is not None or getattr(routed, "w2_bias", None) is not None):
+    if getattr(routed, "w13_bias", None) is not None or getattr(routed, "w2_bias", None) is not None:
         raise NotImplementedError("[FT] scale_down weight reload does not support MoE expert bias yet.")
     tp_rank, tp_size = _tp_shard_info(routed)
     tensors = buckets[(layer_idx, logical_id)]
@@ -211,18 +205,18 @@ def _assemble_entry(
     return w13, w2, _gather_w13_scale(tensors, tp_rank, tp_size), tensors[_W2_SCALE_SUFFIX].view(-1)
 
 
-def _reload_batched(
+def _reload_local_slots(
     routed_layers: list,
     local_slots: dict[tuple[int, int], int],
     buckets: dict[tuple[int, int], dict[str, torch.Tensor]],
 ) -> int:
-    """Reload all local (layer, slot) pairs in uniformly-laid-out batches.
+    """Reload all local (layer, expert) pairs in uniformly-laid-out chunks.
 
-    Every entry shares one quant scheme, weight shape and dtype, so a chunk
-    stacks into one tensor, e.g. DeepSeek-V4 43-layers 8 experts, 344 pairs
-    become ceil(344 / 32) = 11 chunks instead of 344 per-expert reloads.
+    Every pair shares one quant scheme, weight shape and dtype, so a chunk
+    stacks into one tensor, e.g. DeepSeek-V4 43-layers, 8 experts to reload,
+    344 pairs become ceil(344 / 32) = 11 chunks instead of 344 per-expert reloads.
     """
-    entries: list[tuple[int, int, int]] = []
+    pairs: list[tuple[int, int]] = []
     layouts: set[tuple] = set()
     for (layer_idx, logical_id), slot in sorted(local_slots.items()):
         routed = routed_layers[layer_idx]
@@ -241,7 +235,7 @@ def _reload_batched(
             w13_shape, w13_dtype = routed.w13_weight.shape[1:], routed.w13_weight.dtype
             w2_shape, w2_dtype = routed.w2_weight.shape[1:], routed.w2_weight.dtype
         layouts.add((type(quant_method), w13_shape, w13_dtype, w2_shape, w2_dtype))
-        entries.append((layer_idx, logical_id, slot))
+        pairs.append((layer_idx, logical_id))
 
     if len(layouts) != 1:
         raise RuntimeError(
@@ -251,25 +245,27 @@ def _reload_batched(
     quant_type = next(iter(layouts))[0]
 
     reloaded = 0
-    for start in range(0, len(entries), _RELOAD_CHUNK_SIZE):
-        reloaded += _reload_chunk(quant_type, routed_layers, entries[start : start + _RELOAD_CHUNK_SIZE], buckets)
+    for start in range(0, len(pairs), _RELOAD_CHUNK_SIZE):
+        chunk = pairs[start : start + _RELOAD_CHUNK_SIZE]
+        reloaded += _reload_chunk(quant_type, routed_layers, chunk, local_slots, buckets)
     return reloaded
 
 
 def _reload_chunk(
     quant_type: type,
     routed_layers: list,
-    entries: list[tuple[int, int, int]],
+    pairs: list[tuple[int, int]],
+    local_slots: dict[tuple[int, int], int],
     buckets: dict[tuple[int, int], dict[str, torch.Tensor]],
 ) -> int:
-    """Apply one chunk of entries sharing a quant scheme and layout.
+    """Apply one chunk of pairs sharing a quant scheme and layout.
 
     Assemble the chunk's (w13, w2) pairs on the CPU in parallel, stack them,
     then pay one H2D + one format cast for the whole stack and scatter it with
-    one non-blocking copy per slot, drained by a single sync. Per entry that
+    one non-blocking copy per slot, drained by a single sync. Per pair that
     replaces a CPU transpose-copy plus its own H2D, cast and scatter.
 
-    Shapes must match (see ``_reload_batched``); stacking and the device-side
+    Shapes must match (see ``_reload_local_slots``); stacking and the device-side
     cast assume it.
     """
     w13s: list[torch.Tensor] = []
@@ -278,10 +274,10 @@ def _reload_chunk(
     w2_scales: list[torch.Tensor] = []
     w8a8 = quant_type is AscendW8A8DynamicFusedMoEMethod
 
-    # CPU phase: assemble entries in parallel (read-only shared state).
-    assemble = partial(_assemble_entry, routed_layers=routed_layers, buckets=buckets, w8a8=w8a8)
-    with ThreadPoolExecutor(max_workers=min(len(entries), _GATHER_MAX_WORKERS)) as pool:
-        for w13, w2, w13_scale, w2_scale in pool.map(assemble, entries):
+    # CPU phase: assemble pairs in parallel (read-only shared state).
+    assemble = partial(_assemble_expert, routed_layers=routed_layers, buckets=buckets, w8a8=w8a8)
+    with ThreadPoolExecutor(max_workers=min(len(pairs), _GATHER_MAX_WORKERS)) as pool:
+        for w13, w2, w13_scale, w2_scale in pool.map(assemble, pairs):
             w13s.append(w13)
             w2s.append(w2)
             if w8a8:
@@ -295,8 +291,8 @@ def _reload_chunk(
         w2_scale_batch = torch.stack(w2_scales)
 
     # Device phase: one H2D + one format cast per weight class.
-    first_layer = routed_layers[entries[0][0]]
-    first_slot = entries[0][2]
+    first_layer = routed_layers[pairs[0][0]]
+    first_slot = local_slots[pairs[0]]
     w13_weight_list = getattr(first_layer, "w13_weight_list", None)
     if w13_weight_list is not None:
         device = w13_weight_list[first_slot].device
@@ -322,7 +318,8 @@ def _reload_chunk(
         w2_batch = maybe_trans_nz(w2_batch)
 
     # Scatter phase: non-blocking copies drained by one sync.
-    for i, (layer_idx, _logical_id, slot) in enumerate(entries):
+    for i, (layer_idx, logical_id) in enumerate(pairs):
+        slot = local_slots[(layer_idx, logical_id)]
         routed = routed_layers[layer_idx]
         w13_weight_list = getattr(routed, "w13_weight_list", None)
         if w13_weight_list is not None:
@@ -344,14 +341,17 @@ def _reload_chunk(
                 fused_w1_scale_list[slot].copy_(scale_from_float_to_int64(w13_scales[i]))
                 fused_w2_scale_list[slot].copy_(scale_from_float_to_int64(w2_scales[i]))
     torch.npu.synchronize()
-    return len(entries)
+    return len(pairs)
 
 
-def _match_weight_name(
+def _resolve_expert_tensor(
     name: str,
     wanted: dict[str, dict[int, tuple[int, int]]],
 ) -> tuple[tuple[int, int], str] | None:
-    """Split a normalized name into (key, suffix) if it names a wanted expert tensor."""
+    """Split a normalized name into (key, suffix) if it names a wanted expert tensor.
+
+    E.g. ``model.layers.3.ffn.experts.12.gate_proj.weight`` -> ``((3, 12), "gate_proj.weight")``.
+    """
     head, _, suffix = name.rpartition(".")
     layer_name, _, expert_str = head.rpartition(".")
     if not expert_str.isdigit():
@@ -366,45 +366,28 @@ def _match_weight_name(
     return (key, suffix) if key is not None else None
 
 
-def _resolve_safetensors_shards(vllm_config: VllmConfig, model: torch.nn.Module) -> list[str]:
-    """List the checkpoint's safetensors shards, downloading them if needed."""
-    model_config = vllm_config.model_config
-    load_config = vllm_config.load_config
-    model_path = maybe_download_from_modelscope(model_config.model, model_config.revision) or model_config.model
-    is_local = os.path.isdir(model_path)
+def _collect_safetensors_shards(vllm_config: VllmConfig, model: torch.nn.Module) -> list[str]:
+    """Collect the safetensors shards the model loads from the local checkpoint directory."""
+    model_path = vllm_config.model_config.model
+    if not os.path.isdir(model_path):
+        raise RuntimeError(
+            f"[FT] scale_down expert reload reads a local checkpoint only, but '{model_path}' is not a directory."
+        )
     # A model may narrow the patterns it loads; honour that over our default.
     allow_patterns = getattr(model, "allow_patterns_overrides", None) or ["*.safetensors"]
-    if is_local:
-        hf_folder = model_path
-    else:
-        hf_folder = download_weights_from_hf(
-            model_path,
-            load_config.download_dir,
-            allow_patterns,
-            model_config.revision,
-            ignore_patterns=load_config.ignore_patterns,
-        )
     shards: list[str] = []
     for pattern in allow_patterns:
-        shards += glob.glob(os.path.join(hf_folder, pattern))
+        shards += glob.glob(os.path.join(model_path, pattern))
         if shards:
             break
     # An override may select non-safetensors files; the header walk has
     # nothing to read there.
     shards = [shard for shard in shards if shard.endswith(".safetensors")]
     if len(shards) > 1:
-        if not is_local:
-            # The index file matches no "*.safetensors" pattern, so the
-            # download above skipped it; the dedup below needs it.
-            download_safetensors_index_file_from_hf(
-                model_path,
-                SAFE_WEIGHTS_INDEX_NAME,
-                load_config.download_dir,
-                revision=model_config.revision,
-            )
         # Sharded and consolidated safetensors can coexist; the index file
-        # records which set the model actually loads.
-        shards = filter_duplicate_safetensors_files(shards, hf_folder, SAFE_WEIGHTS_INDEX_NAME)
+        # records which set the model actually loads. It ships with the
+        # checkpoint, and the filter no-ops without it.
+        shards = filter_duplicate_safetensors_files(shards, model_path, SAFE_WEIGHTS_INDEX_NAME)
     return sorted(shards)
 
 
@@ -419,13 +402,13 @@ def _collect_matching_weights(
     """Read only the wanted experts' tensors by walking safetensors shard headers.
 
     ``safe_open(...).keys()`` reads a shard's JSON header alone, so a name
-    ``_match_weight_name`` rejects never reaches ``get_tensor``: reads are
+    ``_resolve_expert_tensor`` rejects never reaches ``get_tensor``: reads are
     limited to the wanted experts plus one header per shard.
     """
     for st_file in shards:
         with safe_open(st_file, framework="pt") as f:
             for raw_name in f.keys():  # noqa: SIM118
-                found = _match_weight_name(normalize(raw_name), wanted)
+                found = _resolve_expert_tensor(normalize(raw_name), wanted)
                 if found is None:
                     continue
                 key, suffix = found
@@ -458,8 +441,6 @@ def reload_experts_from_disk(
     local_slots: dict[tuple[int, int], int] = {}
     for layer_idx, logical_id in reassignments:
         layer_state = getattr(moe_layers[layer_idx], "eplb_state", None)
-        # Skipping is not an option: the rebuilt routing table already points
-        # at this expert, so its slot would silently keep the old occupant's.
         l2p = getattr(layer_state, "logical_to_physical_map", None)
         if l2p is None:
             raise RuntimeError(
@@ -490,7 +471,7 @@ def reload_experts_from_disk(
     matched: set[tuple[int, int]] = set()
 
     logger.info("[FT] Reloading %d reassigned (layer, expert) pair(s) on this rank from disk.", len(local_slots))
-    shards = _resolve_safetensors_shards(vllm_config, model)
+    shards = _collect_safetensors_shards(vllm_config, model)
     if not shards:
         raise RuntimeError(
             "[FT] scale_down expert reload requires a safetensors checkpoint; "
@@ -510,7 +491,7 @@ def reload_experts_from_disk(
             "an hf_to_vllm_mapper declared on the model class."
         )
 
-    reloaded = _reload_batched(routed_layers, local_slots, buckets)
+    reloaded = _reload_local_slots(routed_layers, local_slots, buckets)
 
-    logger.info("[FT] Expert weight reload complete: %d (layer, slot) pair(s).", reloaded)
+    logger.info("[FT] Expert weight reload complete: %d (layer, expert) pair(s).", reloaded)
     return reloaded
