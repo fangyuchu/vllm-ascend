@@ -463,8 +463,7 @@ def reload_experts_from_disk(
         l2p = getattr(layer_state, "logical_to_physical_map", None)
         if l2p is None:
             raise RuntimeError(
-                f"[FT] MoE layer {layer_idx} has no EPLB placement map; the "
-                "reassigned expert has nowhere to land."
+                f"[FT] MoE layer {layer_idx} has no EPLB placement map; the reassigned expert has nowhere to land."
             )
         num_local = routed_layers[layer_idx].moe_config.num_local_experts
         start = ep_rank * num_local
