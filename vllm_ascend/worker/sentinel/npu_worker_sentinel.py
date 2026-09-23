@@ -27,6 +27,7 @@ from vllm.v1.worker.sentinel.gpu_worker_sentinel import (
 )
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ascend_forward_context import use_cann_megamoe
 from vllm_ascend.distributed.eplb.state import refresh_model_routing_tables
 from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.worker.sentinel.eplb_redistribute import (
@@ -88,7 +89,7 @@ class WorkerSentinel(GPUWorkerSentinel):
 
     Handles commands dispatched from EngineCoreSentinel via collective_rpc,
     including device restart and DP group re-initialization on retry, and
-    MC2 elastic_info masking + expert redistribution on scale_down.
+    MC2 elastic_info or MegaMoe rank masking + expert redistribution on scale_down.
     """
 
     def __init__(self, worker: "Worker", device: torch.device):
@@ -116,6 +117,10 @@ class WorkerSentinel(GPUWorkerSentinel):
         # base flow and lift the quarantine after the groups are rebuilt.
         self.reset_device()
         super().retry(ft_request)
+        if use_cann_megamoe(self.worker.vllm_config):
+            # Publish mask and CCL-buffer writes before another stream replays
+            # the model's captured graph.
+            torch.npu.synchronize()
         self.worker_faulted = False
 
     def init_num_local_experts(self) -> None:
@@ -158,16 +163,19 @@ class WorkerSentinel(GPUWorkerSentinel):
                 "[FT] scale_down requires EPLB with num_redundant_experts > 0 to re-host the dead rank's experts."
             )
         ascend_config = get_ascend_config()
-        if ascend_config.enable_fused_mc2:
+        mega_moe = use_cann_megamoe(self.worker.vllm_config)
+        if mega_moe and not get_ep_all2all_manager().uses_mega_moe:
+            raise ValueError("[FT] MegaMoe fault-tolerance buffer was not initialized during warmup.")
+        if ascend_config.enable_fused_mc2 and not mega_moe:
             raise ValueError(
-                "[FT] scale_down is not supported with enable_fused_mc2: the "
-                "fused dispatch_ffn_combine operators take no elastic_info."
+                "[FT] scale_down with enable_fused_mc2 requires CANN MegaMoe; "
+                "the legacy fused dispatch_ffn_combine operators take no rank mask."
             )
         if ascend_config.enable_mc2_hierarchy_comm:
             raise ValueError(
                 "[FT] scale_down (elastic_info) is mutually exclusive with mc2 hierarchy comm (comm_alg='hierarchy')."
             )
-        if not hasattr(torch_npu, "npu_moe_distribute_dispatch_v2"):
+        if not mega_moe and not hasattr(torch_npu, "npu_moe_distribute_dispatch_v2"):
             raise ValueError(
                 "[FT] scale_down requires npu_moe_distribute_dispatch_v2 "
                 "(aclnn V3+); please upgrade the CANN/torch_npu version."
@@ -181,8 +189,8 @@ class WorkerSentinel(GPUWorkerSentinel):
         which cannot produce Ascend's runtime expert layout (transpose / NZ /
         per-slot lists / quant scales). The shared redistribution steps (mark
         dead slots, steal spare slots, rebuild the logical maps) are kept; on
-        top of that, refreshes the Ascend kernel-facing routing tables into
-        the densified id space and shrinks the MC2 physical-expert width.
+        top of that, refreshes the Ascend kernel-facing routing tables. MC2
+        densifies physical ids; MegaMoe preserves the original physical slots.
         """
         model_runner = self.worker.model_runner
         eplb_model_state = self._eplb_model_state()
@@ -209,10 +217,12 @@ class WorkerSentinel(GPUWorkerSentinel):
         )
 
         # Propagate the new placement into the Ascend routing tables (in-place,
-        # so captured graphs keep pointing at valid storage), then renumber
-        # their ids into the densified space for the MC2 kernels.
+        # so captured graphs keep pointing at valid storage).
         refresh_model_routing_tables(eplb_model_state)
-        self._densify_routing_tables(eplb_model_state)
+        # MegaMoe masks failed physical ranks without shrinking its expert-id
+        # space. Densifying would route experts to the wrong surviving rank.
+        if not get_ep_all2all_manager().uses_mega_moe:
+            self._densify_routing_tables(eplb_model_state)
 
     def _densify_routing_tables(self, eplb_model_state) -> None:
         """Renumber the kernel-facing routing tables into the densified id space.

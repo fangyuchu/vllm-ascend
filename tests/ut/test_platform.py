@@ -753,6 +753,9 @@ class TestNPUPlatform(TestBase):
         vllm_config = TestNPUPlatform.mock_vllm_config()
         vllm_config.use_v2_model_runner = True
         vllm_config.parallel_config.prefill_context_parallel_size = 2
+        vllm_config.kv_transfer_config = SimpleNamespace(kv_role="kv_consumer")
+        ascend_config = TestNPUPlatform.mock_vllm_ascend_config()
+        ascend_config.scheduler_config.recompute_scheduler_enable = True
         dummy_comm_method = object()
 
         with (
@@ -762,6 +765,8 @@ class TestNPUPlatform(TestBase):
             patch("vllm.distributed.get_tensor_model_parallel_world_size", return_value=4),
             patch("vllm.distributed.get_dp_group", return_value=MagicMock(world_size=1)),
             patch("vllm_ascend.ascend_forward_context.select_moe_comm_method", return_value=MoECommType.ALLGATHER),
+            patch("vllm_ascend.ascend_forward_context.use_cann_megamoe", return_value=True),
+            patch("vllm_ascend.ascend_forward_context.get_ascend_config", return_value=ascend_config),
             patch("vllm_ascend.ascend_forward_context.get_mc2_mask", return_value=None),
             patch("vllm_ascend.ops.fused_moe.moe_comm_method.get_moe_comm_method", return_value=dummy_comm_method),
         ):
@@ -773,6 +778,8 @@ class TestNPUPlatform(TestBase):
             )
 
         self.assertFalse(kwargs["in_profile_run"])
+        self.assertIs(kwargs["use_mega_moe"], True)
+        self.assertIs(kwargs["is_decode_only_node"], True)
         self.assertEqual(kwargs["padded_num_tokens"], 8)
         self.assertEqual(kwargs["max_tokens_across_pcp"], 5)
         self.assertIs(kwargs["moe_comm_method"], dummy_comm_method)
@@ -806,6 +813,7 @@ class TestNPUPlatform(TestBase):
             patch("vllm.distributed.get_tensor_model_parallel_world_size", return_value=2),
             patch("vllm.distributed.get_dp_group", return_value=MagicMock(world_size=1)),
             patch("vllm_ascend.ascend_forward_context.select_moe_comm_method", return_value=MoECommType.ALLGATHER),
+            patch("vllm_ascend.ascend_forward_context.use_cann_megamoe", return_value=False),
             patch("vllm_ascend.ascend_forward_context.get_mc2_mask", return_value=None),
             patch("vllm_ascend.ops.fused_moe.moe_comm_method.get_moe_comm_method", return_value=object()),
             override_mrv2_in_profile_run(True),
@@ -818,6 +826,8 @@ class TestNPUPlatform(TestBase):
             )
 
         self.assertTrue(kwargs["in_profile_run"])
+        self.assertIs(kwargs["use_mega_moe"], False)
+        self.assertIs(kwargs["is_decode_only_node"], False)
 
     @patch("vllm_ascend.quantization.utils.maybe_auto_detect_quantization")
     @patch("vllm_ascend.ascend_config.init_ascend_config")
