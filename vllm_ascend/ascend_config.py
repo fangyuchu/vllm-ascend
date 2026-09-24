@@ -27,7 +27,7 @@ from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 
 from vllm_ascend.config_utils import config
-from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+from vllm_ascend.device.hardware_profile import HardwareCapability, MoECommPolicy, get_current_hardware_profile
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -930,13 +930,29 @@ class AscendConfig:
             moe_intermediate_size = getattr(hf_text_config, "intermediate_size", None)
         if moe_intermediate_size is None:
             return False
+        quant_type = getattr(hf_text_config, "moe_quantize", getattr(hf_text_config, "quantize", None))
+        quant_name = str(getattr(quant_type, "name", quant_type)).lower()
+        # TEMPORARY WORKAROUND: allow intermediate_size=768 to bypass the
+        # minimum-1024 and 512-alignment checks below only for A3 W8A8 FT.
+        # This requires the matching locally patched CANN MegaMoe operator;
+        # it does not imply general support for non-512-aligned dimensions.
+        # TODO: remove this exception once upstream CANN supports this shape
+        # and the regular MegaMoe configuration checks are updated accordingly.
+        if (
+            moe_intermediate_size == 768
+            and quant_name in {"w8a8", "w8a8_dynamic", "quanttype.w8a8"}
+            and get_current_hardware_profile().moe_comm_policy is MoECommPolicy.FUSED_OR_CAPACITY
+            and getattr(getattr(vllm_config, "parallel_config", None), "enable_fault_tolerance", False)
+        ):
+            logger.warning_once(
+                "A3 W8A8 768 MegaMoe fault tolerance requires the matching patched CANN operator build."
+            )
+            return True
         if moe_intermediate_size < 1024 or moe_intermediate_size > 3072 or moe_intermediate_size % 512 != 0:
             return False
 
-        quant_type = getattr(hf_text_config, "moe_quantize", getattr(hf_text_config, "quantize", None))
         if quant_type is None:
             return True
-        quant_name = str(getattr(quant_type, "name", quant_type)).lower()
         supported_quant_names = {
             "w8a8",
             "w4a8",
