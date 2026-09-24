@@ -177,3 +177,11 @@ class AscendEplbState(_eplb_state.EplbState):
         for model_state in state.model_states.values():
             refresh_model_routing_tables(model_state)
         return state
+
+    def update_mapping(
+        self,
+        model_config: Any,
+        expanded_physical_to_logical: torch.Tensor,
+    ) -> None:
+        super().update_mapping(model_config, expanded_physical_to_logical)
+        refresh_model_routing_tables(self.model_states[model_config.compute_hash()])

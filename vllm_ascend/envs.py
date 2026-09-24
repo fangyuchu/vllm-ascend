@@ -79,6 +79,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Whether to reuse captured ACL graphs across Elastic EP scale-down
+    # reconfiguration on the CANN MegaMoe all2all backend. When "1", a
+    # scale-down keeps the captured graphs alive and masks the removed EP
+    # ranks on the MegaMoe symmetric buffer instead of releasing and
+    # re-capturing every graph shape. Requires --enable-elastic-ep with
+    # the fused MC2 (CANN MegaMoe) path. Scale-up always re-captures.
+    # Valid values: 0 or 1. Default: 0 (disabled). Not sensitive.
+    "VLLM_ASCEND_ELASTIC_EP_GRAPH_REUSE": lambda: bool(int(os.getenv("VLLM_ASCEND_ELASTIC_EP_GRAPH_REUSE", "0"))),
     # Emit per-layer KVPool ranged transfer audit events. Default: 0 (disabled).
     # Valid values: 0 or 1. This configuration is not sensitive.
     "VLLM_ASCEND_KVPOOL_RANGE_DEBUG": lambda: _strict_binary_env("VLLM_ASCEND_KVPOOL_RANGE_DEBUG"),

@@ -744,6 +744,15 @@
 #    Future Plan:
 #       Remove this workaround when vLLM 0.28.0 support is dropped.
 #
+#   3. `vllm.config.vllm.VllmConfig._get_v2_model_runner_unsupported_features`
+#    Why:
+#       Ascend V2 runner supports elastic EP, which upstream lists as
+#       unsupported (vllm/config/vllm.py). Drop it from the returned list.
+#    Related PR (if no, explain why):
+#       No, NPU V2 model runner supports elastic EP.
+#    Future Plan:
+#       Remove when upstream V2 runner supports elastic EP on non-CUDA backends.
+#
 # * Worker Patch:
 # ========#
 # Entries are listed in alphabetical order by file name.

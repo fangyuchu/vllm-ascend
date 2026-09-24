@@ -40,6 +40,7 @@ class PyHcclCommunicator:
         group: ProcessGroup | StatelessProcessGroup,
         device: int | str | torch.device,
         library_path: str | None = None,
+        warmup: bool = True,
     ):
         """
         Args:
@@ -120,27 +121,37 @@ class PyHcclCommunicator:
         with torch.npu.device(device):
             self.comm: hcclComm_t = self.hccl.hcclCommInitRank(self.world_size, self.unique_id, self.rank)
 
-            stream = current_stream()
-            # A small all_reduce for warmup.
-            data = torch.zeros(1, device=device)
-            self.all_reduce(data)
-            stream.synchronize()
-            del data
+            if warmup:
+                stream = current_stream()
+                # A small all_reduce for warmup.
+                data = torch.zeros(1, device=device)
+                self.all_reduce(data)
+                stream.synchronize()
+                del data
+
+    def destroy(self):
+        if self.available and not self.disabled:
+            with torch.accelerator.device_index(self.device.index):
+                self.hccl.hcclCommDestroy(self.comm)
+            self.available = False
+            self.disabled = True
+
+    def _check_tensor_device(self, tensor: torch.Tensor) -> None:
+        assert tensor.device == self.device, (
+            f"this hccl communicator is created to work on {self.device}, but the tensor is on {tensor.device}"
+        )
+
+    def _get_stream(self, stream):
+        return stream if stream is not None else current_stream()
 
     def all_reduce(self, in_tensor: torch.Tensor, op: ReduceOp = ReduceOp.SUM, stream=None) -> torch.Tensor:
         if self.disabled:
             return None
-        # hccl communicator created on a specific device
-        # will only work on tensors on the same device
-        # otherwise it will cause "illegal memory access"
-        assert in_tensor.device == self.device, (
-            f"this hccl communicator is created to work on {self.device}, but the input tensor is on {in_tensor.device}"
-        )
+        self._check_tensor_device(in_tensor)
+        stream = self._get_stream(stream)
 
         out_tensor = torch.empty_like(in_tensor)
 
-        if stream is None:
-            stream = current_stream()
         self.hccl.hcclAllReduce(
             buffer_type(in_tensor.data_ptr()),
             buffer_type(out_tensor.data_ptr()),
@@ -152,14 +163,54 @@ class PyHcclCommunicator:
         )
         return out_tensor
 
+    def all_gather(self, in_tensor: torch.Tensor, out_tensor: torch.Tensor, stream=None) -> torch.Tensor:
+        if self.disabled:
+            return None
+        self._check_tensor_device(in_tensor)
+        stream = self._get_stream(stream)
+        self.hccl.hcclAllGather(
+            buffer_type(in_tensor.data_ptr()),
+            buffer_type(out_tensor.data_ptr()),
+            in_tensor.numel(),
+            hcclDataTypeEnum.from_torch(in_tensor.dtype),
+            self.comm,
+            aclrtStream_t(stream.npu_stream),
+        )
+        return out_tensor
+
+    def send(self, tensor: torch.Tensor, dst: int, stream=None):
+        if self.disabled:
+            return None
+        self._check_tensor_device(tensor)
+        stream = self._get_stream(stream)
+        self.hccl.hcclSend(
+            buffer_type(tensor.data_ptr()),
+            tensor.numel(),
+            hcclDataTypeEnum.from_torch(tensor.dtype),
+            dst,
+            self.comm,
+            aclrtStream_t(stream.npu_stream),
+        )
+
+    def recv(self, tensor: torch.Tensor, src: int, stream=None):
+        if self.disabled:
+            return None
+        self._check_tensor_device(tensor)
+        stream = self._get_stream(stream)
+        self.hccl.hcclRecv(
+            buffer_type(tensor.data_ptr()),
+            tensor.numel(),
+            hcclDataTypeEnum.from_torch(tensor.dtype),
+            src,
+            self.comm,
+            aclrtStream_t(stream.npu_stream),
+        )
+
     def broadcast(self, tensor: torch.Tensor, src: int, stream=None):
         if self.disabled:
             return
-        assert tensor.device == self.device, (
-            f"this hccl communicator is created to work on {self.device}, but the input tensor is on {tensor.device}"
-        )
-        if stream is None:
-            stream = current_stream()
+        self._check_tensor_device(tensor)
+        stream = self._get_stream(stream)
         buffer = buffer_type(tensor.data_ptr())
         self.hccl.hcclBroadcast(
             buffer,
@@ -169,3 +220,13 @@ class PyHcclCommunicator:
             self.comm,
             aclrtStream_t(stream.npu_stream),
         )
+
+    def batch_isend_irecv(self, p2p_ops: list, stream=None):
+        if self.disabled:
+            return
+        stream = self._get_stream(stream)
+        for op in p2p_ops:
+            if op.op is torch.distributed.isend:
+                self.send(op.tensor, op.group_peer, stream)
+            elif op.op is torch.distributed.irecv:
+                self.recv(op.tensor, op.group_peer, stream)
