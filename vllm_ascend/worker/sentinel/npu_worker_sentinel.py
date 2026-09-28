@@ -129,10 +129,9 @@ class WorkerSentinel(GPUWorkerSentinel):
         # upstream retry and clear the fault flag once the groups are rebuilt.
         self.reset_device()
         super().retry(ft_request)
-        if use_cann_megamoe(self.worker.vllm_config):
-            # Publish mask and CCL-buffer writes before another stream replays
-            # the model's captured graph.
-            torch.npu.synchronize()
+        # Complete device-state updates before another stream replays
+        # the model's captured graph.
+        torch.npu.synchronize()
         self.worker_faulted = False
         self.fault_info = None
 
