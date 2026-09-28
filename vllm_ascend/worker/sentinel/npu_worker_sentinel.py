@@ -176,12 +176,13 @@ class WorkerSentinel(GPUWorkerSentinel):
         self._find_eplb_drafter()
         ascend_config = get_ascend_config()
         mega_moe = use_cann_megamoe(self.worker.vllm_config)
-        if mega_moe and not get_ep_all2all_manager().uses_mega_moe:
+        if mega_moe and not get_ep_all2all_manager().has_mega_moe_buffer:
             raise ValueError("[FT] MegaMoe fault-tolerance buffer was not initialized during warmup.")
         if ascend_config.enable_fused_mc2 and not mega_moe:
             raise ValueError(
-                "[FT] scale_down with enable_fused_mc2 requires CANN MegaMoe; "
-                "the legacy fused dispatch_ffn_combine operators take no rank mask."
+                "[FT] scale_down with enable_fused_mc2 requires a cann_ops_transformer build "
+                "with MegaMoe rank-mask support. Select enable_fused_mc2=2; "
+                "the legacy dispatch_ffn_combine backend does not support fault tolerance."
             )
         if ascend_config.enable_mc2_hierarchy_comm:
             raise ValueError(
@@ -190,7 +191,7 @@ class WorkerSentinel(GPUWorkerSentinel):
         self._check_comm_method_supports_scale_down(raise_on_error=True)
         if not mega_moe and not hasattr(torch_npu, "npu_moe_distribute_dispatch_v2"):
             raise ValueError(
-                "[FT] scale_down requires npu_moe_distribute_dispatch_v2 "
+                "[FT] MC2 scale_down requires npu_moe_distribute_dispatch_v2 "
                 "(aclnn V3+); please upgrade the CANN/torch_npu version."
             )
 
@@ -284,7 +285,7 @@ class WorkerSentinel(GPUWorkerSentinel):
         if dead_rank_experts:
             reload_experts_from_disk(model, model_config, load_config, dead_rank_experts)
         refresh_model_routing_tables(model_state)
-        if not get_ep_all2all_manager().uses_mega_moe:
+        if not get_ep_all2all_manager().has_mega_moe_buffer:
             densify_routing_tables(
                 model_state.model.moe_layers,
                 get_ep_all2all_manager().orig_to_dense_rank_table(),
