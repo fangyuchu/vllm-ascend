@@ -164,20 +164,19 @@ class WorkerSentinel(GPUWorkerSentinel):
             )
         ascend_config = get_ascend_config()
         mega_moe = use_cann_megamoe(self.worker.vllm_config)
-        if mega_moe and not get_ep_all2all_manager().uses_mega_moe:
+        if mega_moe and not get_ep_all2all_manager().has_mega_moe_buffer:
             raise ValueError("[FT] MegaMoe fault-tolerance buffer was not initialized during warmup.")
         if ascend_config.enable_fused_mc2 and not mega_moe:
             raise ValueError(
-                "[FT] scale_down with enable_fused_mc2 requires CANN MegaMoe; "
-                "the legacy fused dispatch_ffn_combine operators take no rank mask."
+                "[FT] scale_down with enable_fused_mc2 requires a cann_ops_transformer build "
+                "with MegaMoe rank-mask support. Select enable_fused_mc2=2; "
+                "the legacy dispatch_ffn_combine backend does not support fault tolerance."
             )
         if ascend_config.enable_mc2_hierarchy_comm:
-            raise ValueError(
-                "[FT] scale_down (elastic_info) is mutually exclusive with mc2 hierarchy comm (comm_alg='hierarchy')."
-            )
+            raise ValueError("[FT] scale_down is mutually exclusive with mc2 hierarchy comm (comm_alg='hierarchy').")
         if not mega_moe and not hasattr(torch_npu, "npu_moe_distribute_dispatch_v2"):
             raise ValueError(
-                "[FT] scale_down requires npu_moe_distribute_dispatch_v2 "
+                "[FT] MC2 scale_down requires npu_moe_distribute_dispatch_v2 "
                 "(aclnn V3+); please upgrade the CANN/torch_npu version."
             )
 
@@ -221,7 +220,7 @@ class WorkerSentinel(GPUWorkerSentinel):
         refresh_model_routing_tables(eplb_model_state)
         # MegaMoe masks failed physical ranks without shrinking its expert-id
         # space. Densifying would route experts to the wrong surviving rank.
-        if not get_ep_all2all_manager().uses_mega_moe:
+        if not get_ep_all2all_manager().has_mega_moe_buffer:
             self._densify_routing_tables(eplb_model_state)
 
     def _densify_routing_tables(self, eplb_model_state) -> None:
