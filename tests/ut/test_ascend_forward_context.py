@@ -346,6 +346,19 @@ def test_select_moe_comm_method_a3_v3_forces_mc2(monkeypatch):
     assert afc.select_moe_comm_method(4097, _make_vllm_config()) == MoECommType.MC2
 
 
+@pytest.mark.parametrize("v3_enabled", [False, True])
+def test_v3_switch_agrees_with_mega_moe_weights_and_forward_selection(monkeypatch, v3_enabled):
+    _patch_select_moe_comm_method_deps(
+        monkeypatch, device_type=AscendDeviceType.A3, ep_world_size=8, enable_fused_mc2=1
+    )
+    monkeypatch.setattr(afc, "is_mega_moe_supported", lambda: True)
+    monkeypatch.setattr(afc.envs_ascend, "VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3", v3_enabled)
+    config = _make_vllm_config()
+    assert afc.use_cann_megamoe(config) is (not v3_enabled)
+    expected = MoECommType.MC2 if v3_enabled else MoECommType.FUSED_MC2
+    assert afc.select_moe_comm_method(4097, config) == expected
+
+
 @pytest.mark.parametrize(
     ("num_tokens", "expected"),
     [

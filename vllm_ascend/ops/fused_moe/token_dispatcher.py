@@ -154,6 +154,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         # as an explicit elastic_info tensor on every call; dead ranks are
         # excluded purely via elastic_info.
         self._ft_enabled = vllm_config.parallel_config.enable_fault_tolerance
+        self._elastic_ep_enabled = vllm_config.parallel_config.enable_elastic_ep
         self._initial_v3_moe_expert_num: int | None = None
         if self._ft_enabled and self.mc2_comm_alg == "hierarchy":
             raise RuntimeError("MC2 fault tolerance (elastic_info) is mutually exclusive with comm_alg='hierarchy'.")

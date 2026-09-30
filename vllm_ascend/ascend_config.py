@@ -26,6 +26,7 @@ from pydantic_core import ArgsKwargs
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.config_utils import config
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 
@@ -583,6 +584,8 @@ class AscendConfig:
             _MEGA_MOE_SUPPORTED = False
         elif self.enable_fused_mc2 == 2:
             _MEGA_MOE_SUPPORTED = importlib.util.find_spec("cann_ops_transformer") is not None
+            if not _MEGA_MOE_SUPPORTED and not envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3:
+                raise ValueError("enable_fused_mc2=2 requires cann_ops_transformer; use the V3 backend instead.")
             self.enable_fused_mc2 = 1
         return self
 
@@ -739,9 +742,17 @@ class AscendConfig:
                 "cannot be enabled at the same time. Setting multistream_overlap_shared_expert to False."
             )
         if self.enable_fused_mc2 == 1 and is_mega_moe_supported() and not self._is_megamoe_supported_by_config(vc):
-            self.enable_fused_mc2 = 0
+            # Temporarily disabled for startup debugging.
+            # if vc.parallel_config.enable_fault_tolerance and not envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3:
+            #     raise ValueError(
+            #         "MegaMoe fault tolerance does not support this model's dimensions or quantization. "
+            #         "Use VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3=1 and enable_fused_mc2=0; "
+            #         "Qwen3-30B-A3B's 768-wide MoE intermediate dimension is not supported by MegaMoe."
+            #     )
+            # Temporarily force MegaMoe for debugging unsupported model configs.
+            # self.enable_fused_mc2 = 0
             logger.warning_once(
-                "MegaMoe is not supported for this model config; additional_config.enable_fused_mc2 will be set to 0."
+                "Forcing MegaMoe for an unsupported model config; compatibility fallback is disabled for debugging."
             )
 
         # mlapo_keep_prefill_weights preconditions: the prefill weights are only

@@ -23,6 +23,7 @@ from vllm.distributed.parallel_state import _replace_active_groups
 from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
 from vllm.distributed.utils import get_cached_tcp_store_client
 from vllm.logger import logger
+from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 from vllm.platforms import current_platform
 from vllm.utils import is_moe_layer
 from vllm.v1.attention.backend import AttentionImplBase
@@ -31,13 +32,14 @@ from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.workspace import lock_workspace, unlock_workspace
 
 import vllm_ascend.envs as envs_ascend
-from vllm_ascend.ascend_forward_context import MoECommType
+from vllm_ascend.ascend_forward_context import MoECommType, _is_decode_only_node
 from vllm_ascend.compilation.acl_graph import (
     ACLGraphWrapper,
     reset_graph_params,
     set_draft_graph_params,
     set_graph_params,
 )
+from vllm_ascend.distributed.elastic_ep.mega_moe_capture import MegaMoeCaptureState, ep_to_mc2_ranks
 from vllm_ascend.distributed.elastic_ep.standby_state import (
     create_ascend_standby_groups,
     get_standby_mc2_group,
@@ -65,6 +67,8 @@ from vllm_ascend.ops.fused_moe.moe_comm_method import (
 from vllm_ascend.ops.fused_moe.moe_distribute_v3 import (
     update_moe_distribute_v3_contexts,
 )
+from vllm_ascend.ops.fused_moe.moe_utils import _get_cann_mega_moe_quant_settings
+from vllm_ascend.quantization.quant_type import QuantType
 
 _PATCH_LOCK = threading.Lock()
 
@@ -223,6 +227,38 @@ def setup_moe_comm_and_quant_method(module: nn.Module) -> None:
 
 
 class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
+    def _is_mega_moe_restore(self, request: ReconfigureDistributedRequest) -> bool:
+        config = self.worker.vllm_config
+        parallel = config.parallel_config
+        comm = get_moe_comm_method(MoECommType.FUSED_MC2)
+        state = getattr(comm, "mega_moe_capture_state", None)
+        if not isinstance(state, MegaMoeCaptureState):
+            return False
+        dp_group = get_dp_group()
+        return bool(
+            not envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3
+            and request.operation_id
+            and parallel.enable_fault_tolerance
+            and parallel.tensor_parallel_size
+            == parallel.pipeline_parallel_size
+            == parallel.prefill_context_parallel_size
+            == 1
+            and config.lora_config is None
+            and getattr(config, "speculative_config", None) is None
+            and comm.mega_moe_quant_type == QuantType.W8A8
+            and upstream_elastic_execute.get_active_dp_size(dp_group) < request.new_data_parallel_size
+            and request.new_data_parallel_size == state.buffer.ep_world_size == get_mc2_group().world_size
+            and bool(getattr(dp_group, "dead_dp_ranks", ()))
+            and callable(getattr(state.buffer, "update_group", None))
+        )
+
+    @staticmethod
+    def _mega_moe_comm():
+        comm = get_moe_comm_method(MoECommType.FUSED_MC2)
+        if not isinstance(getattr(comm, "mega_moe_capture_state", None), MegaMoeCaptureState):
+            raise RuntimeError("MegaMoe restore requires graph-stable routing and a live symmetric buffer")
+        return comm
+
     @staticmethod
     def _build_v3_mc2_rank_order(
         physical_ranks: list[int],
@@ -248,7 +284,7 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         reconfig_request: ReconfigureDistributedRequest,
     ) -> bool:
         parallel_config = self.worker.vllm_config.parallel_config
-        return bool(
+        return self._is_mega_moe_restore(reconfig_request) or bool(
             envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3
             and reconfig_request.operation_id
             and reconfig_request.new_data_parallel_size > parallel_config.data_parallel_size
@@ -469,7 +505,10 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         if elastic_info is not None:
             elastic_info_cpu = elastic_info.detach().cpu()
             has_inactive_ranks = bool(elastic_info_cpu[0].item()) and (int(elastic_info_cpu[1].item()) < target_ep_size)
-        enabled = bool(
+        self._mega_moe_precommit_capture = self._is_mega_moe_restore(reconfig_request)
+        self._v3_capture_companion_done = False
+        self._v3_bootstrap_mapping = None
+        enabled = self._mega_moe_precommit_capture or bool(
             envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3
             and reconfig_request.operation_id
             and reconfig_request.new_data_parallel_size > old_dp_size
@@ -479,6 +518,12 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
             and has_inactive_ranks
         )
         store = self._v3_capture_store(reconfig_request)
+        # Reuse the existing capture protocol and state machine for both
+        # backends, but never run V3 context/routing operations for MegaMoe.
+        store.set(
+            self._v3_capture_key(reconfig_request.operation_id, "backend"),
+            b"mega_moe" if self._mega_moe_precommit_capture else b"v3",
+        )
         if enabled:
             dp_group = get_dp_group()
             dead_ranks = set(getattr(dp_group, "dead_dp_ranks", ()))
@@ -508,10 +553,15 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
     ) -> bool:
         if not reconfig_request.operation_id:
             self._v3_precommit_capture = False
+            self._mega_moe_precommit_capture = False
             return False
         store = self._v3_capture_store(reconfig_request)
         enabled = store.get(self._v3_capture_key(reconfig_request.operation_id, "enabled")) == b"1"
         self._v3_precommit_capture = enabled
+        self._mega_moe_precommit_capture = enabled and (
+            store.get(self._v3_capture_key(reconfig_request.operation_id, "backend")) == b"mega_moe"
+        )
+        self._v3_precommit_capture_done = False
         if enabled:
             self._v3_mc2_rank_order = [
                 int(rank)
@@ -996,7 +1046,15 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         # target-group collectives. Keep them in the same drained phase so
         # old and new ranks enter them in one deterministic order.
         self.materialize_new_communication_groups()
-        self._update_existing_v3_contexts()
+        if getattr(self, "_mega_moe_precommit_capture", False):
+            group = get_standby_mc2_group()
+            comm = self._mega_moe_comm()
+            comm.mega_moe_capture_state.update_context(group)
+            # The MC2 permutation keeps every survivor in its old physical
+            # slot, so its existing FT mask and routing remain valid here.
+            self._synchronize_v3_context_rendezvous(group, "existing MegaMoe")
+        else:
+            self._update_existing_v3_contexts()
 
     def transfer_weights(self, old_dp_size: int, new_dp_size: int) -> None:
         with _PATCH_LOCK, self._use_ascend_transfer_impl():
@@ -1260,11 +1318,19 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         if eplb_state is None:
             raise RuntimeError("V3 Elastic EP scale-up requires EPLB state")
         if not eplb_state.is_async:
+            if getattr(self, "_mega_moe_precommit_capture", False):
+                # Synchronous EPLB resumes on the next normal model step.
+                # The bootstrap mapping is already installed at this point.
+                eplb_state.expert_rearrangement_step = 0
+                return
             raise RuntimeError("V3 graph-preserving scale-up requires asynchronous EPLB")
         eplb_state.expert_rearrangement_step = 0
         eplb_state.start_async_loop()
 
     def commit_scale_up(self, is_existing_worker: bool) -> None:
+        if getattr(self, "_mega_moe_precommit_capture", False):
+            self._commit_mega_moe_restore(is_existing_worker)
+            return
         if getattr(self, "_v3_precommit_capture", False):
             commit_completed = False
             try:
@@ -1620,6 +1686,10 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         if not moe_modules:
             raise RuntimeError("V3 pre-commit capture requires at least one MoE layer")
 
+        if getattr(self, "_mega_moe_precommit_capture", False):
+            self._prepare_new_mega_moe_capture(moe_modules)
+            return reconfig_request.operation_id
+
         new_ep_size = get_mc2_group().world_size
         new_dp_size = parallel_config.data_parallel_size
         if new_ep_size % new_dp_size != 0:
@@ -1692,6 +1762,67 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
 
     def warmup_local_kernels(self) -> None:
         pass
+
+    def _prepare_new_mega_moe_capture(self, moe_modules: list[nn.Module]) -> None:
+        self._setup_moe_comm_and_quant_method()
+        comm = get_moe_comm_method(MoECommType.FUSED_MC2)
+        scheme = moe_modules[0].routed_experts.quant_method.quant_method
+        if scheme.quant_type != QuantType.W8A8:
+            raise RuntimeError("MegaMoe restore capture currently requires W8A8")
+        mode, dtype, _ = _get_cann_mega_moe_quant_settings(scheme.quant_type)
+        comm.mega_moe_quant_type = scheme.quant_type
+        comm.mega_moe_symm_buffer = comm._init_mega_moe_symm_buffer(
+            mode, dtype, is_decode_only_node=_is_decode_only_node(self.worker.vllm_config)
+        )
+        group = get_mc2_group()
+        active_slots = [slot for slot, rank in enumerate(group.ranks) if rank >= self._v3_old_dp_size]
+        comm.mega_moe_capture_state.prepare_capture(active_slots, moe_modules[0].moe_config.experts_per_token)
+        comm.mega_moe_symm_buffer.get_local_buffer_tensor(torch.uint8).zero_()
+        self._synchronize_v3_context_rendezvous(group, "new MegaMoe")
+
+    def _commit_mega_moe_restore(self, is_existing_worker: bool) -> None:
+        completed = False
+        try:
+            comm = self._mega_moe_comm()
+            if is_existing_worker:
+                if not getattr(self, "_v3_capture_companion_done", False):
+                    raise RuntimeError("MegaMoe capture companion has not completed")
+                retired = self._switch_and_prepare_v3_restore_scale_up()
+                retired_mc2 = self._activate_ascend_standby_groups()
+                retired = (*retired, retired_mc2) if retired_mc2 is not None else retired
+            else:
+                if not getattr(self, "_v3_precommit_capture_done", False):
+                    raise RuntimeError("New-rank MegaMoe capture has not completed")
+                retired = None
+
+            group = get_mc2_group()
+            state = comm.mega_moe_capture_state
+            rank_map = ep_to_mc2_ranks(get_ep_group().ranks, group.ranks)
+            state.set_rank_map(rank_map)
+            # Keep the original FusedMC2CommImpl, weights and graphs alive.
+            comm.token_dispatcher.refresh_hccl_group()
+            get_ep_all2all_manager().bind_mega_moe_buffer(state.buffer, rank_map)
+            state.buffer.get_local_buffer_tensor(torch.uint8).zero_()
+            self._synchronize_v3_context_rendezvous(group, "MegaMoe clear flags")
+            state.finish_capture()
+            sentinel = getattr(self.worker, "worker_sentinel", None)
+            if sentinel is not None:
+                sentinel.init_num_local_experts()
+            self._synchronize_v3_context_rendezvous(group, "MegaMoe commit")
+            self._resume_async_eplb_from_bootstrap()
+            self._set_eplb_suppressed(False)
+            self._v3_eplb_suppression_operation_id = None
+            self._v3_bootstrap_mapping = None
+            if retired is not None:
+                self._start_group_cleanup(retired)
+            self._cleanup_v3_capture_group()
+            completed = True
+            logger.info(
+                "[Elastic EP] MegaMoe restore committed; existing graphs preserved, ep_size=%s", group.world_size
+            )
+        finally:
+            if not completed:
+                logger.warning("[Elastic EP] Keeping EPLB suppressed because MegaMoe restore did not complete")
 
     def warm_and_capture(self) -> None:
         # No need to save/clear/restore the KV-cache block tables like the

@@ -88,7 +88,8 @@ def get_mrv2_in_profile_run() -> bool:
 def use_cann_megamoe(vllm_config: VllmConfig) -> bool:
     # TODO: drop the EP-size guard when MegaMoe supports larger EP sizes.
     return (
-        is_mega_moe_supported()
+        not envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3
+        and is_mega_moe_supported()
         and get_current_hardware_profile().supports(HardwareCapability.CANN_MEGAMOE)
         and get_ascend_config().enable_fused_mc2 == 1
         and is_moe_model(vllm_config)
