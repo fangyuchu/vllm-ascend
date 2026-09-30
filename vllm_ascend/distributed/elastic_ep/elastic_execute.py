@@ -922,7 +922,6 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
                 f"mapping_width={physical_to_logical.shape[1]}, "
                 f"num_local_experts={num_local_physical_experts}"
             )
-        num_logical_experts = model_state.logical_replica_count.shape[1]
         reconfig_request = self.reconfig_request
         old_dp_size = getattr(self, "_v3_old_dp_size", None)
         if reconfig_request is None or old_dp_size is None:
@@ -964,8 +963,6 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         self._v3_bootstrap_mapping = bootstrap_mapping
         upstream_elastic_execute.broadcast_expert_mapping(
             physical_to_logical=bootstrap_mapping,
-            num_local_physical_experts=num_local_physical_experts,
-            num_logical_experts=num_logical_experts,
             dp_group=standby_dp_group,
             src_rank=0,
             device=self.worker.device,
@@ -1201,15 +1198,7 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
                 f"current={current_num_physical_experts}, "
                 f"target={num_physical_experts}"
             )
-        if current_num_physical_experts < num_physical_experts:
-            expanded_physical_to_logical = torch.full(
-                (physical_to_logical.shape[0], num_physical_experts),
-                -1,
-                dtype=physical_to_logical.dtype,
-                device=physical_to_logical.device,
-            )
-            expanded_physical_to_logical[:, :current_num_physical_experts].copy_(physical_to_logical)
-            model_state.physical_to_logical_map = expanded_physical_to_logical
+        model_state.physical_to_logical_map = model_state.physical_to_logical_map_buffer[:, :num_physical_experts]
 
         bootstrap_mapping = getattr(self, "_v3_bootstrap_mapping", None)
         if bootstrap_mapping is None:
@@ -1224,11 +1213,8 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         # Scale-down keeps slices of the original full-capacity load tensors.
         # Recover full views of that storage so existing ACL graphs keep the
         # same captured addresses while EPLB regains the target topology.
-        model_state.expert_load_pass = self._restore_v3_tensor_capacity(
-            model_state.expert_load_pass,
-            num_physical_experts,
-            "expert_load_pass",
-        )
+        model_state.expert_load_pass = model_state.expert_load_pass_buffer[:, :num_physical_experts]
+        model_state.expert_load_pass[:, current_num_physical_experts:].zero_()
         model_state.expert_load_window = self._restore_v3_tensor_capacity(
             model_state.expert_load_window,
             num_physical_experts,
@@ -1241,7 +1227,7 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         model.expert_weights = []
         with set_current_vllm_config(self.worker.vllm_config):
             model.set_eplb_state(
-                model_state.expert_load_pass,
+                model_state.expert_load_pass_buffer,
                 model_state.logical_to_physical_map,
                 model_state.logical_replica_count,
             )
@@ -1510,7 +1496,7 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         model.expert_weights = []
         with set_current_vllm_config(self.worker.vllm_config):
             model.set_eplb_state(
-                model_state.expert_load_pass,
+                model_state.expert_load_pass_buffer,
                 model_state.logical_to_physical_map,
                 model_state.logical_replica_count,
             )
@@ -1759,6 +1745,9 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
             raise RuntimeError("Failed to prepare MoeDistribute V3 buffer")
         self._synchronize_v3_context_rendezvous(target_mc2_group, "new")
         return reconfig_request.operation_id
+
+    def warmup_new_worker(self) -> None:
+        self.warmup_local_kernels()
 
     def warmup_local_kernels(self) -> None:
         pass
