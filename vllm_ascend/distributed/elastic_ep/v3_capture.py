@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 import torch
 import torch.distributed as dist
 from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
-from vllm.v1.worker.gpu.dp_utils import override_dp_sync_group
+from vllm.v1.worker.gpu.dp_utils import DP_SYNC_METADATA_ROWS, override_dp_sync_group
 
 _CAPTURE_SESSION: ContextVar[V3CaptureDPSyncSession | None] = ContextVar(
     "ascend_v3_capture_session",
@@ -105,7 +105,7 @@ class V3CaptureDPSyncSession:
             raise RuntimeError("Only an existing rank can run a capture companion")
 
         tensor = torch.zeros(
-            4,
+            DP_SYNC_METADATA_ROWS,
             self.group.world_size,
             dtype=torch.int32,
             device="cpu",
