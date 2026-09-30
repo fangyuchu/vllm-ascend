@@ -6,12 +6,15 @@ import pytest
 import torch
 from vllm.distributed.elastic_ep.elastic_execute import ElasticEPScalingExecutor
 
+from tests.ut.distributed.test_mega_moe_capture import make_capture_state
+from vllm_ascend.distributed.device_communicators.npu_communicator import _NpuAll2AllManager
 from vllm_ascend.distributed.elastic_ep.elastic_execute import (
     AscendElasticEPScalingExecutor,
     _match_peer_parameters,
     setup_moe_comm_and_quant_method,
 )
 from vllm_ascend.distributed.elastic_ep.standby_state import _mc2_group_ranks
+from vllm_ascend.quantization.quant_type import QuantType
 
 
 def _executor_and_worker():
@@ -527,3 +530,159 @@ def test_v3_middle_rank_restore_publishes_capture_decision_and_mc2_order():
         with patch.object(new_executor, "_v3_capture_store", return_value=store):
             assert new_executor._read_v3_capture_decision(request)
             assert new_executor._v3_mc2_rank_order == [0, 1, 3, 2]
+
+
+def _mega_restore_executor(monkeypatch, dead_ranks=(2,)):
+    executor, worker = _executor_and_worker()
+    parallel = worker.vllm_config.parallel_config
+    parallel.world_size = 1
+    parallel.data_parallel_size = 4
+    parallel.enable_fault_tolerance = True
+    comm = SimpleNamespace(
+        mega_moe_capture_state=make_capture_state(),
+        mega_moe_quant_type=QuantType.W8A8,
+        token_dispatcher=SimpleNamespace(refresh_hccl_group=MagicMock()),
+    )
+    module = "vllm_ascend.distributed.elastic_ep.elastic_execute"
+    monkeypatch.setattr(f"{module}.get_moe_comm_method", lambda kind: comm)
+    monkeypatch.setattr(f"{module}.get_dp_group", lambda: SimpleNamespace(world_size=4, dead_dp_ranks=set(dead_ranks)))
+    monkeypatch.setattr(f"{module}.get_mc2_group", lambda: SimpleNamespace(world_size=4, ranks=[0, 1, 2, 3]))
+    monkeypatch.setattr(f"{module}.envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3", False)
+    return executor, worker, comm
+
+
+@pytest.mark.parametrize(
+    "target,dead,expected",
+    [(4, (2,), True), (4, (3,), True), (4, (1, 3), True), (5, (2,), False), (3, (2,), False), (4, (), False)],
+)
+def test_mega_restore_requires_return_to_original_capacity(monkeypatch, target, dead, expected):
+    executor, _, _ = _mega_restore_executor(monkeypatch, dead)
+    request = SimpleNamespace(new_data_parallel_size=target, operation_id="restore")
+    assert executor._is_mega_moe_restore(request) is expected
+
+
+@pytest.mark.parametrize("unsupported", ["tp", "draft", "quant", "lora", "legacy_wrapper"])
+def test_mega_restore_rejects_unhandled_configurations(monkeypatch, unsupported):
+    executor, worker, comm = _mega_restore_executor(monkeypatch)
+    if unsupported == "tp":
+        worker.vllm_config.parallel_config.tensor_parallel_size = 2
+    elif unsupported == "draft":
+        worker.vllm_config.speculative_config = object()
+    elif unsupported == "quant":
+        comm.mega_moe_quant_type = QuantType.NONE
+    elif unsupported == "lora":
+        worker.vllm_config.lora_config = object()
+    else:
+        comm.mega_moe_capture_state.buffer.update_group = None
+    assert not executor._is_mega_moe_restore(SimpleNamespace(new_data_parallel_size=4, operation_id="restore"))
+
+
+def test_mega_middle_restore_exchanges_backend_and_preserves_mc2_slots(monkeypatch):
+    executor, _, _ = _mega_restore_executor(monkeypatch)
+    values = {}
+    store = SimpleNamespace(set=values.__setitem__, get=values.__getitem__)
+    monkeypatch.setattr(executor, "_v3_capture_store", lambda request: store)
+    monkeypatch.setattr("vllm_ascend.distributed.elastic_ep.elastic_execute.get_v3_elastic_info", lambda: None)
+    request = SimpleNamespace(new_data_parallel_size=4, operation_id="mega-restore")
+    assert executor._publish_v3_capture_decision(request, old_dp_size=3)
+    assert executor._mega_moe_precommit_capture
+    assert executor._v3_mc2_rank_order == [0, 1, 3, 2]
+    assert not executor._v3_capture_companion_done
+    new_executor, _ = _executor_and_worker()
+    monkeypatch.setattr(new_executor, "_v3_capture_store", lambda request: store)
+    assert new_executor._read_v3_capture_decision(request)
+    assert new_executor._mega_moe_precommit_capture
+    assert new_executor._v3_old_dp_size == 3
+    assert new_executor._v3_mc2_rank_order == [0, 1, 3, 2]
+
+
+@pytest.mark.parametrize("existing", [True, False])
+def test_mega_commit_preserves_graphs_and_connects_fault_manager(monkeypatch, existing):
+    executor, worker, comm = _mega_restore_executor(monkeypatch)
+    state = comm.mega_moe_capture_state
+    if not existing:
+        state.prepare_capture([2], topk=4)
+    else:
+        state.buffer.update_mask_buffer(2, True)
+    addresses = (state.buffer.context.data_ptr(), state.buffer.mask_buffer.data_ptr(), state.rank_map.data_ptr())
+    executor._v3_capture_companion_done = True
+    executor._v3_precommit_capture_done = True
+    manager = _NpuAll2AllManager(4, torch.device("cpu"))
+    group = SimpleNamespace(world_size=4, ranks=[0, 1, 3, 2])
+    module = "vllm_ascend.distributed.elastic_ep.elastic_execute"
+    monkeypatch.setattr(f"{module}.get_mc2_group", lambda: group)
+    monkeypatch.setattr(f"{module}.get_ep_group", lambda: SimpleNamespace(ranks=[0, 1, 2, 3]))
+    monkeypatch.setattr(f"{module}.get_ep_all2all_manager", lambda: manager)
+    calls = []
+    for name in (
+        "_resume_async_eplb_from_bootstrap",
+        "_cleanup_v3_capture_group",
+        "_set_eplb_suppressed",
+        "_start_group_cleanup",
+        "_synchronize_v3_context_rendezvous",
+    ):
+        monkeypatch.setattr(executor, name, MagicMock(side_effect=lambda *args, n=name: calls.append(n)))
+    monkeypatch.setattr(executor, "_switch_and_prepare_v3_restore_scale_up", MagicMock(return_value=(object(),)))
+    monkeypatch.setattr(executor, "_activate_ascend_standby_groups", MagicMock(return_value=object()))
+    monkeypatch.setattr(executor, "_release_cuda_graphs", MagicMock(side_effect=AssertionError("old graphs released")))
+    monkeypatch.setattr(executor, "warm_and_capture", MagicMock(side_effect=AssertionError("old graphs recaptured")))
+    worker.worker_sentinel = SimpleNamespace(init_num_local_experts=MagicMock())
+    executor._commit_mega_moe_restore(existing)
+    assert not state.capture_active
+    assert not state.buffer.mask_buffer.any()
+    assert state.rank_map.tolist() == [0, 1, 3, 2]
+    assert addresses == (
+        state.buffer.context.data_ptr(),
+        state.buffer.mask_buffer.data_ptr(),
+        state.rank_map.data_ptr(),
+    )
+    assert calls.index("_synchronize_v3_context_rendezvous") < calls.index("_resume_async_eplb_from_bootstrap")
+    manager.update_mask(3)
+    assert state.buffer.mask_buffer.tolist() == [0, 0, 1, 0]
+    assert manager.query_active_mask().tolist() == [0, 0, 0, 1]
+    assert executor._switch_and_prepare_v3_restore_scale_up.call_count == int(existing)
+
+
+def test_mega_commit_requires_capture_completion(monkeypatch):
+    executor, _, _ = _mega_restore_executor(monkeypatch)
+    executor._v3_capture_companion_done = False
+    monkeypatch.setattr(executor, "_set_eplb_suppressed", MagicMock())
+    with pytest.raises(RuntimeError, match="companion has not completed"):
+        executor._commit_mega_moe_restore(True)
+    executor._set_eplb_suppressed.assert_not_called()
+
+
+@pytest.mark.parametrize("is_async", [False, True])
+def test_mega_resume_preserves_eplb_execution_mode(monkeypatch, is_async):
+    executor, worker, _ = _mega_restore_executor(monkeypatch)
+    executor._mega_moe_precommit_capture = True
+    state = SimpleNamespace(is_async=is_async, expert_rearrangement_step=50, start_async_loop=MagicMock())
+    worker.model_runner = SimpleNamespace(eplb_state=state)
+    executor._resume_async_eplb_from_bootstrap()
+    assert state.is_async is is_async
+    assert state.expert_rearrangement_step == 0
+    assert state.start_async_loop.call_count == int(is_async)
+
+
+def test_new_mega_worker_masks_existing_slots_before_capture(monkeypatch):
+    executor, _, comm = _mega_restore_executor(monkeypatch)
+    executor._v3_old_dp_size = 3
+    state = comm.mega_moe_capture_state
+    comm._init_mega_moe_symm_buffer = MagicMock(return_value=state.buffer)
+    module = "vllm_ascend.distributed.elastic_ep.elastic_execute"
+    monkeypatch.setattr(f"{module}.get_mc2_group", lambda: SimpleNamespace(ranks=[0, 1, 3, 2]))
+    monkeypatch.setattr(f"{module}._is_decode_only_node", lambda config: False)
+    monkeypatch.setattr(executor, "_setup_moe_comm_and_quant_method", MagicMock())
+    rendezvous = MagicMock(side_effect=lambda *args: bool(state.capture_active) or pytest.fail("routing not ready"))
+    monkeypatch.setattr(executor, "_synchronize_v3_context_rendezvous", rendezvous)
+    layer = SimpleNamespace(
+        routed_experts=SimpleNamespace(
+            quant_method=SimpleNamespace(quant_method=SimpleNamespace(quant_type=QuantType.W8A8))
+        ),
+        moe_config=SimpleNamespace(experts_per_token=4),
+    )
+    executor._prepare_new_mega_moe_capture([layer])
+    assert state.buffer.mask_buffer.tolist() == [1, 1, 0, 1]
+    routed = state.route(torch.zeros((2, 4), dtype=torch.int32))
+    assert ((routed >= 8) & (routed < 12)).all()
+    rendezvous.assert_called_once()

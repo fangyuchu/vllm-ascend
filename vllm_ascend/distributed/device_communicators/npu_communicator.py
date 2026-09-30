@@ -40,6 +40,8 @@ class _NpuAll2AllManager:
         self._device = device
         self._dead: set[int] = set()
         self._num_local_experts: int = 0
+        self._mega_moe_buffer = None
+        self._ep_to_mc2: tuple[int, ...] = ()
 
         # elastic_info layout: [is_scaling_down, dense ep world size,
         #  shared_expert_rank_num, num_physical_experts] + table1(orig->dense)
@@ -62,8 +64,51 @@ class _NpuAll2AllManager:
         # Keep the upstream default no-op here to avoid changing them twice.
         pass
 
+    @property
+    def uses_mega_moe(self) -> bool:
+        return self._mega_moe_buffer is not None
+
+    @torch.inference_mode()
+    def bind_mega_moe_buffer(self, buffer, ep_to_mc2: list[int]) -> None:
+        """Attach the active fused backend before graph capture.
+
+        The manager remains the CPU source of truth for faults. MegaMoe uses
+        full-width physical expert ids, whereas MC2 uses elastic_info's dense
+        ids. Binding explicitly avoids importing the MoE stack here.
+        """
+        if buffer.ep_world_size != self._ep_world_size or sorted(ep_to_mc2) != list(range(self._ep_world_size)):
+            raise ValueError("MegaMoe fault tolerance requires matching EP and MC2 rank sets.")
+        if self.uses_mega_moe:
+            if buffer is not self._mega_moe_buffer or tuple(ep_to_mc2) != self._ep_to_mc2:
+                raise RuntimeError("Cannot replace a captured MegaMoe fault-tolerance buffer or its rank order.")
+            return
+        for method in ("clean_mask_buffer", "update_mask_buffer", "get_local_buffer_tensor"):
+            if not callable(getattr(buffer, method, None)):
+                raise RuntimeError(
+                    f"MegaMoe fault tolerance requires SymmBuffer.{method}; "
+                    "install matching CANN operators and cann_ops_transformer with PR #9368 support."
+                )
+        # Do not swallow failures: a graph captured with mask_buffer=None
+        # cannot start honoring a newly allocated mask after a fault.
+        buffer.clean_mask_buffer()
+        for rank in sorted(self._dead):
+            buffer.update_mask_buffer(ep_to_mc2[rank], True)
+        self._ep_to_mc2 = tuple(ep_to_mc2)
+        self._mega_moe_buffer = buffer
+
+    @torch.inference_mode()
     def update_mask(self, rank: int, masked: bool = True) -> None:
         """Mark an EP rank dead/alive and rebuild elastic_info in place."""
+        if isinstance(rank, bool) or not isinstance(rank, int) or not 0 <= rank < self._ep_world_size:
+            raise ValueError(f"EP rank must be in [0, {self._ep_world_size}), got {rank}.")
+        if not isinstance(masked, bool):
+            raise TypeError("masked must be a bool")
+        if self.uses_mega_moe:
+            if not masked and rank in self._dead:
+                # Recovery runs only after outstanding device work is stopped.
+                # Old completion flags must not survive re-enabling a peer.
+                self.clean_buffers()
+            self._mega_moe_buffer.update_mask_buffer(self._ep_to_mc2[rank], masked)
         if masked:
             self._dead.add(rank)
         else:
@@ -86,8 +131,11 @@ class _NpuAll2AllManager:
         # MC2 has no in-kernel fault detection; faults surface as aborted ops.
         return torch.tensor(False)
 
+    @torch.inference_mode()
     def clean_buffers(self) -> None:
-        """No-op, kept for the upstream retry flow which calls it unconditionally."""
+        """Clear fused communication flags after device reset, keeping dead ranks masked."""
+        if self.uses_mega_moe:
+            self._mega_moe_buffer.get_local_buffer_tensor(torch.uint8).zero_()
 
     def get_elastic_info(self) -> torch.Tensor:
         """The device elastic_info tensor for the next MC2 dispatch/combine."""
