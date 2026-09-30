@@ -1,7 +1,10 @@
 from typing import TYPE_CHECKING
+from contextlib import contextmanager
 
 import torch
+import torch.distributed as dist
 import vllm.envs as envs
+from torch.distributed.distributed_c10d import _world
 from vllm.config import ParallelConfig, get_current_vllm_config
 from vllm.distributed import parallel_state as vllm_parallel_state
 from vllm.distributed import get_cached_tcp_store_client
@@ -74,6 +77,29 @@ _REPLICATED = ReplicatedGroup()
 # all2all manager supplies the new contents; during planned Elastic EP changes
 # the scaling executor supplies them.
 _V3_ELASTIC_INFO: torch.Tensor | None = None
+
+
+@contextmanager
+def register_stateless_group_rank(device_group, rank: int, world_size: int):
+    """Expose stateless ranks while CANN buffer constructors query c10d."""
+    try:
+        default_rank = dist.get_rank()
+    except Exception:
+        yield
+        return
+
+    had_mapping = device_group in _world.pg_group_ranks
+    previous_mapping = _world.pg_group_ranks.get(device_group)
+    try:
+        group_ranks = {group_rank: group_rank for group_rank in range(world_size)}
+        group_ranks[default_rank] = rank
+        _world.pg_group_ranks[device_group] = group_ranks
+        yield
+    finally:
+        if had_mapping:
+            _world.pg_group_ranks[device_group] = previous_mapping
+        else:
+            _world.pg_group_ranks.pop(device_group, None)
 
 
 def get_v3_elastic_info() -> torch.Tensor | None:
