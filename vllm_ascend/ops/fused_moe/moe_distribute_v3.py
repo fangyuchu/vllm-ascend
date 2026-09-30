@@ -12,12 +12,9 @@ from __future__ import annotations
 
 import importlib
 import weakref
-from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 import torch
-import torch.distributed as dist
-from torch.distributed.distributed_c10d import _world
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
@@ -25,6 +22,7 @@ from vllm.logger import logger
 from vllm_ascend.distributed.parallel_state import (
     get_mc2_group,
     get_v3_elastic_info,
+    register_stateless_group_rank,
 )
 from vllm_ascend.ops.fused_moe.dataclass.token_dispatcher import (
     MoEMC2CombineMetadata,
@@ -69,39 +67,7 @@ class MoeDistributeV3Adapter:
             return None
         return tuple(int(value) for value in elastic_info.detach().cpu().tolist())
 
-    @staticmethod
-    @contextmanager
-    def _register_stateless_group_rank(
-        device_group,
-        rank: int,
-        world_size: int,
-    ):
-        """Temporarily expose a stateless PG to PyTorch rank lookup.
-
-        ``MoeDistributeBuffer`` calls ``dist.get_rank(group)`` internally,
-        while vLLM's stateless process groups deliberately are not registered
-        in the default c10d world. Keep this compatibility shim tightly scoped
-        to buffer construction/update until the operator accepts an explicit
-        rank.
-        """
-        try:
-            default_rank = dist.get_rank()
-        except Exception:
-            yield
-            return
-
-        had_mapping = device_group in _world.pg_group_ranks
-        previous_mapping = _world.pg_group_ranks.get(device_group)
-        try:
-            group_ranks = {group_rank: group_rank for group_rank in range(world_size)}
-            group_ranks[default_rank] = rank
-            _world.pg_group_ranks[device_group] = group_ranks
-            yield
-        finally:
-            if had_mapping:
-                _world.pg_group_ranks[device_group] = previous_mapping
-            else:
-                _world.pg_group_ranks.pop(device_group, None)
+    _register_stateless_group_rank = staticmethod(register_stateless_group_rank)
 
     @staticmethod
     def _load_buffer_cls():
