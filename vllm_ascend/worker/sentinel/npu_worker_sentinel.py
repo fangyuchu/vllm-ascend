@@ -10,6 +10,7 @@ from vllm.distributed.eplb.eplb_state import _commit_eplb_maps
 from vllm.distributed.parallel_state import (
     get_dp_group,
     get_ep_group,
+    get_pcp_group,
     get_tp_group,
 )
 from vllm.distributed.utils import set_gloo_backend_timeout
@@ -33,7 +34,10 @@ from vllm_ascend.distributed.eplb.state import refresh_model_routing_tables
 from vllm_ascend.distributed.parallel_state import (
     set_v3_elastic_info_from_ep,
 )
-from vllm_ascend.ops.fused_moe.moe_distribute_v3 import trace_moe_distribute_v3_contexts
+from vllm_ascend.ops.fused_moe.moe_distribute_v3 import (
+    clean_moe_distribute_v3_buffers,
+    trace_moe_distribute_v3_contexts,
+)
 from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.worker.sentinel.eplb_redistribute import (
     build_orig_to_dense_rank_table,
@@ -129,6 +133,18 @@ class WorkerSentinel(GPUWorkerSentinel):
         # base flow and lift the quarantine after the groups are rebuilt.
         self.reset_device()
         super().retry(ft_request)
+        if envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3 and not use_cann_megamoe(self.worker.vllm_config):
+            # The rebuilt CPU groups contain only survivors. Wait until every
+            # peer has stopped old device work before clearing its CCL window,
+            # then wait for all clears before any rank replays the model.
+            groups = (get_dp_group(), get_pcp_group(), get_tp_group())
+            for group in groups:
+                if group.world_size > 1:
+                    torch.distributed.barrier(group=group.cpu_group)
+            clean_moe_distribute_v3_buffers()
+            for group in groups:
+                if group.world_size > 1:
+                    torch.distributed.barrier(group=group.cpu_group)
         if use_cann_megamoe(self.worker.vllm_config):
             # Publish buffer cleanup and mask writes before any graph replay
             # on a different stream.

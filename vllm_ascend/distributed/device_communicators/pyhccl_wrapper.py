@@ -334,6 +334,37 @@ class HCCLLibrary:
         self.HCCL_CHECK(self._funcs["HcclCommDestroy"](comm))
 
 
+def clear_hccl_buffer(group_name: str) -> None:
+    """Clear the local HCCL window in place after all peers stop device work.
+
+    Device restart resumes the communicator but leaves MC2 completion flags
+    in this window. Keep its allocation so captured graphs remain valid.
+    """
+    hccl = HCCLLibrary()
+    get_handle = hccl.lib.HcclCommGetHandleWithName
+    get_handle.restype = hcclResult_t
+    get_handle.argtypes = [ctypes.c_char_p, ctypes.POINTER(hcclComm_t)]
+    comm = hcclComm_t()
+    hccl.HCCL_CHECK(get_handle(group_name.encode(), ctypes.byref(comm)))
+
+    get_buffer = hccl.lib.HcclGetHcclBuffer
+    get_buffer.restype = hcclResult_t
+    get_buffer.argtypes = [hcclComm_t, ctypes.POINTER(buffer_type), ctypes.POINTER(ctypes.c_uint64)]
+    buffer = buffer_type()
+    size = ctypes.c_uint64()
+    hccl.HCCL_CHECK(get_buffer(comm, ctypes.byref(buffer), ctypes.byref(size)))
+
+    # Use the synchronous ACL API: the caller's post-cleanup CPU barrier must
+    # not complete while another rank still has a pending memset.
+    acl = ctypes.CDLL("libascendcl.so")
+    memset = acl.aclrtMemset
+    memset.restype = ctypes.c_int
+    memset.argtypes = [buffer_type, ctypes.c_size_t, ctypes.c_int, ctypes.c_size_t]
+    result = memset(buffer, size.value, 0, size.value)
+    if result != 0:
+        raise RuntimeError(f"aclrtMemset failed while clearing the MC2 buffer: {result}")
+
+
 __all__ = [
     "HCCLLibrary",
     "hcclDataTypeEnum",
