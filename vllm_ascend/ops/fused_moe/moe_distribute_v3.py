@@ -19,6 +19,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 
+from vllm_ascend.distributed.device_communicators.pyhccl_wrapper import clear_hccl_buffer
 from vllm_ascend.distributed.parallel_state import (
     get_mc2_group,
     get_v3_elastic_info,
@@ -410,6 +411,20 @@ class MoeDistributeV3Adapter:
             kwargs["elastic_info"] = elastic_info
         combine = self._get_buffer_method(buffer, "low_latency_combine")
         return combine(**kwargs)
+
+
+def clean_moe_distribute_v3_buffers() -> None:
+    """Clear initialized V3 HCCL windows without replacing captured contexts."""
+    cleaned_groups = set()
+    for adapter in list(MoeDistributeV3Adapter._INSTANCES):
+        if adapter._buffer is None:
+            continue
+        mc2_group = adapter._context_group or get_mc2_group()
+        backend = mc2_group.device_group._get_backend(torch.device("npu"))
+        group_name = backend.get_hccl_comm_name(mc2_group.rank_in_group, init_comm=False)
+        if group_name not in cleaned_groups:
+            clear_hccl_buffer(group_name)
+            cleaned_groups.add(group_name)
 
 
 def trace_moe_distribute_v3_contexts(stage: str, *, read_device: bool) -> None:
