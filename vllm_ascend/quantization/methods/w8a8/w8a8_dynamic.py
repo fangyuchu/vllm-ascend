@@ -258,19 +258,39 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             )
         return weights
 
+    def _process_w8a8_weights(self, w13, w2, w13_scale, w2_scale, w13_offset=None, w2_offset=None):
+        """W8A8 MoE post-processing shared by load time and scale-down reload."""
+        w13 = w13.transpose(1, 2).contiguous()
+        w2 = w2.transpose(1, 2).contiguous()
+        w13_scale = w13_scale.view(w13_scale.shape[0], -1)
+        w2_scale = w2_scale.view(w2_scale.shape[0], -1)
+        w13_scale_fp32 = w13_scale.to(torch.float32)
+        w13_offset = None if w13_offset is None else w13_offset.view(w13_offset.shape[0], -1)
+        w2_offset = None if w2_offset is None else w2_offset.view(w2_offset.shape[0], -1)
+        return w13, w2, w13_scale, w2_scale, w13_scale_fp32, w13_offset, w2_offset
+
     def process_weights_after_loading(self, layer):
-        layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
-        layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
+        (
+            layer.w13_weight.data,
+            layer.w2_weight.data,
+            layer.w13_weight_scale.data,
+            layer.w2_weight_scale.data,
+            layer.w13_weight_scale_fp32,
+            layer.w13_weight_offset.data,
+            layer.w2_weight_offset.data,
+        ) = self._process_w8a8_weights(
+            layer.w13_weight.data,
+            layer.w2_weight.data,
+            layer.w13_weight_scale.data,
+            layer.w2_weight_scale.data,
+            layer.w13_weight_offset.data,
+            layer.w2_weight_offset.data,
+        )
         # TODO(zzzzwwjj): Currently, `torch_npu.npu_grouped_matmul_swiglu_quant`
         # can only support weight nz.
         if self.quant_type == QuantType.W8A8:
             layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ)
             layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)
-        layer.w13_weight_scale.data = layer.w13_weight_scale.data.view(layer.w13_weight_scale.data.shape[0], -1)
-        layer.w13_weight_scale_fp32 = layer.w13_weight_scale.data.to(torch.float32)
-        layer.w13_weight_offset.data = layer.w13_weight_offset.data.view(layer.w13_weight_offset.data.shape[0], -1)
-        layer.w2_weight_scale.data = layer.w2_weight_scale.data.view(layer.w2_weight_scale.data.shape[0], -1)
-        layer.w2_weight_offset.data = layer.w2_weight_offset.data.view(layer.w2_weight_offset.data.shape[0], -1)
 
         if get_ascend_config().enable_fused_mc2 == 1:
             layer.fused_w1_scale = scale_from_float_to_int64(layer.w13_weight_scale.data)

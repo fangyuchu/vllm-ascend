@@ -356,8 +356,7 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         scale = scale.transpose(1, 2).contiguous()
         scale_np = scale.cpu().numpy()
         scale_np.dtype = np.uint32
-        scale_uint64_tensor = torch.from_numpy(scale_np.astype(np.int64)).npu()
-        return scale_uint64_tensor
+        return torch.from_numpy(scale_np.astype(np.int64))
 
     def _pack_int4_to_int8(self, weight: torch.Tensor) -> torch.Tensor:
         shape = weight.shape
@@ -432,8 +431,8 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         w2_scale_bias = torch.nn.Parameter(w2_bias, requires_grad=False)
         layer.register_parameter("w2_scale_bias", w2_scale_bias)
 
-        layer.w13_weight_scale.data = self._process_scale(layer.w13_weight_scale.data.to(torch.float32))
-        layer.w2_weight_scale.data = self._process_scale(layer.w2_weight_scale.data.to(torch.float32))
+        layer.w13_weight_scale.data = self._process_scale(layer.w13_weight_scale.data.to(torch.float32)).npu()
+        layer.w2_weight_scale.data = self._process_scale(layer.w2_weight_scale.data.to(torch.float32)).npu()
         # To use torch_npu.npu_grouped_matmul, keep w2_weigh_scale unsqueezed
         layer.w13_weight_scale.data = self.maybe_squeeze_per_channel_weight_scale(layer.w13_weight_scale.data)
 
@@ -653,13 +652,39 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
             output_dtype=torch.bfloat16,
         )[0]
 
+    def _process_modelslim_weights(self, w13, w2, w13_scale, w2_scale, w13_scale_bias, w2_scale_bias):
+        """modelslim MoE post-processing shared by load time and scale-down reload.
+
+        Transposes the weights to runtime layout, reinterprets the fp32 scales as
+        int64, and reduces scale_bias. Works on whole-layer ``[E, ...]`` tensors
+        (load time) and on a single expert ``[1, ...]`` (scale-down reload).
+        Scales are returned as CPU raw bits; device placement is the caller's job.
+        """
+        w13 = w13.transpose(1, 2).contiguous()
+        w2 = w2.transpose(1, 2).contiguous()
+        w13_scale = self._process_scale(w13_scale)
+        w2_scale = self._process_scale(w2_scale)
+        w13_scale_bias = w13_scale_bias.transpose(1, 2).contiguous().sum(axis=1)
+        w2_scale_bias = w2_scale_bias.transpose(1, 2).contiguous().sum(axis=1)
+        w13_scale = self.maybe_squeeze_per_channel_weight_scale(w13_scale)
+        return w13, w2, w13_scale, w2_scale, w13_scale_bias, w2_scale_bias
+
     def process_weights_after_loading_modelslim(self, layer):
-        layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
-        layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
+        (
+            layer.w13_weight.data,
+            layer.w2_weight.data,
+            layer.w13_weight_scale.data,
+            layer.w2_weight_scale.data,
+            layer.w13_scale_bias.data,
+            layer.w2_scale_bias.data,
+        ) = self._process_modelslim_weights(
+            layer.w13_weight.data,
+            layer.w2_weight.data,
+            layer.w13_weight_scale.data,
+            layer.w2_weight_scale.data,
+            layer.w13_scale_bias.data,
+            layer.w2_scale_bias.data,
+        )
 
-        layer.w13_weight_scale.data = self._process_scale(layer.w13_weight_scale.data)
-        layer.w2_weight_scale.data = self._process_scale(layer.w2_weight_scale.data)
-
-        layer.w13_scale_bias.data = layer.w13_scale_bias.data.transpose(1, 2).contiguous().sum(axis=1)
-        layer.w2_scale_bias.data = layer.w2_scale_bias.data.transpose(1, 2).contiguous().sum(axis=1)
-        layer.w13_weight_scale.data = self.maybe_squeeze_per_channel_weight_scale(layer.w13_weight_scale.data)
+        layer.w13_weight_scale.data = layer.w13_weight_scale.data.npu()
+        layer.w2_weight_scale.data = layer.w2_weight_scale.data.npu()
