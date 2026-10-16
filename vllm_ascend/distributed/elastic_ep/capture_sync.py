@@ -33,6 +33,7 @@ class CaptureDPSyncSession:
     operation_id: str
     old_dp_size: int
     timeout_s: float = 600.0
+    existing_dp_ranks: tuple[int, ...] | None = None
     sequence: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
@@ -64,8 +65,9 @@ class CaptureDPSyncSession:
         return f"{self._prefix}/error"
 
     @property
-    def new_ranks(self) -> range:
-        return range(self.old_dp_size, self.group.world_size)
+    def new_ranks(self) -> list[int]:
+        existing = self.existing_dp_ranks if self.existing_dp_ranks is not None else range(self.old_dp_size)
+        return [rank for rank in range(self.group.world_size) if rank not in existing]
 
     def notify_all_reduce(self) -> None:
         """Publish the next collective before the new rank enters it."""
@@ -101,7 +103,7 @@ class CaptureDPSyncSession:
 
     def run_existing_rank_companion(self) -> int:
         """Match every DP metadata all-reduce issued during new-rank capture."""
-        if self.group.rank_in_group >= self.old_dp_size:
+        if self.group.rank_in_group in self.new_ranks:
             raise RuntimeError("Only an existing rank can run a capture companion")
 
         tensor = torch.zeros(
