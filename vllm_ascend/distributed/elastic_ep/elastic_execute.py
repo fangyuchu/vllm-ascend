@@ -258,16 +258,8 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         """Keep survivors in their captured MC2 slots; fill holes with new ranks."""
         if sorted(physical_ranks) != list(range(len(physical_ranks))):
             raise ValueError("MegaMoe MC2 ranks must cover the physical world")
-        dense_dp_ranks = {rank: dense for dense, rank in enumerate(active_dp_ranks)}
-        new_ranks = iter(range(len(active_dp_ranks) * world_size_per_dp, len(physical_ranks)))
-        result = []
-        for rank in physical_ranks:
-            dp_rank, local_rank = divmod(rank, world_size_per_dp)
-            if dp_rank in dense_dp_ranks:
-                result.append(dense_dp_ranks[dp_rank] * world_size_per_dp + local_rank)
-            else:
-                result.append(next(new_ranks))
-        return result
+        # DP identities survive FT; a replacement fills the same physical slot.
+        return list(physical_ranks)
 
     def start_async(self, execute_method: str, *args, **kwargs) -> str:
         """Arm EPLB suppression before background MegaMoe preparation starts.
@@ -305,20 +297,9 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         new_dp_rank: int,
     ) -> int:
         """Return the old DP rank whose weights initialize a new DP rank."""
-        if not 0 <= new_dp_rank - old_dp_size < new_dp_size - old_dp_size:
-            raise ValueError(
-                "new_dp_rank must identify a newly added rank: "
-                f"old_dp_size={old_dp_size}, new_dp_size={new_dp_size}, "
-                f"new_dp_rank={new_dp_rank}"
-            )
-        num_new_workers = new_dp_size - old_dp_size
-        new_worker_idx = new_dp_rank - old_dp_size
-        num_dst_per_sender = num_new_workers // old_dp_size
-        remainder = num_new_workers % old_dp_size
-        larger_sender_span = remainder * (num_dst_per_sender + 1)
-        if new_worker_idx < larger_sender_span:
-            return new_worker_idx // (num_dst_per_sender + 1)
-        return remainder + (new_worker_idx - larger_sender_span) // num_dst_per_sender
+        return upstream_elastic_execute.scale_up_source_rank(
+            list(range(old_dp_size)), list(range(old_dp_size, new_dp_size)), new_dp_rank
+        )
 
     @classmethod
     def _build_capture_bootstrap_mapping(
@@ -327,6 +308,7 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         num_local_physical_experts: int,
         old_dp_size: int,
         new_dp_size: int,
+        existing_dp_ranks: list[int] | None = None,
     ) -> torch.Tensor:
         """Build a target-size mapping matching background weight cloning.
 
@@ -360,14 +342,17 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
             dtype=physical_to_logical.dtype,
             device=physical_to_logical.device,
         )
-        bootstrap_mapping[:, :mapping_width].copy_(physical_to_logical)
-
-        for new_dp_rank in range(old_dp_size, new_dp_size):
-            source_dp_rank = cls._scale_up_source_dp_rank(
-                old_dp_size,
-                new_dp_size,
-                new_dp_rank,
+        existing = existing_dp_ranks if existing_dp_ranks is not None else list(range(old_dp_size))
+        new = [rank for rank in range(new_dp_size) if rank not in existing]
+        chunk = ep_ranks_per_dp * num_local_physical_experts
+        # Input contains compact survivor chunks; scatter them back into their
+        # original rank slots and clone the sender's mapping into each joiner.
+        for source_index, rank in enumerate(existing):
+            bootstrap_mapping[:, rank * chunk : (rank + 1) * chunk].copy_(
+                physical_to_logical[:, source_index * chunk : (source_index + 1) * chunk]
             )
+        for new_dp_rank in new:
+            source_dp_rank = existing.index(upstream_elastic_execute.scale_up_source_rank(existing, new, new_dp_rank))
             for ep_offset in range(ep_ranks_per_dp):
                 source_ep_rank = source_dp_rank * ep_ranks_per_dp + ep_offset
                 target_ep_rank = new_dp_rank * ep_ranks_per_dp + ep_offset
@@ -407,10 +392,11 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         world_size_per_dp = parallel_config.world_size
         old_world_size = old_dp_size * world_size_per_dp
         new_world_size = reconfig_request.new_data_parallel_size * world_size_per_dp
-        ready_keys = [
-            self._capture_key(operation_id, f"mapping/ready/{rank}") for rank in range(old_world_size, new_world_size)
-        ]
-        ack_keys = [self._capture_key(operation_id, f"mapping/ack/{rank}") for rank in range(old_world_size)]
+        existing, new = self.scale_up_members(old_dp_size, reconfig_request.new_data_parallel_size)
+        old_workers = [rank * world_size_per_dp + offset for rank in existing for offset in range(world_size_per_dp)]
+        new_workers = [rank * world_size_per_dp + offset for rank in new for offset in range(world_size_per_dp)]
+        ready_keys = [self._capture_key(operation_id, f"mapping/ready/{rank}") for rank in new_workers]
+        ack_keys = [self._capture_key(operation_id, f"mapping/ack/{rank}") for rank in old_workers]
         if is_existing_worker:
             worker_global_rank = getattr(self, "_target_global_rank", None)
             if worker_global_rank is None:
@@ -425,7 +411,7 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         store = self._capture_store(reconfig_request)
 
         if is_existing_worker:
-            if worker_global_rank >= old_world_size:
+            if worker_global_rank not in old_workers:
                 raise RuntimeError(
                     "Existing MegaMoe worker rank is outside the old world: "
                     f"rank={worker_global_rank}, old_world_size={old_world_size}"
@@ -441,7 +427,7 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
                 b"1",
             )
         else:
-            if worker_global_rank < old_world_size:
+            if worker_global_rank not in new_workers:
                 raise RuntimeError(
                     "New MegaMoe worker rank is inside the old world: "
                     f"rank={worker_global_rank}, old_world_size={old_world_size}"
@@ -586,6 +572,7 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
             group=group,
             operation_id=operation_id,
             old_dp_size=self._capture_old_dp_size,
+            existing_dp_ranks=tuple(self.scale_up_members(self._capture_old_dp_size, group.world_size)[0]),
         )
 
     def run_new_rank_capture_companion(self, operation_id: str) -> None:
@@ -754,12 +741,13 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
             num_local_physical_experts,
             old_dp_size,
             reconfig_request.new_data_parallel_size,
+            existing_dp_ranks=self.scale_up_members(old_dp_size, reconfig_request.new_data_parallel_size)[0],
         )
         self._capture_bootstrap_mapping = bootstrap_mapping
         upstream_elastic_execute.broadcast_expert_mapping(
             physical_to_logical=bootstrap_mapping,
             dp_group=standby_dp_group,
-            src_rank=0,
+            src_rank=self._mapping_source_rank(),
             device=self.worker.device,
         )
 
@@ -1118,6 +1106,8 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         parallel_config.data_parallel_master_port = request.new_data_parallel_master_port
         parallel_config._data_parallel_master_port_list = request.new_data_parallel_master_port_list
         parallel_config._coord_store_port = request.coord_store_port
+        parallel_config._data_parallel_master_rank = request.data_parallel_master_rank
+        parallel_config._eep_existing_dp_ranks = request.existing_dp_ranks
         self.worker.model_runner.dp_size = request.new_data_parallel_size
         self.worker.model_runner.dp_rank = parallel_config.data_parallel_rank
 
@@ -1157,6 +1147,8 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
                     new_data_parallel_master_port_list=(parallel_config._data_parallel_master_port_list),
                     coord_store_port=parallel_config._coord_store_port,
                     operation_id=operation_id,
+                    existing_dp_ranks=parallel_config._eep_existing_dp_ranks,
+                    data_parallel_master_rank=parallel_config._data_parallel_master_rank,
                 )
                 self.reconfig_request = reconfig_request
         use_precommit_capture = bool(reconfig_request is not None and self._read_capture_decision(reconfig_request))
@@ -1236,7 +1228,9 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
             mode, dtype, is_decode_only_node=_is_decode_only_node(self.worker.vllm_config)
         )
         group = get_mc2_group()
-        active_slots = [slot for slot, rank in enumerate(group.ranks) if rank >= self._capture_old_dp_size]
+        _, new_ranks = self.scale_up_members(self._capture_old_dp_size, self.reconfig_request.new_data_parallel_size)
+        world_size_per_dp = self.worker.vllm_config.parallel_config.world_size
+        active_slots = [slot for slot, rank in enumerate(group.ranks) if rank // world_size_per_dp in new_ranks]
         comm.mega_moe_capture_state.prepare_capture(active_slots, moe_modules[0].moe_config.experts_per_token)
         comm.mega_moe_symm_buffer.get_local_buffer_tensor(torch.uint8).zero_()
         self._synchronize_capture_context_rendezvous(group, "new MegaMoe")
