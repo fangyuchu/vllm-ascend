@@ -31,6 +31,8 @@ def _executor_and_worker():
         data_parallel_master_port=29500,
         _data_parallel_master_port_list=[29500, 29501],
         _coord_store_port=1234,
+        _data_parallel_master_rank=0,
+        _eep_existing_dp_ranks=None,
     )
     worker = SimpleNamespace(
         vllm_config=SimpleNamespace(
@@ -39,6 +41,7 @@ def _executor_and_worker():
         ),
     )
     executor.worker_ref = lambda: worker
+    executor.reconfig_request = None
     return executor, worker
 
 
@@ -58,7 +61,10 @@ def _capture_mapping_executor(monkeypatch, width, local_experts, dead_ranks):
     worker.device = torch.device("cpu")
     executor._mega_moe_precommit_capture = True
     executor._capture_old_dp_size = 4 - len(dead_ranks)
-    executor.reconfig_request = SimpleNamespace(new_data_parallel_size=executor._capture_old_dp_size + 1)
+    executor.reconfig_request = SimpleNamespace(
+        new_data_parallel_size=max(4, executor._capture_old_dp_size + 1),
+        existing_dp_ranks=[rank for rank in range(4) if rank not in dead_ranks],
+    )
     module = "vllm_ascend.distributed.elastic_ep.elastic_execute"
     monkeypatch.setattr(f"{module}.is_moe_layer", lambda layer: layer is moe)
     monkeypatch.setattr(f"{module}.get_dp_group", lambda: SimpleNamespace(world_size=4, dead_dp_ranks=dead_ranks))
@@ -71,9 +77,9 @@ def _capture_mapping_executor(monkeypatch, width, local_experts, dead_ranks):
 @pytest.mark.parametrize(
     "width,dead_ranks,expected",
     [
-        (8, {2}, [0, 1, 2, 3, 6, 7, 0, 1]),
-        (16, {2}, list(range(8)) + list(range(12, 16)) + list(range(4))),
-        (8, {1, 3}, [0, 1, 4, 5, 0, 1]),
+        (8, {2}, [0, 1, 2, 3, 0, 1, 6, 7]),
+        (16, {2}, list(range(8)) + list(range(4)) + list(range(12, 16))),
+        (8, {1, 3}, [0, 1, 0, 1, 4, 5, 4, 5]),
         (8, set(), list(range(8)) + [0, 1]),
     ],
 )
@@ -116,6 +122,8 @@ def test_prepare_reconfiguration_adds_ascend_standby_group():
         new_data_parallel_size=3,
         new_data_parallel_master_ip="127.0.0.1",
         coord_store_port=1234,
+        existing_dp_ranks=None,
+        data_parallel_master_rank=0,
         operation_id="scale-1",
     )
 
@@ -359,10 +367,10 @@ def test_mc2_standby_ranks_match_dp_ep_layout():
 @pytest.mark.parametrize(
     "physical,active,width,expected",
     [
-        ([0, 1, 2, 3], [0, 1, 3], 1, [0, 1, 3, 2]),
+        ([0, 1, 2, 3], [0, 1, 3], 1, [0, 1, 2, 3]),
         ([0, 1, 2, 3], [0, 1, 2], 1, [0, 1, 2, 3]),
-        ([0, 1, 3, 2], [0, 2, 3], 1, [0, 3, 2, 1]),
-        (list(range(8)), [0, 1, 3], 2, [0, 1, 2, 3, 6, 7, 4, 5]),
+        ([0, 1, 3, 2], [0, 2, 3], 1, [0, 1, 3, 2]),
+        (list(range(8)), [0, 1, 3], 2, list(range(8))),
     ],
 )
 def test_capture_restore_keeps_captured_mc2_rank_ids(physical, active, width, expected):
@@ -422,14 +430,14 @@ def test_mega_middle_restore_exchanges_backend_and_preserves_mc2_slots(monkeypat
     request = SimpleNamespace(new_data_parallel_size=4, operation_id="mega-restore")
     assert executor._publish_capture_decision(request, old_dp_size=3)
     assert executor._mega_moe_precommit_capture
-    assert executor._capture_mc2_rank_order == [0, 1, 3, 2]
+    assert executor._capture_mc2_rank_order == [0, 1, 2, 3]
     assert not executor._capture_companion_done
     new_executor, _ = _executor_and_worker()
     monkeypatch.setattr(new_executor, "_capture_store", lambda request: store)
     assert new_executor._read_capture_decision(request)
     assert new_executor._mega_moe_precommit_capture
     assert new_executor._capture_old_dp_size == 3
-    assert new_executor._capture_mc2_rank_order == [0, 1, 3, 2]
+    assert new_executor._capture_mc2_rank_order == [0, 1, 2, 3]
 
 
 @pytest.mark.parametrize("existing", [True, False])
@@ -503,10 +511,11 @@ def test_mega_resume_preserves_eplb_execution_mode(monkeypatch, is_async):
 def test_new_mega_worker_masks_existing_slots_before_capture(monkeypatch):
     executor, _, comm = _mega_restore_executor(monkeypatch)
     executor._capture_old_dp_size = 3
+    executor.reconfig_request = SimpleNamespace(new_data_parallel_size=4, existing_dp_ranks=[0, 1, 3])
     state = comm.mega_moe_capture_state
     comm._init_mega_moe_symm_buffer = MagicMock(return_value=state.buffer)
     module = "vllm_ascend.distributed.elastic_ep.elastic_execute"
-    monkeypatch.setattr(f"{module}.get_mc2_group", lambda: SimpleNamespace(ranks=[0, 1, 3, 2]))
+    monkeypatch.setattr(f"{module}.get_mc2_group", lambda: SimpleNamespace(ranks=[0, 1, 2, 3]))
     monkeypatch.setattr(f"{module}._is_decode_only_node", lambda config: False)
     monkeypatch.setattr(executor, "_setup_moe_comm_and_quant_method", MagicMock())
     rendezvous = MagicMock(side_effect=lambda *args: bool(state.capture_active) or pytest.fail("routing not ready"))
