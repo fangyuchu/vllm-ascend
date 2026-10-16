@@ -18,6 +18,9 @@
 import torch
 import torch.distributed as dist
 from vllm.distributed.device_communicators.base_device_communicator import DeviceCommunicatorBase
+from vllm.distributed.utils import StatelessProcessGroup
+
+from vllm_ascend.distributed.device_communicators.pyhccl import PyHcclCommunicator
 
 
 class _NpuAll2AllManager:
@@ -36,6 +39,15 @@ class _NpuAll2AllManager:
     def query_active_mask(self) -> torch.Tensor:
         return torch.zeros(1, dtype=torch.bool, device="cpu")
 
+    # Elastic-EP hooks that upstream calls unconditionally. NPU routes MoE
+    # communication through MC2/all_gather and never reuses kernels across EP
+    # rank changes, so these are no-ops.
+    def stage_ep_size(self) -> None:
+        pass
+
+    def commit_ep_size(self) -> None:
+        pass
+
 
 class NPUCommunicator(DeviceCommunicatorBase):
     def __init__(
@@ -44,6 +56,9 @@ class NPUCommunicator(DeviceCommunicatorBase):
         device: torch.device | None = None,
         device_group: dist.ProcessGroup | None = None,
         unique_name: str = "",
+        global_ranks: list[int] | None = None,
+        global_world_size: int | None = None,
+        tcp_store_group: StatelessProcessGroup | None = None,
         use_all2all: bool = False,
     ):
         super().__init__(
@@ -51,12 +66,32 @@ class NPUCommunicator(DeviceCommunicatorBase):
             device,
             device_group,
             unique_name,
-            use_all2all=use_all2all,
+            global_ranks,
+            global_world_size,
+            use_all2all,
         )
         self.device = torch.npu.current_device()
+
+        # Create pyhccl_comm handle for batch_transfer_weights in elastic_ep
+        self.pyhccl_comm: PyHcclCommunicator | None = None
+        if self.world_size > 1 and tcp_store_group is not None:
+            self.pyhccl_comm = PyHcclCommunicator(group=tcp_store_group, device=self.device, warmup=False)
+
         self.ca_comm = None
         # vLLM #53576 reads this CUDA-only communicator during graph capture.
         # Keep the shared coordinator protocol available without enabling the
         # FlashInfer PCIe IPC backend on NPU.
         self.fi_pcie_ipc_ar_comm = None
         self.all2all_manager = _NpuAll2AllManager()
+
+    def destroy(self):
+        if self.pyhccl_comm is not None:
+            self.pyhccl_comm.close()
+            self.pyhccl_comm = None
+
+    def batch_isend_irecv(self, p2p_ops: list):
+        pyhccl_comm = self.pyhccl_comm
+        if pyhccl_comm is not None and not pyhccl_comm.disabled:
+            pyhccl_comm.batch_isend_irecv(p2p_ops)
+        else:
+            raise ValueError("No PyHccl communicator found")

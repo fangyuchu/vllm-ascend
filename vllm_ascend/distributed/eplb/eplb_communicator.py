@@ -5,6 +5,7 @@
 
 import contextlib
 import time
+import weakref
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
@@ -465,20 +466,35 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
         cpu_group: ProcessGroup,
         all_expert_weights: Sequence[Sequence[Any]],
         expert_buffer: Sequence[Any],
+        defer_init: bool = True,
     ) -> None:
         self._cpu_group = cpu_group
         self._rank = cpu_group.rank()
         self._world_size = cpu_group.size()
         self._all_expert_weights = all_expert_weights
         self._expert_buffer = expert_buffer
+        self._weights_provider: Callable[[], tuple[Sequence[Sequence[Any]], Sequence[Any]]] | None = None
+        self._session_owner: weakref.ref | None = None
         self._session: _HixlSession | None = None
         self._remote_send_meta: dict[int, _ExpertMetadata] = {}
         self._expert_to_src_row: list[dict[int, int]] | None = None
         self._layer_idx: int | None = None
         self._pending_reads: dict[int, list[tuple[int, int, int]]] = {}
         self._pending_bytes = 0
+        # Lazy session creation is an Elastic-EP-only contract: EEP builds this
+        # communicator before the switch rebuilds the weights, so it defers
+        # registration to the first transfer. Without Elastic EP the weights are
+        # final here, so resolve and validate them eagerly (fail-fast) unless the
+        # caller explicitly defers. This never registers memory, so validating
+        # eagerly is safe on the EEP path too.
+        self._defer_init = defer_init
+        if not defer_init:
+            self._prepare()
 
     def _prepare(self) -> None:
+        if self._weights_provider is not None:
+            # Resolve weights at session init: Elastic EP rebuilds them on switch.
+            self._all_expert_weights, self._expert_buffer = self._weights_provider()
         if not self._all_expert_weights or not self._all_expert_weights[0] or not self._expert_buffer:
             raise ValueError("HIXL EPLB requires expert weights and receive buffers")
         first_view = self._all_expert_weights[0][0]
@@ -497,6 +513,36 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
             raise RuntimeError("HIXL EPLB session must be initialized before migration")
         self._session.check_usable()
         return self._session
+
+    def bind_weights_provider(self, model_state: Any) -> None:
+        """Resolve weights at lazy init: Elastic EP rebuilds them at the switch."""
+        self._weights_provider = lambda: (model_state.model.expert_weights, model_state.expert_buffer)
+
+    def bind_session_owner(self, owner: Any) -> None:
+        """Weakly keep the owning state so a lazily created session is registered back on it."""
+        self._session_owner = weakref.ref(owner)
+
+    def _ensure_initialized(self) -> None:
+        """Create the HIXL session on first transfer.
+
+        Only the Elastic EP path initializes lazily: it constructs the
+        communicator before the switch (weights not final, registrations still
+        held by the active engine), so the communicator factory marks it with
+        ``defer_init`` and registration runs here at the first transfer. Without
+        Elastic EP the state initializes the session eagerly, so a missing
+        session is a contract violation rather than a lazy trigger.
+        """
+        if self._session is not None:
+            self._session.check_usable()
+            return
+        if not self._defer_init:
+            raise RuntimeError("HIXL EPLB session must be initialized eagerly when Elastic EP is disabled")
+        session = _HixlSession(self._cpu_group)
+        self._session = session
+        session.initialize({"": self})
+        owner = self._session_owner() if self._session_owner is not None else None
+        if owner is not None:
+            owner._hixl_session = session
 
     def _validate_tensors(
         self,
@@ -554,11 +600,16 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
         return local_meta
 
     def set_stream(self, stream: torch.Stream | None) -> None:
+        session = self._session
+        if session is None:
+            # No engine context to restore before lazy initialization.
+            return
         # HIXL owns its streams; restore the engine's initialization context.
-        self._require_session()._set_hixl_context()
+        session.check_usable()
+        session._set_hixl_context()
 
     def set_transfer_context(self, old_indices: np.ndarray, layer_idx: int) -> None:
-        self._require_session()
+        self._ensure_initialized()
         if self._pending_reads:
             raise RuntimeError("HIXL EPLB started a layer with pending transfers")
         placement = np.asarray(old_indices).reshape(
@@ -643,3 +694,14 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
     @property
     def needs_profile_buffer_reservation(self) -> bool:
         return False
+
+    def _close(self) -> None:
+        """Release the session registrations on the Elastic EP retirement path.
+
+        register_mem pins the segments, so they must be freed before the switch
+        releases the weights and the replacement registers the same segments.
+        """
+        if self._session is None:
+            return
+        session, self._session = self._session, None
+        session.close()
