@@ -3,7 +3,7 @@
 
 """Ascend-owned extensions for the upstream EPLB state."""
 
-import inspect
+import socket
 import threading
 import time
 from collections.abc import Iterator
@@ -19,7 +19,6 @@ from torch.distributed import all_reduce
 from vllm.distributed import get_ep_group, get_eplb_group
 from vllm.distributed.eplb import eplb_state as _eplb_state
 from vllm.distributed.eplb.policy import AbstractEplbPolicy
-from vllm.distributed.parallel_state import in_the_same_node_as
 from vllm.logger import logger
 
 from vllm_ascend.distributed.eplb.eplb_communicator import AscendHixlEplbCommunicator, _HixlSession
@@ -45,11 +44,6 @@ def _configured_upstream_policy(name: str, policy: AbstractEplbPolicy | None) ->
         yield
     finally:
         policies.pop(name)
-
-
-def _upstream_from_mapping_accepts_valid_expert_count() -> bool:
-    """Return whether the selected vLLM uses the release mapping contract."""
-    return "num_valid_physical_experts" in inspect.signature(_eplb_state.EplbState.from_mapping).parameters
 
 
 class AscendEplbLayerState(_eplb_state.EplbLayerState):
@@ -243,16 +237,19 @@ class AscendEplbState(_eplb_state.EplbState):
 
     def start_async_loop(self, *args, **kwargs) -> None:
         if not self._suspended:
-            communicators = {
-                key: model_state.communicator
-                for key, model_state in self.model_states.items()
-                if isinstance(model_state.communicator, AscendHixlEplbCommunicator)
-            }
-            if communicators and self._hixl_session is None:
-                self._hixl_session = _HixlSession(next(iter(communicators.values()))._cpu_group)
-                self._hixl_session.initialize(communicators)
-            if self._hixl_session is not None:
-                self._hixl_session.check_usable()
+            # Elastic EP builds the HIXL session lazily on first transfer (owned
+            # via bind_session_owner); only the non-elastic path creates it here.
+            if not self.parallel_config.enable_elastic_ep:
+                communicators = {
+                    key: model_state.communicator
+                    for key, model_state in self.model_states.items()
+                    if isinstance(model_state.communicator, AscendHixlEplbCommunicator)
+                }
+                if communicators and self._hixl_session is None:
+                    self._hixl_session = _HixlSession(next(iter(communicators.values()))._cpu_group)
+                    self._hixl_session.initialize(communicators)
+                if self._hixl_session is not None:
+                    self._hixl_session.check_usable()
             super().start_async_loop(*args, **kwargs)
 
     def _initialize_load_stats_state(self, model_state: Any) -> None:
@@ -282,24 +279,19 @@ class AscendEplbState(_eplb_state.EplbState):
     def get_rank_node_ids(self) -> np.ndarray:
         """Return cached node ordinals in stage-local EPLB rank order."""
         rank_node_ids = getattr(self, "_rank_node_ids", None)
-        if rank_node_ids is not None:
-            return rank_node_ids
-
         cpu_group = get_eplb_group().cpu_group
+        if rank_node_ids is not None and len(rank_node_ids) == cpu_group.size():
+            # Elastic EP changes the member count, so a stale cache fails this
+            # size check and is re-discovered.
+            return rank_node_ids
         num_ranks = cpu_group.size()
-        rank_node_ids = np.full(num_ranks, -1, dtype=np.int64)
-        next_node_id = 0
-        for source_rank in range(num_ranks):
-            if rank_node_ids[source_rank] >= 0:
-                continue
-            same_node = np.asarray(
-                in_the_same_node_as(cpu_group, source_rank),
-                dtype=bool,
-            )
-            if same_node.shape != (num_ranks,) or not same_node[source_rank]:
-                raise RuntimeError("EPLB node discovery returned an invalid rank mask")
-            rank_node_ids[same_node] = next_node_id
-            next_node_id += 1
+        # Gather hostnames as strings: the upstream shared-memory probe returns
+        # an all-zero mask across containers / stateless groups, and a hashed
+        # key would risk collisions. Ranks on the same host share a node ordinal.
+        hostnames: list[str] = ["" for _ in range(num_ranks)]
+        torch.distributed.all_gather_object(hostnames, socket.gethostname(), group=cpu_group)
+        ordinals = {hostname: ordinal for ordinal, hostname in enumerate(sorted(set(hostnames)))}
+        rank_node_ids = np.array([ordinals[hostname] for hostname in hostnames], dtype=np.int64)
         self._rank_node_ids = rank_node_ids
         return rank_node_ids
 
@@ -387,9 +379,8 @@ class AscendEplbState(_eplb_state.EplbState):
         if prepare_load_stats is None:
             raise TypeError("The selected EPLB policy does not prepare load statistics")
         self._discard_samples_from_old_mapping()
-        if self._num_recorded_load_steps == 0:
-            return None
-
+        # No early return on zero local steps: the all_reduce below is the
+        # participation barrier, so skipping it would deadlock surviving ranks.
         group = get_eplb_group()
         step_indices = self._ordered_load_step_indices()
         rank_counts = self._local_load_collection_mask[step_indices].clone()
@@ -475,10 +466,34 @@ class AscendEplbState(_eplb_state.EplbState):
         all_reduce(flag, group=device_group)
         return bool(flag.item())
 
+    def create_communicator(self, model_config: Any, group_coordinator: Any) -> Any:
+        communicator = super().create_communicator(model_config, group_coordinator)
+        if isinstance(communicator, AscendHixlEplbCommunicator):
+            # HIXL resolves expert weights lazily at first transfer (elastic EP
+            # rebuilds them on switch), and the state stays the session owner.
+            model_state = self.model_states[model_config.compute_hash()]
+            communicator.bind_weights_provider(model_state)
+            communicator.bind_session_owner(self)
+        return communicator
+
+    def update_communicator(self, model_config: Any, communicator: Any) -> None:
+        model_state = self.model_states[model_config.compute_hash()]
+        retired = model_state.communicator
+        if isinstance(retired, AscendHixlEplbCommunicator) and retired is not communicator:
+            # Free the retired session's registrations first: HIXL rejects
+            # overlapping register_mem. Drop the stale reference so the
+            # switched-in communicator rebuilds the session.
+            session = retired._session
+            retired._close()
+            if session is None or self._hixl_session is session:
+                self._hixl_session = None
+        super().update_communicator(model_config, communicator)
+
     def rearrange(
         self,
         is_profile: bool = False,
         rank_mapping: dict[int, int] | None = None,
+        use_last_expert_load: bool = False,
     ) -> torch.Tensor | None:
         if self._suspended:
             return None
@@ -503,6 +518,7 @@ class AscendEplbState(_eplb_state.EplbState):
             result = super().rearrange(
                 is_profile=is_profile,
                 rank_mapping=rank_mapping,
+                use_last_expert_load=use_last_expert_load,
             )
         if not is_profile and not self.is_async:
             for model_state in self.model_states.values():
@@ -577,37 +593,3 @@ class AscendEplbState(_eplb_state.EplbState):
         model_state._eplb_ready_flag = flag
         model_state._eplb_ready_work = work
         return False
-
-    @classmethod
-    def from_mapping(
-        cls,
-        model,
-        model_config,
-        device: torch.device,
-        parallel_config,
-        expanded_physical_to_logical: torch.Tensor,
-        num_valid_physical_experts: int | None = None,
-        policy: AbstractEplbPolicy | None = None,
-    ) -> "AscendEplbState":
-        from_mapping_kwargs: dict[str, Any] = {
-            "model": model,
-            "model_config": model_config,
-            "device": device,
-            "parallel_config": parallel_config,
-            "expanded_physical_to_logical": expanded_physical_to_logical,
-        }
-        if _upstream_from_mapping_accepts_valid_expert_count():
-            if num_valid_physical_experts is None:
-                raise TypeError("num_valid_physical_experts is required by the selected vLLM release mapping contract")
-            from_mapping_kwargs["num_valid_physical_experts"] = num_valid_physical_experts
-        with _configured_upstream_policy(parallel_config.eplb_config.policy, policy):
-            state = super().from_mapping(**from_mapping_kwargs)
-        state._configured_policy = policy
-        if policy is not None:
-            state.policy = policy
-        if state.uses_custom_load_stats:
-            for model_state in state.model_states.values():
-                state._initialize_load_stats_state(model_state)
-        for model_state in state.model_states.values():
-            refresh_model_routing_tables(model_state)
-        return state

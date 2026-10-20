@@ -4,15 +4,10 @@
 from typing import Any
 
 import torch
-import torch.nn as nn
-from vllm.model_executor.models.interfaces import (
-    SupportsMultiModal,
-    is_mixture_of_experts,
-)
 from vllm.v1.worker.gpu.eplb_utils import EPLBController
 
 from vllm_ascend.ascend_config import EplbConfig
-from vllm_ascend.distributed.eplb.eplb_state import AscendEplbState
+from vllm_ascend.distributed.eplb.eplb_state import AscendEplbState, refresh_model_routing_tables
 from vllm_ascend.distributed.eplb.policy.factory import create_eplb_policy
 from vllm_ascend.patch.platform.patch_eplb import resolve_ascend_eplb_communicator
 
@@ -26,12 +21,6 @@ def is_eplb_load_collection_phase_matched(
         return True
     batch_phase = "prefill" if batch_has_prefill else "decode"
     return load_collection_phase == batch_phase
-
-
-def _unwrap_moe(model: nn.Module) -> nn.Module:
-    if not is_mixture_of_experts(model) and isinstance(model, SupportsMultiModal):
-        return model.get_language_model()
-    return model
 
 
 class AscendEPLBController(EPLBController):
@@ -107,22 +96,13 @@ class AscendEPLBController(EPLBController):
 
     def setup_from_mapping(
         self,
-        model: nn.Module,
         model_config: Any,
         expanded_physical_to_logical: torch.Tensor,
-        old_num_physical_experts: int | None = None,
     ) -> None:
-        model = _unwrap_moe(model)
-        assert is_mixture_of_experts(model)
-        from_mapping_kwargs: dict[str, Any] = dict(
-            model=model,
-            model_config=model_config,
-            device=self.device,
-            parallel_config=self.parallel_config,
-            expanded_physical_to_logical=expanded_physical_to_logical,
-            policy=self.eplb_policy,
-        )
-        if old_num_physical_experts is not None:
-            from_mapping_kwargs["num_valid_physical_experts"] = old_num_physical_experts
-        self.state = AscendEplbState.from_mapping(**from_mapping_kwargs)
+        # Update in place: a fresh EplbState would build a second communicator
+        # over a group the other ranks have already left.
+        assert self.state is not None
+        self.state.update_mapping(model_config, expanded_physical_to_logical)
         self._has_registered_models = True
+        for model_state in self.state.model_states.values():
+            refresh_model_routing_tables(model_state)

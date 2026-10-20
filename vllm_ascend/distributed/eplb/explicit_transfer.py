@@ -27,14 +27,16 @@ def stage_explicit_layer_transfer(
     """Stage one layer using its exact ``[ranks, slots]`` source plan.
 
     Old and new indices are flattened ``[ranks * slots]`` CPU tensors for a
-    dense, equal-capacity placement with no rank-local duplicate experts. The
-    source arrays index the old placement. Weight and buffer sequences are
-    non-empty and aligned; each pair has ``slots`` expert tensors with matching
-    shape, dtype, and device at each slot. Mappings, source coordinates, and
-    buffer schemas are validated before any copy or transfer is registered.
-    Callers must validate the policy's complete plan separately. This function
-    stages data into buffers and returns metadata for the current rank; live
-    weights are not committed here.
+    dense, equal-capacity placement with no rank-local duplicate experts. An
+    entry of ``-1`` denotes an empty Elastic EP slot; empty targets need no
+    weight movement and their source coordinates are ignored. The source
+    arrays index the old placement. Weight and buffer sequences are non-empty
+    and aligned; each pair has ``slots`` expert tensors with matching shape,
+    dtype, and device at each slot. Mappings, source coordinates, and buffer
+    schemas are validated before any copy or transfer is registered. Callers
+    must validate the policy's complete plan separately. This function stages
+    data into buffers and returns metadata for the current rank; live weights
+    are not committed here.
     """
     if old_layer_indices.device.type != "cpu" or new_layer_indices.device.type != "cpu":
         raise ValueError("explicit EPLB layer mappings must be CPU tensors")
@@ -46,10 +48,12 @@ def stage_explicit_layer_transfer(
         or old.size == 0
         or not np.issubdtype(old.dtype, np.integer)
         or not np.issubdtype(new.dtype, np.integer)
-        or np.any(old < 0)
-        or np.any(new < 0)
+        or np.any(old < -1)
+        or np.any(new < -1)
     ):
-        raise ValueError("explicit EPLB layer mappings must be aligned non-empty non-negative integer vectors")
+        raise ValueError(
+            "explicit EPLB layer mappings must be aligned non-empty integer vectors of expert indices or -1 empty slots"
+        )
 
     num_ranks = ep_group.size()
     ep_rank = ep_group.rank()
@@ -69,11 +73,16 @@ def stage_explicit_layer_transfer(
         or not np.issubdtype(source_slots.dtype, np.integer)
     ):
         raise ValueError("explicit EPLB source plans must be integer [ranks, slots] arrays")
+    old_placement = old.reshape(expected_shape)
+    new_placement = new.reshape(expected_shape)
+    valid_targets = new_placement >= 0
+    valid_source_ranks = source_ranks[valid_targets]
+    valid_source_slots = source_slots[valid_targets]
     if (
-        np.any(source_ranks < 0)
-        or np.any(source_ranks >= num_ranks)
-        or np.any(source_slots < 0)
-        or np.any(source_slots >= slots_per_rank)
+        np.any(valid_source_ranks < 0)
+        or np.any(valid_source_ranks >= num_ranks)
+        or np.any(valid_source_slots < 0)
+        or np.any(valid_source_slots >= slots_per_rank)
     ):
         raise ValueError("explicit EPLB source plan contains an out-of-range coordinate")
     if len(expert_weights) != len(expert_weight_buffers) or not expert_weights:
@@ -96,9 +105,10 @@ def stage_explicit_layer_transfer(
             ):
                 raise ValueError("each EPLB expert weight and buffer pair must have the same slot-aligned schema")
 
-    old_placement = old.reshape(expected_shape)
-    new_placement = new.reshape(expected_shape)
-    if not np.array_equal(old_placement[source_ranks, source_slots], new_placement):
+    if not np.array_equal(
+        old_placement[valid_source_ranks, valid_source_slots],
+        new_placement[valid_targets],
+    ):
         raise RuntimeError("explicit EPLB source plan does not own every target expert")
 
     is_unchanged = np.zeros(slots_per_rank, dtype=np.bool_)
@@ -114,6 +124,12 @@ def stage_explicit_layer_transfer(
         for dst_rank in destination_ranks:
             for dst_slot in range(slots_per_rank):
                 expert = int(new_placement[dst_rank, dst_slot])
+                if expert < 0:
+                    # Reserved Elastic EP slot: no weight is needed and the
+                    # source plan entry is intentionally a -1 sentinel.
+                    if ep_rank == dst_rank:
+                        is_unchanged[dst_slot] = True
+                    continue
                 src_rank = int(source_ranks[dst_rank, dst_slot])
                 src_slot = int(source_slots[dst_rank, dst_slot])
                 if src_rank == dst_rank:

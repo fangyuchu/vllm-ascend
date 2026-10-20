@@ -224,8 +224,15 @@ class StairEplbPolicy(AbstractEplbPolicy):
             raise ValueError("STAIR requires the current expert placement")
 
         current_map = old_global_expert_indices.cpu()
-        if current_map.ndim != 2 or current_map.shape[1] != num_replicas:
+        if current_map.ndim != 2 or current_map.shape[1] < num_replicas:
             raise ValueError("current expert placement must be [layers, num_replicas]")
+        if current_map.shape[1] > num_replicas:
+            # Scale-down passes the old-width placement (still carries removed
+            # ranks' trailing slots), so plan over surviving slots only.
+            slots_per_rank = num_replicas // num_ranks
+            if current_map.shape[1] % slots_per_rank or current_map.shape[1] // slots_per_rank <= num_ranks:
+                raise ValueError("current expert placement does not match the scaled-down rank capacity")
+            current_map = current_map[:, :num_replicas]
         if isinstance(weight, PreparedLoadStats):
             if weight.values.device.type != "cpu" or weight.sample_counts is None:
                 raise ValueError("prepared STAIR statistics require CPU values and sample counts")
@@ -253,7 +260,9 @@ class StairEplbPolicy(AbstractEplbPolicy):
             if len(np.unique(node_ids)) != num_nodes:
                 raise ValueError("num_nodes must match the distinct rank_node_ids")
         cpu_group = get_eplb_group().cpu_group
-        if cpu_group.size() != num_ranks:
+        # Scale-down plans the surviving topology while the larger group is
+        # still connected (the leaving rank stays in the shard all-gather).
+        if cpu_group.size() < num_ranks:
             raise RuntimeError("STAIR topology does not match the stage-local EPLB group")
 
         plan = self.plan_sharded_rebalance(
@@ -333,11 +342,14 @@ class StairEplbPolicy(AbstractEplbPolicy):
             raise ValueError("rank_expert_ids must be an integer [ranks, slots] array")
         if num_experts < 1:
             raise ValueError("num_experts must be positive")
-        if np.any(placement < 0) or np.any(placement >= num_experts):
+        # Elastic EP expansion fills slots with -1 (empty); count populated slots only.
+        valid = placement[placement >= 0]
+        if np.any(valid >= num_experts):
             raise ValueError("rank_expert_ids contains an out-of-range expert")
         placement = placement.astype(np.int64, copy=False)
-        replica_counts = np.bincount(placement.ravel(), minlength=num_experts)
-        if np.any(replica_counts == 0) or any(len(set(rank)) != len(rank) for rank in placement.tolist()):
+        replica_counts = np.bincount(valid.ravel().astype(np.int64), minlength=num_experts)
+        populated = [rank_experts[rank_experts >= 0].tolist() for rank_experts in placement]
+        if np.any(replica_counts == 0) or any(len(set(rank)) != len(rank) for rank in populated):
             raise ValueError("rank_expert_ids must cover every expert without rank-local duplicates")
         return replica_counts
 
@@ -356,14 +368,24 @@ class StairEplbPolicy(AbstractEplbPolicy):
         placement = np.asarray(rank_expert_ids)
         replica_counts = cls.placement_replica_counts(placement, values.shape[1])
         rank_loads = np.stack(
-            [np.sum(values[:, rank_experts] / replica_counts[rank_experts], axis=1) for rank_experts in placement],
+            [
+                # Skip the empty (-1) slots from Elastic EP placement expansion.
+                np.sum(
+                    values[:, rank_experts[rank_experts >= 0]] / replica_counts[rank_experts[rank_experts >= 0]],
+                    axis=1,
+                )
+                for rank_experts in placement
+            ],
             axis=1,
         )
         sample_total_loads = rank_loads.sum(axis=1)
         imbalance_ratios = np.ones(values.shape[0], dtype=np.float64)
         nonzero_load_samples = sample_total_loads > 0
-        imbalance_ratios[nonzero_load_samples] = rank_loads[nonzero_load_samples].max(axis=1) / (
-            sample_total_loads[nonzero_load_samples] / placement.shape[0]
+        # Clamp to 1.0 so floating-point noise keeps the >= 1 mean/p95 invariants.
+        imbalance_ratios[nonzero_load_samples] = np.maximum(
+            rank_loads[nonzero_load_samples].max(axis=1)
+            / (sample_total_loads[nonzero_load_samples] / placement.shape[0]),
+            1.0,
         )
         imbalance_order = np.argsort(imbalance_ratios, kind="stable")
         cumulative_sample_counts = np.cumsum(counts[imbalance_order])
@@ -605,12 +627,19 @@ class StairEplbPolicy(AbstractEplbPolicy):
         budget_radius: int,
         beam_size: int,
     ) -> list[np.ndarray]:
-        """Move current replica counts toward FlashTree candidates."""
+        """Move current replica counts toward FlashTree candidates.
+
+        Elastic EP expansion leaves (-1) empty slots in the current
+        placement, so the populated counts start below the rank capacity:
+        the walk allocates those free slots as new replicas of the
+        highest-risk under-target experts until the capacity is met.
+        """
         current = cls.placement_replica_counts(current_placement, len(risks))
+        total_slots = current_placement.size
         score = lambda replicas: float(np.max(risks / replicas))
         targets = cls.replica_candidates(
             risks,
-            current_placement.size,
+            total_slots,
             num_ranks,
             num_stages=num_stages,
             budget_radius=budget_radius,
@@ -622,18 +651,38 @@ class StairEplbPolicy(AbstractEplbPolicy):
             candidate = current.copy()
             for _ in range(max_replica_changes):
                 receivers = np.flatnonzero(candidate < target)
-                donors = np.flatnonzero(candidate > target)
-                if not receivers.size or not donors.size:
+                if not receivers.size:
                     break
-                receiver = min(receivers, key=lambda expert: (-risks[expert] / candidate[expert], expert))
-                donor = min(donors, key=lambda expert: (risks[expert] / (candidate[expert] - 1), expert))
-                candidate = candidate.copy()
-                candidate[receiver] += 1
-                candidate[donor] -= 1
+                free_slots = total_slots - int(candidate.sum())
+                donors = np.flatnonzero(candidate > target)
+                if donors.size:
+                    receiver = min(receivers, key=lambda expert: (-risks[expert] / candidate[expert], expert))
+                    donor = min(donors, key=lambda expert: (risks[expert] / (candidate[expert] - 1), expert))
+                    candidate = candidate.copy()
+                    candidate[receiver] += 1
+                    candidate[donor] -= 1
+                elif free_slots > 0:
+                    # Elastic EP expansion: allocate an empty slot as a new
+                    # replica of the highest-risk under-target expert.
+                    receiver = min(receivers, key=lambda expert: (-risks[expert] / candidate[expert], expert))
+                    candidate = candidate.copy()
+                    candidate[receiver] += 1
+                else:
+                    break
                 candidates[tuple(candidate)] = candidate
-        ordered = sorted(candidates.values(), key=lambda replicas: (score(replicas), tuple(replicas)))
+            # Guarantee at least one full-capacity candidate per target so
+            # the LPT capacity check always has a legal input.
+            if int(candidate.sum()) != total_slots:
+                candidate = target.copy()
+                candidates[tuple(candidate)] = candidate
+        # LPT requires replica counts summing to the rank capacity, so only
+        # full-capacity candidates are eligible.
+        ordered = sorted(
+            (c for c in candidates.values() if int(c.sum()) == total_slots),
+            key=lambda replicas: (score(replicas), tuple(replicas)),
+        )
         selected = ordered[:beam_size]
-        if not any(np.array_equal(candidate, current) for candidate in selected):
+        if int(current.sum()) == total_slots and not any(np.array_equal(candidate, current) for candidate in selected):
             selected[-1] = current
         return selected
 
@@ -967,7 +1016,12 @@ class StairEplbPolicy(AbstractEplbPolicy):
             for dst_rank in range(num_ranks)
         ]
         current_has_expert = np.zeros((num_ranks, num_experts), dtype=bool)
-        current_has_expert[np.arange(num_ranks)[:, None], current_placement] = True
+        # Skip Elastic EP's -1 (empty) slots so numpy's -1 index can't wrap.
+        valid_slots = current_placement >= 0
+        current_has_expert[
+            np.broadcast_to(np.arange(num_ranks)[:, None], current_placement.shape)[valid_slots],
+            current_placement[valid_slots],
+        ] = True
         placed_has_expert = np.zeros((num_ranks, num_experts), dtype=bool)
         incoming_demands: list[tuple[int, int]] = []
         incoming_counts = np.zeros(num_ranks, dtype=np.int64)
