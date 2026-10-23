@@ -45,28 +45,22 @@ class MegaMoeCaptureState:
         return physical
 
     @torch.inference_mode()
-    def prepare_capture(self, active_mc2_ranks: list[int], topk: int) -> None:
+    def prepare_capture(self, topk: int) -> None:
+        """Capture independently, using only this rank's experts and buffers."""
         if self.capture_experts is not None:
             raise RuntimeError("MegaMoe capture routing has already been allocated")
-        if (
-            not active_mc2_ranks
-            or len(set(active_mc2_ranks)) != len(active_mc2_ranks)
-            or any(rank < 0 or rank >= self.buffer.ep_world_size for rank in active_mc2_ranks)
-            or len(active_mc2_ranks) * self.num_local_experts < topk
-        ):
-            raise ValueError("MegaMoe capture requires enough distinct experts on new ranks")
-        self.capture_experts = torch.tensor(
-            [
-                rank * self.num_local_experts + slot
-                for rank in active_mc2_ranks
-                for slot in range(self.num_local_experts)
-            ],
+        if not 0 < topk <= self.num_local_experts:
+            raise ValueError("MegaMoe local capture requires enough distinct local experts")
+        local_rank = self.buffer.rank_id
+        self.capture_experts = torch.arange(
+            local_rank * self.num_local_experts,
+            (local_rank + 1) * self.num_local_experts,
             dtype=torch.int32,
             device=self.buffer.context.device,
         )
         self.buffer.clean_mask_buffer()
         for rank in range(self.buffer.ep_world_size):
-            if rank not in active_mc2_ranks:
+            if rank != local_rank:
                 self.buffer.update_mask_buffer(rank, True)
         self.capture_active.fill_(True)
 
