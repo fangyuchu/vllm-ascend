@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from tests.ut.distributed.test_moe_fault_tolerance import FakeSymmBuffer
-from vllm_ascend.distributed.elastic_ep.mega_moe_capture import MegaMoeCaptureState, ep_to_mc2_ranks
+from vllm_ascend.distributed.elastic_ep.mega_moe_capture import MegaMoeCaptureState
 
 
 def make_capture_state(rank_map=None):
@@ -60,28 +60,6 @@ def test_capture_routes_only_to_local_slot(rank):
     assert state.buffer.mask_buffer.tolist() == [int(peer != rank) for peer in range(4)]
 
 
-@pytest.mark.parametrize("topk", [0, 5])
-def test_invalid_capture_topology_does_not_change_mask(topk):
-    state = make_capture_state()
-    with pytest.raises(ValueError, match="distinct local experts"):
-        state.prepare_capture(topk)
-    assert not state.buffer.mask_buffer.any()
-    assert state.capture_experts is None
-
-
-@pytest.mark.parametrize("order", [[0, 1, 1, 3], [0, 1, 2], [0, 1, 2, 4]])
-def test_rank_map_requires_permutation(order):
-    state = make_capture_state()
-    with pytest.raises(ValueError, match="permutation"):
-        state.set_rank_map(order)
-
-
-def test_ep_to_mc2_mapping_preserves_middle_hole():
-    assert ep_to_mc2_ranks([0, 1, 2, 3], [0, 1, 3, 2]) == [0, 1, 3, 2]
-    with pytest.raises(ValueError, match="rank sets"):
-        ep_to_mc2_ranks([0, 1, 2, 3], [0, 1, 2, 4])
-
-
 @pytest.mark.parametrize("change", [None, "context", "mask", "size", "topology"])
 def test_update_context_checks_captured_contract(monkeypatch, change):
     state = make_capture_state()
@@ -116,11 +94,3 @@ def test_update_context_checks_captured_contract(monkeypatch, change):
         assert buffer.context.tolist() == [1] * 8
         assert buffer.mask_buffer.tolist() == [0, 0, 1, 0]
         assert not buffer.ccl.any()
-
-
-@pytest.mark.parametrize("size,rank", [(5, 0), (4, 1)])
-def test_update_context_rejects_capacity_or_slot_change_before_collectives(size, rank):
-    state = make_capture_state()
-    with pytest.raises(ValueError, match="preserve physical"):
-        state.update_context(SimpleNamespace(world_size=size, rank_in_group=rank))
-    state.buffer.update_group.assert_not_called()

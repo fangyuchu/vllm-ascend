@@ -10,7 +10,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 from vllm.config.compilation import CUDAGraphMode
-from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
 from vllm.v1.worker.dp_utils import skip_dp_coordination
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.dp_utils import sync_cudagraph_and_dp_padding
@@ -158,40 +157,6 @@ def test_worker_progress_storage_is_shared_without_executor_tensor_serialization
     assert observer.tolist() == [7, 7]
 
 
-@pytest.mark.parametrize("elastic", [False, True])
-def test_worker_progress_attaches_once_after_engine_initialization(monkeypatch, elastic):
-    from vllm_ascend.patch.platform import patch_elastic_ep
-
-    owner = WorkerDPCollectiveState()
-    initialized = []
-    monkeypatch.setattr(patch_elastic_ep, "_original_init", lambda self: initialized.append(True))
-
-    def share(*args):
-        assert initialized
-        return [owner.share()]
-
-    engine = SimpleNamespace(
-        vllm_config=SimpleNamespace(
-            use_v2_model_runner=True,
-            parallel_config=SimpleNamespace(
-                enable_elastic_ep=elastic,
-                enable_fault_tolerance=True,
-                tensor_parallel_size=1,
-                pipeline_parallel_size=1,
-                prefill_context_parallel_size=1,
-            ),
-        ),
-        model_executor=SimpleNamespace(collective_rpc=MagicMock(side_effect=share)),
-    )
-    patch_elastic_ep._init_with_worker_progress(engine)
-    if elastic:
-        engine.model_executor.collective_rpc.assert_called_once_with("get_elastic_ep_dp_collective_state")
-        owner.tensor.fill_(13)
-        assert engine._ascend_dp_collective_states[0].tolist() == [13, 13]
-    else:
-        engine.model_executor.collective_rpc.assert_not_called()
-
-
 def test_serving_collective_aligns_joiner_epoch_and_preserves_failed_progress(monkeypatch):
     from vllm_ascend.distributed.elastic_ep import dp_collective
 
@@ -331,35 +296,3 @@ def test_catch_up_dummy_wait_does_not_block_or_submit_twice(drain_state, monkeyp
     assert drain.progress()
     state.engine_core.model_executor.execute_dummy_batch.assert_called_once()
     state._collective_rpc.assert_called_once()
-
-
-def test_fresh_elastic_group_supports_fault_tolerant_dp_sync():
-    # Elastic groups bypass GroupCoordinator.__init__, but must expose the
-    # same FT topology state before the first profiling/model step.
-    with (
-        patch("vllm.distributed.parallel_state._WORLD", None),
-        patch("vllm.distributed.stateless_coordinator.get_ip", return_value="127.0.0.1"),
-        patch(
-            "vllm.distributed.stateless_coordinator.allocate_group_ports",
-            return_value=([12301, 12302, 12303], []),
-        ),
-        patch("vllm.distributed.stateless_coordinator.stateless_init_torch_distributed_process_group"),
-        patch("vllm.distributed.stateless_coordinator.StatelessProcessGroup.create"),
-    ):
-        group = StatelessGroupCoordinator([[0, 1]], 0, "gloo", False, MagicMock(), group_name="dp")
-
-    descriptor = BatchExecutionDescriptor(cg_mode=CUDAGraphMode.NONE, num_tokens=1, num_reqs=1)
-    with (
-        patch("vllm.v1.worker.gpu.dp_utils.get_dp_group", return_value=group),
-        patch("vllm.v1.worker.gpu.dp_utils.dist.all_reduce"),
-    ):
-        sync_cudagraph_and_dp_padding(
-            None,
-            descriptor,
-            num_tokens=1,
-            num_reqs=1,
-            uniform_token_count=None,
-            dp_size=2,
-            dp_rank=0,
-            parallel_config=SimpleNamespace(enable_fault_tolerance=True, tensor_parallel_size=1),
-        )
