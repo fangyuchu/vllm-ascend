@@ -108,7 +108,7 @@ def test_replacing_captured_buffer_is_rejected():
         manager.bind_mega_moe_buffer(FakeSymmBuffer(), list(range(4)))
 
 
-def test_v3_manager_keeps_dense_rank_translation_and_retry_behavior():
+def test_mc2_manager_keeps_dense_rank_translation_and_retry_behavior():
     manager = _NpuAll2AllManager(4, torch.device("cpu"))
     manager.set_num_local_physical_experts(8)
     info = manager.get_elastic_info()

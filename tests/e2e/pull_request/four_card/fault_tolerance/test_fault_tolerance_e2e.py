@@ -519,7 +519,7 @@ def test_injected_fault_retry_recovers_all_ranks(monkeypatch, tmp_path):
 
 
 @pytest.mark.skipif(not has_npu_ft_capability(), reason="Requires at least 4 NPUs for DP=4 scale-down testing")
-@pytest.mark.parametrize("moe_backend", ["mc2", "v3", "mega_moe"])
+@pytest.mark.parametrize("moe_backend", ["mc2", "mega_moe"])
 @pytest.mark.parametrize("victim_rank", [1, DP_SIZE - 1])
 def test_scale_down_removes_dead_rank_and_recovers(monkeypatch, moe_backend, victim_rank):
     """scale_down removes the dead DP rank; survivors keep serving.
@@ -534,28 +534,17 @@ def test_scale_down_removes_dead_rank_and_recovers(monkeypatch, moe_backend, vic
     """
     if moe_backend == "mc2" and not has_npu_scale_down_capability():
         pytest.skip("MC2 scale-down requires npu_moe_distribute_dispatch_v2")
-    if moe_backend in ("v3", "mega_moe"):
+    if moe_backend == "mega_moe":
         if "Ascend910_93" not in torch.npu.get_device_name():
-            pytest.skip("V3/MegaMoe scale-down requires Ascend A3")
-        if moe_backend == "v3":
-            from vllm_ascend.ops.fused_moe.moe_distribute_v3 import MoeDistributeV3Adapter
+            pytest.skip("MegaMoe scale-down requires Ascend A3")
+        pytest.importorskip("cann_ops_transformer")
+        from transformers import AutoConfig
 
-            try:
-                MoeDistributeV3Adapter._load_buffer_cls()
-            except RuntimeError as exc:
-                pytest.skip(str(exc))
-        else:
-            pytest.importorskip("cann_ops_transformer")
-            from transformers import AutoConfig
+        from vllm_ascend.ascend_config import AscendConfig
 
-            from vllm_ascend.ascend_config import AscendConfig
-
-            model_config = SimpleNamespace(hf_text_config=AutoConfig.from_pretrained(MODEL_NAME))
-            if not AscendConfig._is_megamoe_supported_by_config(SimpleNamespace(model_config=model_config)):
-                pytest.skip(
-                    "Set MODEL_NAME to a MegaMoe-compatible W8A8 checkpoint; Qwen3's 768 dimension is unsupported"
-                )
-    monkeypatch.setenv("VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3", "1" if moe_backend == "v3" else "0")
+        model_config = SimpleNamespace(hf_text_config=AutoConfig.from_pretrained(MODEL_NAME))
+        if not AscendConfig._is_megamoe_supported_by_config(SimpleNamespace(model_config=model_config)):
+            pytest.skip("Set MODEL_NAME to a MegaMoe-compatible W8A8 checkpoint; Qwen3's 768 dimension is unsupported")
     extra_args = [
         "--additional-config",
         json.dumps(

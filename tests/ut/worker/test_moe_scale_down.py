@@ -7,7 +7,11 @@ import pytest
 import torch
 
 from vllm_ascend.worker.sentinel import npu_worker_sentinel as sentinel_module
-from vllm_ascend.worker.sentinel.eplb_redistribute import _reload_w8a8_dynamic, scale_from_float_to_int64
+from vllm_ascend.worker.sentinel.eplb_redistribute import (
+    AscendW8A8DynamicFusedMoEMethod,
+    _reload_chunk,
+    scale_from_float_to_int64,
+)
 from vllm_ascend.worker.sentinel.npu_worker_sentinel import WorkerSentinel
 
 
@@ -34,11 +38,16 @@ def test_retry_publishes_mega_moe_mask_writes_before_leaving_quarantine(mega_moe
 @pytest.mark.parametrize("mega_moe", [False, True])
 def test_scale_down_uses_backend_specific_physical_expert_ids(mega_moe):
     # Rank 1 is dead: the expert on rank 2 must keep id 8 for MegaMoe,
-    # but become id 4 for V3. A tail-rank-only test would miss this bug.
+    # but become id 4 for MC2. A tail-rank-only test would miss this bug.
     table = torch.tensor([[0], [8], [12]], dtype=torch.int32)
     layer = SimpleNamespace(eplb_state=SimpleNamespace(expert_replica_routing_table=table))
-    state = SimpleNamespace(physical_to_logical_map=torch.empty(1, 16), model=SimpleNamespace(moe_layers=[layer]))
+    state = SimpleNamespace(
+        physical_to_logical_map=torch.empty(1, 16),
+        logical_replica_count=torch.ones(1, 4),
+        model=SimpleNamespace(moe_layers=[layer]),
+    )
     sentinel = object.__new__(WorkerSentinel)
+    sentinel.worker = SimpleNamespace(model_runner=SimpleNamespace(model=state.model))
     sentinel._eplb_model_state = lambda: state
     manager = SimpleNamespace(
         uses_mega_moe=mega_moe,
@@ -46,29 +55,27 @@ def test_scale_down_uses_backend_specific_physical_expert_ids(mega_moe):
         get_elastic_info=Mock(return_value=torch.zeros(12)),
     )
     with (
-        patch.object(sentinel_module.GPUWorkerSentinel, "_redistribute_experts"),
+        patch.object(sentinel_module, "mark_dead_expert_slots_inplace"),
+        patch.object(sentinel_module, "redistribute_expert_placement", return_value=[]),
+        patch.object(sentinel_module, "_commit_eplb_maps"),
+        patch.object(sentinel_module, "rebuild_model_expert_maps"),
         patch.object(sentinel_module, "refresh_model_routing_tables"),
         patch.object(sentinel_module, "get_ep_group", return_value=SimpleNamespace(world_size=4)),
         patch.object(sentinel_module, "get_ep_all2all_manager", return_value=manager),
-        patch.object(sentinel_module.envs_ascend, "VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3", not mega_moe),
-        patch.object(sentinel_module, "set_v3_elastic_info_from_ep") as publish,
     ):
         sentinel._redistribute_experts({1})
     assert table.flatten().tolist() == ([0, 8, 12] if mega_moe else [0, 4, 8])
-    assert publish.call_count == (0 if mega_moe else 1)
 
 
 @pytest.mark.parametrize(
-    "fused,mega_moe,v3,bound,error",
+    "fused,mega_moe,bound,error",
     [
-        (1, True, False, True, None),
-        (1, True, False, False, "warmup"),
-        (1, False, False, False, "enable_fused_mc2"),
-        (0, False, True, False, None),
-        (1, False, True, False, None),
+        (1, True, True, None),
+        (1, True, False, "warmup"),
+        (1, False, False, "enable_fused_mc2"),
     ],
 )
-def test_scale_down_rejects_unsupported_fused_backend(fused, mega_moe, v3, bound, error):
+def test_scale_down_rejects_unsupported_fused_backend(fused, mega_moe, bound, error):
     sentinel = object.__new__(WorkerSentinel)
     sentinel.worker = SimpleNamespace(
         use_v2_model_runner=True,
@@ -84,7 +91,6 @@ def test_scale_down_rejects_unsupported_fused_backend(fused, mega_moe, v3, bound
         ),
         patch.object(sentinel_module, "use_cann_megamoe", return_value=mega_moe),
         patch.object(sentinel_module, "get_ep_all2all_manager", return_value=SimpleNamespace(uses_mega_moe=bound)),
-        patch.object(sentinel_module.envs_ascend, "VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3", v3),
     ):
         if error:
             with pytest.raises(ValueError, match=error):
@@ -113,8 +119,11 @@ def test_expert_reload_updates_mega_moe_packed_scales_without_replacing_storage(
     }
     weight_address = layer.w13_weight_list[0].data_ptr()
     scale_address = layer.fused_w1_scale_list[0].data_ptr()
-    with patch("vllm_ascend.worker.sentinel.eplb_redistribute.torch_npu.npu_format_cast", side_effect=lambda x, _: x):
-        _reload_w8a8_dynamic(layer, 0, tensors)
+    with (
+        patch("vllm_ascend.worker.sentinel.eplb_redistribute.torch_npu.npu_format_cast", side_effect=lambda x, _: x),
+        patch.object(torch.npu, "synchronize"),
+    ):
+        _reload_chunk(AscendW8A8DynamicFusedMoEMethod, [layer], [(0, 0)], {(0, 0): 0}, {(0, 0): tensors})
     assert layer.w13_weight_list[0].data_ptr() == weight_address
     assert layer.fused_w1_scale_list[0].data_ptr() == scale_address
     assert layer.w13_weight_list[0][0].tolist() == [2, 2, 2, 3, 3, 3]

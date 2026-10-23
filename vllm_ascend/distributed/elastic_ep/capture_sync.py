@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
-"""Operation-scoped DP synchronization for concurrent V3 graph capture."""
+"""Operation-scoped DP synchronization for concurrent new-rank graph capture."""
 
 from __future__ import annotations
 
@@ -15,14 +15,14 @@ import torch.distributed as dist
 from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
 from vllm.v1.worker.gpu.dp_utils import DP_SYNC_METADATA_ROWS, override_dp_sync_group
 
-_CAPTURE_SESSION: ContextVar[V3CaptureDPSyncSession | None] = ContextVar(
-    "ascend_v3_capture_session",
+_CAPTURE_SESSION: ContextVar[CaptureDPSyncSession | None] = ContextVar(
+    "ascend_capture_session",
     default=None,
 )
 
 
 @dataclass
-class V3CaptureDPSyncSession:
+class CaptureDPSyncSession:
     """Synchronize new-rank capture collectives with serving companions.
 
     Store keys are namespaced by the external reconfiguration operation ID, so
@@ -37,10 +37,10 @@ class V3CaptureDPSyncSession:
 
     def __post_init__(self) -> None:
         if not self.operation_id:
-            raise ValueError("V3 capture DP sync requires a non-empty operation_id")
+            raise ValueError("Elastic EP capture DP sync requires a non-empty operation_id")
         if not 0 < self.old_dp_size < self.group.world_size:
             raise ValueError(
-                "V3 capture DP sync requires a scale-up topology: "
+                "Elastic EP capture DP sync requires a scale-up topology: "
                 f"old_dp_size={self.old_dp_size}, "
                 f"new_dp_size={self.group.world_size}"
             )
@@ -51,7 +51,7 @@ class V3CaptureDPSyncSession:
 
     @property
     def _prefix(self) -> str:
-        return f"v3_capture/{self.operation_id}"
+        return f"elastic_capture/{self.operation_id}"
 
     def _step_key(self, sequence: int) -> str:
         return f"{self._prefix}/step/{sequence}"
@@ -87,7 +87,7 @@ class V3CaptureDPSyncSession:
 
     def mark_capture_done(self) -> None:
         if self.group.rank_in_group not in self.new_ranks:
-            raise RuntimeError("Only a new rank can mark V3 capture complete")
+            raise RuntimeError("Only a new rank can mark Elastic EP capture complete")
         self._store.set(
             self._done_key(self.group.rank_in_group),
             str(self.sequence).encode(),
@@ -114,7 +114,7 @@ class V3CaptureDPSyncSession:
         while True:
             if self._store.check([self._error_key]):
                 error = self._store.get(self._error_key).decode()
-                raise RuntimeError(f"New-rank V3 graph capture failed: {error}")
+                raise RuntimeError(f"New-rank new-rank graph capture failed: {error}")
             step_key = self._step_key(self.sequence)
             if self._store.check([step_key]):
                 dist.all_reduce(tensor, group=self.group.cpu_group)
@@ -126,7 +126,7 @@ class V3CaptureDPSyncSession:
                 step_counts = {int(self._store.get(self._done_key(rank)).decode()) for rank in self.new_ranks}
                 if step_counts != {self.sequence}:
                     raise RuntimeError(
-                        "V3 capture ranks completed with inconsistent DP "
+                        "Elastic EP capture ranks completed with inconsistent DP "
                         f"collective counts: companion={self.sequence}, "
                         f"new_ranks={sorted(step_counts)}"
                     )
@@ -134,11 +134,11 @@ class V3CaptureDPSyncSession:
 
             if time.monotonic() - start > self.timeout_s:
                 raise TimeoutError(
-                    "Timed out waiting for V3 capture DP collective "
+                    "Timed out waiting for Elastic EP capture DP collective "
                     f"operation={self.operation_id}, sequence={self.sequence}"
                 )
             time.sleep(0.02)
 
 
-def get_v3_capture_session() -> V3CaptureDPSyncSession | None:
+def get_capture_session() -> CaptureDPSyncSession | None:
     return _CAPTURE_SESSION.get()
