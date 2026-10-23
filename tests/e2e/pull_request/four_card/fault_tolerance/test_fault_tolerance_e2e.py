@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """End-to-end tests for the fault-tolerance framework on Ascend NPU.
 
-Requires 4 NPUs (DP=4). Retry is gated behind ``has_npu_ft_capability()``;
-scale-down additionally behind ``has_npu_scale_down_capability()`` (CANN V3+).
+Requires 4 NPUs (DP=4). MC2 scale-down also requires CANN V3+;
+MegaMoe requires A3 and a cann_ops_transformer build with rank-mask support.
+MODEL_NAME must point to a checkpoint supported by the selected MoE backend.
 """
 
 import contextlib
@@ -144,10 +145,14 @@ def _install_fault_injection(monkeypatch, tmp_path, rank: int, step: int) -> Non
 # ---------------------------------------------------------------------------
 
 
-def _ft_server_args(extra_args: list[str] | None = None) -> list[str]:
+def _ft_server_args(
+    extra_args: list[str] | None = None, *, additional_config: dict[str, Any] | None = None
+) -> list[str]:
     # Quantized path end to end: --quantization ascend (W8A8); no --dtype,
     # the checkpoint's own config decides. MODEL_NAME must point at a W8A8
     # checkpoint (e.g. vllm-ascend/Qwen3-30B-A3B-W8A8).
+    config = {"ft_communication_abort_timeout": FT_COMMUNICATION_ABORT_TIMEOUT_S}
+    config.update(additional_config or {})
     return [
         "--quantization",
         "ascend",
@@ -162,7 +167,7 @@ def _ft_server_args(extra_args: list[str] | None = None) -> list[str]:
         "--fault-tolerance-config",
         '{"engine_recovery_timeout_sec": 120}',
         "--additional-config",
-        f'{{"ft_communication_abort_timeout": {FT_COMMUNICATION_ABORT_TIMEOUT_S}}}',
+        json.dumps(config),
         *(extra_args or []),
     ]
 
@@ -244,11 +249,13 @@ class FTServerManager:
         self.servers.clear()
 
 
-def _ft_manager(extra_args: list[str] | None = None) -> FTServerManager:
+def _ft_manager(
+    extra_args: list[str] | None = None, *, additional_config: dict[str, Any] | None = None
+) -> FTServerManager:
     return FTServerManager(
         MODEL_NAME,
         DP_SIZE,
-        base_server_args=_ft_server_args(extra_args),
+        base_server_args=_ft_server_args(extra_args, additional_config=additional_config),
         tp_size=1,
     )
 
@@ -517,22 +524,26 @@ def test_injected_fault_retry_recovers_all_ranks(monkeypatch, tmp_path):
         _assert_correct_answers(all_ranks)
 
 
-@pytest.mark.skipif(
-    not has_npu_scale_down_capability(),
-    reason=("Requires at least 4 NPUs and npu_moe_distribute_dispatch_v2 (CANN V3+) for DP=4 scale-down testing"),
-)
-def test_scale_down_removes_dead_rank_and_recovers():
+@pytest.mark.skipif(not has_npu_ft_capability(), reason="Requires at least 4 NPUs for DP=4 scale-down testing")
+@pytest.mark.parametrize("moe_backend", ["mc2", "mega_moe"])
+def test_scale_down_removes_dead_rank_and_recovers(moe_backend):
     """scale_down removes the dead DP rank; survivors keep serving.
 
-    SIGKILL rank 3's worker: survivors go UNHEALTHY, the victim goes DEAD
+    SIGKILL a middle worker: survivors go UNHEALTHY, the victim goes DEAD
     and rejects ``retry`` (recovery requires UNHEALTHY). ``scale_down``
-    with ``removed_dp_ranks=[3]`` masks the dead rank, redistributes its
+    with ``removed_dp_ranks=[victim_rank]`` masks the dead rank, redistributes its
     EPLB experts onto the survivors and reloads the reassigned weights.
-    Rank 3 (not rank 0, the DP store master) is removed so no
+    A non-master rank is removed so no
     ``dp_master_ip`` / ``dp_store_port`` params are needed. After recovery
     every survivor must answer factual prompts correctly.
     """
-    victim_rank = DP_SIZE - 1
+    victim_rank = 1
+    if moe_backend == "mc2" and not has_npu_scale_down_capability():
+        pytest.skip("MC2 scale-down requires npu_moe_distribute_dispatch_v2")
+    if moe_backend == "mega_moe":
+        if "Ascend910_93" not in torch.npu.get_device_name():
+            pytest.skip("MegaMoe scale-down requires Ascend A3")
+        pytest.importorskip("cann_ops_transformer")
     extra_args = [
         "--compilation-config",
         json.dumps(
@@ -545,7 +556,9 @@ def test_scale_down_removes_dead_rank_and_recovers():
         "--eplb-config.num_redundant_experts",
         str(NUM_REDUNDANT_EXPERTS),
     ]
-    with _ft_manager(extra_args) as servers:
+    with _ft_manager(
+        extra_args, additional_config={"enable_fused_mc2": 2 if moe_backend == "mega_moe" else 0}
+    ) as servers:
         assert len(servers) == DP_SIZE
         servers_by_rank = {r: _server_for_rank(servers, r) for r in range(DP_SIZE)}
         victim = servers_by_rank[victim_rank]
