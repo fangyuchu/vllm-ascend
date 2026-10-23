@@ -1286,16 +1286,7 @@ class TestTopLevelSwitchTypeValidation(TestBase):
     def test_mega_moe_opt_in_requires_package(self):
         with (
             patch("vllm_ascend.ascend_config.importlib.util.find_spec", return_value=None),
-            patch("vllm_ascend.ascend_config.envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3", False),
             self.assertRaisesRegex(ValueError, "requires cann_ops_transformer"),
-        ):
-            AscendConfig(enable_fused_mc2=2, sparse_kv_offload_config=SimpleNamespace(enabled=False))
-
-    @_clean_up
-    def test_v3_override_does_not_require_mega_moe_package(self):
-        with (
-            patch("vllm_ascend.ascend_config.importlib.util.find_spec", return_value=None),
-            patch("vllm_ascend.ascend_config.envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3", True),
         ):
             AscendConfig(enable_fused_mc2=2, sparse_kv_offload_config=SimpleNamespace(enabled=False))
 
@@ -1313,7 +1304,6 @@ class TestTopLevelSwitchTypeValidation(TestBase):
         vc.parallel_config.enable_fault_tolerance = True
         with (
             patch("vllm_ascend.ascend_config.importlib.util.find_spec", return_value=True),
-            patch("vllm_ascend.ascend_config.envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3", False),
             patch.object(AscendConfig, "_is_megamoe_supported_by_config", return_value=False),
         ):
             config = AscendConfig(enable_fused_mc2=2, sparse_kv_offload_config=SimpleNamespace(enabled=False))

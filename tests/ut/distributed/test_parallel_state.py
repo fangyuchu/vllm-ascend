@@ -2,7 +2,6 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
-import torch
 from vllm.config import ParallelConfig
 
 from vllm_ascend.distributed.parallel_state import (
@@ -12,52 +11,8 @@ from vllm_ascend.distributed.parallel_state import (
     get_mc2_group,
     get_otp_group,
     get_p_tp_group,
-    get_v3_elastic_info,
     init_ascend_model_parallel,
-    remap_v3_elastic_info,
-    set_v3_elastic_info_from_ep,
 )
-
-
-@pytest.mark.parametrize(
-    "ep_info,expected",
-    [
-        ([1, 3, 0, 192, 0, 1, 2, -1, 0, 1, 2, -1], [1, 3, 0, 192, 0, 1, -1, 2, 0, 1, 3, -1]),
-        ([1, 1, 0, 64, -1, -1, -1, 0, 3, -1, -1, -1], [1, 1, 0, 64, -1, -1, 0, -1, 2, -1, -1, -1]),
-        ([0, 4, 0, 256, 0, 1, 2, 3, 0, 1, 2, 3], [1, 4, 0, 256, 0, 1, 3, 2, 0, 1, 3, 2]),
-        ([1, 3, 0, 192, 0, 1, -1, 2, 0, 1, 3, -1], [1, 3, 0, 192, 0, 1, 2, -1, 0, 1, 2, -1]),
-    ],
-)
-def test_v3_masks_match_mc2_slots_during_restore_and_next_fault(ep_info, expected):
-    info = torch.tensor(ep_info, dtype=torch.int32)
-    before = info.clone()
-    actual = remap_v3_elastic_info(info, [0, 1, 3, 2])
-    assert actual.tolist() == expected
-    torch.testing.assert_close(info, before)
-
-
-def test_v3_ft_update_preserves_graph_address_and_ep_manager_tables():
-    captured = torch.zeros(12, dtype=torch.int32)
-    address = captured.data_ptr()
-    ep_info = torch.tensor([1, 3, 0, 192, 0, 1, -1, 2, 0, 1, 3, -1], dtype=torch.int32)
-    before = ep_info.clone()
-    with (
-        patch("vllm_ascend.distributed.parallel_state._V3_ELASTIC_INFO", captured),
-        patch(
-            "vllm_ascend.distributed.parallel_state.get_ep_group",
-            return_value=SimpleNamespace(ranks=[0, 1, 2, 3]),
-        ),
-        patch(
-            "vllm_ascend.distributed.parallel_state.get_mc2_group",
-            return_value=SimpleNamespace(ranks=[0, 1, 3, 2]),
-        ),
-    ):
-        set_v3_elastic_info_from_ep(ep_info)
-        actual = get_v3_elastic_info()
-        assert actual is not None
-        assert actual.data_ptr() == address
-        assert actual.tolist() == [1, 3, 0, 192, 0, 1, 2, -1, 0, 1, 2, -1]
-    torch.testing.assert_close(ep_info, before)
 
 
 @pytest.fixture
@@ -218,6 +173,7 @@ def test_kvpp_group_stays_inside_pipeline_stage(monkeypatch, size, pcp_size):
     monkeypatch.setattr(parallel_state, "init_model_parallel_group", init_group)
     parallel_state.init_ascend_model_parallel(
         SimpleNamespace(
+            enable_elastic_ep=False,
             tensor_parallel_size=4 // pcp_size,
             pipeline_parallel_size=2,
             data_parallel_size=1,

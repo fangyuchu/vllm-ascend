@@ -88,11 +88,6 @@ def _patch_select_moe_comm_method_deps(
     enable_fused_mc2: int = 0,
     is_moe: bool = True,
 ):
-    monkeypatch.setattr(
-        afc.envs_ascend,
-        "VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3",
-        False,
-    )
     monkeypatch.setattr(afc, "is_moe_model", lambda _: is_moe)
     monkeypatch.setattr(afc, "get_mc2_tokens_capacity", lambda: capacity)
     monkeypatch.setattr(afc, "get_current_hardware_profile", lambda: get_hardware_profile(device_type))
@@ -327,36 +322,6 @@ def test_select_moe_comm_method_a3_enable_fused_mc2_mode_1(
     vllm_config = _make_vllm_config(quant_type="w4a8")
 
     assert afc.select_moe_comm_method(num_tokens, vllm_config) == expected
-
-
-def test_select_moe_comm_method_a3_v3_forces_mc2(monkeypatch):
-    _patch_select_moe_comm_method_deps(
-        monkeypatch,
-        device_type=AscendDeviceType.A3,
-        capacity=128,
-        ep_world_size=8,
-        enable_fused_mc2=1,
-    )
-    monkeypatch.setattr(
-        afc.envs_ascend,
-        "VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3",
-        True,
-    )
-
-    assert afc.select_moe_comm_method(4097, _make_vllm_config()) == MoECommType.MC2
-
-
-@pytest.mark.parametrize("v3_enabled", [False, True])
-def test_v3_switch_agrees_with_mega_moe_weights_and_forward_selection(monkeypatch, v3_enabled):
-    _patch_select_moe_comm_method_deps(
-        monkeypatch, device_type=AscendDeviceType.A3, ep_world_size=8, enable_fused_mc2=1
-    )
-    monkeypatch.setattr(afc, "is_mega_moe_supported", lambda: True)
-    monkeypatch.setattr(afc.envs_ascend, "VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3", v3_enabled)
-    config = _make_vllm_config()
-    assert afc.use_cann_megamoe(config) is (not v3_enabled)
-    expected = MoECommType.MC2 if v3_enabled else MoECommType.FUSED_MC2
-    assert afc.select_moe_comm_method(4097, config) == expected
 
 
 @pytest.mark.parametrize(

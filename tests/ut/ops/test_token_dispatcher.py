@@ -86,12 +86,6 @@ def build_token_dispatch_input_fixture(
 
 class TestTokenDispatcherWithMC2(TestBase):
     def setUp(self):
-        self.v3_env_patcher = patch(
-            "vllm_ascend.ops.fused_moe.token_dispatcher.envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3",
-            False,
-            create=True,
-        )
-        self.v3_env_patcher.start()
         self.config_patcher = patch("vllm_ascend.ops.fused_moe.token_dispatcher.get_current_vllm_config")
         self.mock_get_config = self.config_patcher.start()
 
@@ -164,7 +158,6 @@ class TestTokenDispatcherWithMC2(TestBase):
         self.dispatcher = TokenDispatcherWithMC2(**kwargs)
 
     def tearDown(self):
-        self.v3_env_patcher.stop()
         self.config_patcher.stop()
         self.mc2_capacity_patch.stop()
         self.mc2_group_patch.stop()

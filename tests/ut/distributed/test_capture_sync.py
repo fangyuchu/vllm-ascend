@@ -3,8 +3,8 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from vllm_ascend.distributed.elastic_ep.v3_capture import (
-    V3CaptureDPSyncSession,
+from vllm_ascend.distributed.elastic_ep.capture_sync import (
+    CaptureDPSyncSession,
 )
 
 
@@ -34,29 +34,29 @@ def _group(rank: int):
 
 def test_capture_session_uses_operation_scoped_keys():
     group = _group(rank=2)
-    session = V3CaptureDPSyncSession(group, "scale-17", old_dp_size=2)
+    session = CaptureDPSyncSession(group, "scale-17", old_dp_size=2)
 
     session.notify_all_reduce()
     session.notify_all_reduce()
     session.mark_capture_done()
 
     assert group.tcp_store_group.store.values == {
-        "v3_capture/scale-17/step/0": b"1",
-        "v3_capture/scale-17/step/1": b"1",
-        "v3_capture/scale-17/done/2": b"2",
+        "elastic_capture/scale-17/step/0": b"1",
+        "elastic_capture/scale-17/step/1": b"1",
+        "elastic_capture/scale-17/done/2": b"2",
     }
 
 
 def test_existing_companion_matches_steps_until_all_new_ranks_finish():
     group = _group(rank=0)
     store = group.tcp_store_group.store
-    store.set("v3_capture/scale-18/step/0", b"1")
-    store.set("v3_capture/scale-18/step/1", b"1")
-    store.set("v3_capture/scale-18/done/2", b"2")
-    store.set("v3_capture/scale-18/done/3", b"2")
-    session = V3CaptureDPSyncSession(group, "scale-18", old_dp_size=2)
+    store.set("elastic_capture/scale-18/step/0", b"1")
+    store.set("elastic_capture/scale-18/step/1", b"1")
+    store.set("elastic_capture/scale-18/done/2", b"2")
+    store.set("elastic_capture/scale-18/done/3", b"2")
+    session = CaptureDPSyncSession(group, "scale-18", old_dp_size=2)
 
-    with patch("vllm_ascend.distributed.elastic_ep.v3_capture.dist.all_reduce") as all_reduce:
+    with patch("vllm_ascend.distributed.elastic_ep.capture_sync.dist.all_reduce") as all_reduce:
         steps = session.run_existing_rank_companion()
 
     assert steps == 2
