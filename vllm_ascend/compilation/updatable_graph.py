@@ -157,21 +157,12 @@ class UpdatableGraph(torch.npu.NPUGraph):
         self,
         update_stream,
         resolved_tasks: tuple[GraphUpdateTask, ...],
-        *,
-        trace: bool = False,
     ) -> None:
         logger.debug_once("Updating host-side attention metadata with UpdatableGraph.")
         with torch.npu.stream(update_stream):
             # This is specially designed for PA.
             ws_buffer: dict[Hashable, Any] = {}
-            for index, task in enumerate(resolved_tasks):
-                if trace:
-                    logger.info(
-                        "[FT_REPLAY] task.begin index=%d/%d layer=%s",
-                        index + 1,
-                        len(resolved_tasks),
-                        getattr(task.provider, "layer_name", None),
-                    )
+            for task in resolved_tasks:
                 if task.operation == torch_npu._npu_paged_attention:
                     ws_key = _get_ws_key(task.kwargs)
                     if ws_buffer.get(ws_key) is None:
@@ -181,8 +172,6 @@ class UpdatableGraph(torch.npu.NPUGraph):
                         ws_buffer[ws_key] = workspace
                     task.kwargs["workspace"] = ws_buffer[ws_key]
                 task.apply(update_stream)
-                if trace:
-                    logger.info("[FT_REPLAY] task.submitted index=%d/%d", index + 1, len(resolved_tasks))
 
 
 def register_task(
