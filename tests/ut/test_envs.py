@@ -79,4 +79,3 @@ class TestEnvVariables(TestBase):
                     os.environ.pop(name, None)
                 else:
                     os.environ[name] = original_val
-

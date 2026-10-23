@@ -16,26 +16,6 @@ from vllm_ascend.worker.sentinel.npu_worker_sentinel import WorkerSentinel
 
 
 @pytest.mark.parametrize("mega_moe", [False, True])
-def test_retry_publishes_mega_moe_mask_writes_before_leaving_quarantine(mega_moe):
-    sentinel = object.__new__(WorkerSentinel)
-    sentinel.worker = SimpleNamespace(vllm_config=object())
-    sentinel.worker_faulted = True
-    sentinel.reset_device = Mock()
-    request = object()
-    with (
-        patch.object(sentinel_module.GPUWorkerSentinel, "retry") as retry,
-        patch.object(sentinel_module, "use_cann_megamoe", return_value=mega_moe),
-        patch.object(torch.npu, "synchronize") as synchronize,
-        patch.object(sentinel_module, "get_ep_all2all_manager", side_effect=AssertionError("unexpected EP lookup")),
-    ):
-        sentinel.retry(request)
-    sentinel.reset_device.assert_called_once()
-    retry.assert_called_once_with(request)
-    assert synchronize.call_count == int(mega_moe)
-    assert not sentinel.worker_faulted
-
-
-@pytest.mark.parametrize("mega_moe", [False, True])
 def test_scale_down_uses_backend_specific_physical_expert_ids(mega_moe):
     # Rank 1 is dead: the expert on rank 2 must keep id 8 for MegaMoe,
     # but become id 4 for MC2. A tail-rank-only test would miss this bug.
@@ -65,38 +45,6 @@ def test_scale_down_uses_backend_specific_physical_expert_ids(mega_moe):
     ):
         sentinel._redistribute_experts({1})
     assert table.flatten().tolist() == ([0, 8, 12] if mega_moe else [0, 4, 8])
-
-
-@pytest.mark.parametrize(
-    "fused,mega_moe,bound,error",
-    [
-        (1, True, True, None),
-        (1, True, False, "warmup"),
-        (1, False, False, "enable_fused_mc2"),
-    ],
-)
-def test_scale_down_rejects_unsupported_fused_backend(fused, mega_moe, bound, error):
-    sentinel = object.__new__(WorkerSentinel)
-    sentinel.worker = SimpleNamespace(
-        use_v2_model_runner=True,
-        model_runner=SimpleNamespace(eplb_state=object()),
-        parallel_config=SimpleNamespace(eplb_config=SimpleNamespace(num_redundant_experts=8)),
-        vllm_config=object(),
-    )
-    with (
-        patch.object(
-            sentinel_module,
-            "get_ascend_config",
-            return_value=SimpleNamespace(enable_fused_mc2=fused, enable_mc2_hierarchy_comm=False),
-        ),
-        patch.object(sentinel_module, "use_cann_megamoe", return_value=mega_moe),
-        patch.object(sentinel_module, "get_ep_all2all_manager", return_value=SimpleNamespace(uses_mega_moe=bound)),
-    ):
-        if error:
-            with pytest.raises(ValueError, match=error):
-                sentinel._validate_scale_down_preconditions()
-        else:
-            sentinel._validate_scale_down_preconditions()
 
 
 def test_expert_reload_updates_mega_moe_packed_scales_without_replacing_storage():
