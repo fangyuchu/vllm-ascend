@@ -204,6 +204,14 @@ class NPUPlatform(Platform):
         return torch.npu.max_memory_allocated(device)
 
     @classmethod
+    def get_elastic_ep_prepare_controller(cls, scaling_state):
+        if scaling_state.scale_type == "scale_up" and scaling_state.worker_type == "existing":
+            from vllm_ascend.distributed.elastic_ep.prepare_drain import AscendPrepareDrain
+
+            return AscendPrepareDrain(scaling_state)
+        return None
+
+    @classmethod
     def get_device_communicator_cls(cls) -> str:
         return "vllm_ascend.distributed.device_communicators.npu_communicator.NPUCommunicator"
 

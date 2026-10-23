@@ -183,5 +183,9 @@ class AscendEplbState(_eplb_state.EplbState):
         model_config: Any,
         expanded_physical_to_logical: torch.Tensor,
     ) -> None:
+        model_state = self.model_states[model_config.compute_hash()]
+        padding = model_state.physical_to_logical_map_buffer.shape[1] - expanded_physical_to_logical.shape[1]
+        if padding > 0:
+            expanded_physical_to_logical = torch.nn.functional.pad(expanded_physical_to_logical, (0, padding), value=-1)
         super().update_mapping(model_config, expanded_physical_to_logical)
-        refresh_model_routing_tables(self.model_states[model_config.compute_hash()])
+        refresh_model_routing_tables(model_state)
