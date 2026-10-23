@@ -167,6 +167,12 @@ class NPUWorker(WorkerBase):
             is_driver_worker=is_driver_worker,
         )
 
+        from vllm_ascend.distributed.elastic_ep.elastic_execute import AscendElasticEPScalingExecutor
+
+        self.elastic_ep_executor: AscendElasticEPScalingExecutor | None = None
+        if self.parallel_config.enable_elastic_ep:
+            self.elastic_ep_executor = AscendElasticEPScalingExecutor(self)
+
         if self.cache_config.cache_dtype == "auto":
             self.cache_dtype = self.model_config.dtype
         else:
@@ -380,6 +386,11 @@ class NPUWorker(WorkerBase):
 
         if weight_transfer_engine := getattr(self, "weight_transfer_engine", None):
             weight_transfer_engine.shutdown()
+
+        # Wait for the Elastic EP async group-cleanup thread before the
+        # worker (and its device context) goes away.
+        if elastic_ep_executor := getattr(self, "elastic_ep_executor", None):
+            elastic_ep_executor.shutdown()
 
         if model_runner := getattr(self, "model_runner", None):
             shutdown_fn = getattr(model_runner, "shutdown", None)
@@ -892,7 +903,7 @@ class NPUWorker(WorkerBase):
             output.__class__ = AscendAsyncOutput
         return output
 
-    def load_model(self) -> None:
+    def load_model(self, *, load_dummy_weights: bool = False) -> None:
         if self.vllm_config.model_config.enable_sleep_mode:
             allocator = CaMemAllocator.get_instance()
             assert allocator.get_current_usage() == 0, "Sleep mode can only be used for one instance per process."
@@ -903,7 +914,7 @@ class NPUWorker(WorkerBase):
             context = nullcontext()  # type: ignore
 
         with context, set_current_vllm_config(self.vllm_config):
-            self.model_runner.load_model()
+            self.model_runner.load_model(load_dummy_weights)
 
         if self.worker_sentinel is not None and self.use_v2_model_runner:
             self.worker_sentinel.init_num_local_experts()
@@ -1357,6 +1368,9 @@ class NPUWorker(WorkerBase):
         except Exception as e:
             logger.error("query NPU card %s fail: %s", self.local_rank, e)
         return
+
+    def elastic_ep_execute(self, execute_method: str, *args, **kwargs):
+        return self.elastic_ep_executor.execute(execute_method, *args, **kwargs)
 
 
 def parse_text_output(output) -> None:
