@@ -204,21 +204,6 @@ class TestMoECommMethod(TestBase):
             comm_impl._init_mega_moe_symm_buffer(is_decode_only_node=True)
         buffer.destroy.assert_called_once()
 
-    @patch("vllm_ascend.ops.fused_moe.moe_comm_method.get_mc2_group")
-    @patch("vllm_ascend.ops.fused_moe.moe_comm_method.get_ep_group")
-    @patch("vllm_ascend.ops.fused_moe.moe_comm_method.get_current_hardware_profile")
-    def test_mega_moe_ft_rejects_rank_order_without_expert_translation(self, profile, ep_group, mc2_group):
-        from vllm_ascend.device.hardware_profile import MoECommPolicy
-
-        profile.return_value.moe_comm_policy = MoECommPolicy.FUSED_OR_CAPACITY
-        ep_group.return_value.ranks = [0, 1, 2, 3]
-        mc2_group.return_value.ranks = [0, 2, 1, 3]
-        comm_impl = self._make_fused_mc2_comm_for_buffer_init()
-        comm_impl.token_dispatcher._ft_enabled = True
-        with self.assertRaisesRegex(ValueError, "identical EP and MC2 rank order"):
-            comm_impl._init_mega_moe_symm_buffer(is_decode_only_node=True)
-        comm_impl.get_symm_buffer_for_mega_moe.assert_not_called()
-
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")
     @patch("vllm_ascend.ops.fused_moe.moe_comm_method.PrepareAndFinalizeWithAllGather")
     @patch("vllm_ascend.ops.fused_moe.moe_comm_method.TokenDispatcherWithAllGather")

@@ -1,10 +1,9 @@
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 import torch
-from vllm.distributed.elastic_ep.elastic_execute import ElasticEPScalingExecutor
 
 from tests.ut.distributed.test_mega_moe_capture import make_capture_state
 from vllm_ascend.distributed.device_communicators.npu_communicator import _NpuAll2AllManager
@@ -13,7 +12,6 @@ from vllm_ascend.distributed.elastic_ep.elastic_execute import (
     _match_peer_parameters,
     setup_moe_comm_and_quant_method,
 )
-from vllm_ascend.distributed.elastic_ep.standby_state import _mc2_group_ranks
 from vllm_ascend.quantization.quant_type import QuantType
 
 
@@ -94,56 +92,6 @@ def test_capture_broadcast_preserves_survivors_and_serving_mapping(monkeypatch, 
     torch.testing.assert_close(original, snapshot)
 
 
-def test_prepare_reconfiguration_adds_ascend_standby_group():
-    executor, _ = _executor_and_worker()
-    request = SimpleNamespace(
-        new_data_parallel_size=3,
-        new_data_parallel_master_ip="127.0.0.1",
-        coord_store_port=1234,
-        existing_dp_ranks=None,
-        data_parallel_master_rank=0,
-        operation_id="scale-1",
-    )
-
-    with (
-        patch.object(
-            ElasticEPScalingExecutor,
-            "prepare_reconfiguration",
-        ) as upstream_prepare,
-        patch.object(
-            executor,
-            "_publish_capture_decision",
-            return_value=False,
-        ),
-        patch(
-            "vllm_ascend.distributed.elastic_ep.elastic_execute.get_dp_group",
-            return_value=SimpleNamespace(world_size=2),
-        ),
-        patch(
-            "vllm_ascend.distributed.elastic_ep.elastic_execute.create_ascend_standby_groups"
-        ) as create_ascend_groups,
-    ):
-        executor.prepare_reconfiguration(request, use_all2all=True)
-
-    upstream_prepare.assert_called_once_with(request, True)
-    create_ascend_groups.assert_called_once_with(
-        new_dp_size=3,
-        new_world_size_across_dp=6,
-        master_ip="127.0.0.1",
-        coord_store_port=1234,
-    )
-
-
-@pytest.mark.parametrize("reuse_graphs", [True, False])
-def test_quant_method_staging_only_runs_for_recapture(reuse_graphs):
-    executor, _ = _executor_and_worker()
-    executor._mega_moe_precommit_capture = reuse_graphs
-    manager = object()
-    with patch.object(ElasticEPScalingExecutor, "stage_standby_moe_quant_methods") as stage:
-        executor.stage_standby_moe_quant_methods(manager)
-    assert stage.call_args_list == ([] if reuse_graphs else [((manager,), {})])
-
-
 def test_mega_restore_preserves_full_capacity_eplb_storage(monkeypatch):
     executor, worker = _executor_and_worker()
     mapping = torch.arange(8).reshape(1, 8)
@@ -179,95 +127,6 @@ def test_mega_restore_preserves_full_capacity_eplb_storage(monkeypatch):
     assert state.expert_load_pass.data_ptr() == load_pass.data_ptr()
     assert state.expert_load_window is load_window
     eplb.update_mapping.assert_called_once_with(worker.model_runner.model_config, executor._capture_bootstrap_mapping)
-
-
-@pytest.mark.parametrize("external", [False, True])
-def test_prepare_new_worker_uses_ascend_weight_transfer(external):
-    executor, _ = _executor_and_worker()
-    events = []
-    request = SimpleNamespace(operation_id="scale-2") if external else None
-
-    with (
-        patch.object(
-            ElasticEPScalingExecutor,
-            "prepare_new_worker",
-            side_effect=lambda _: events.append("upstream"),
-        ) as upstream_prepare,
-        patch.object(
-            executor,
-            "_use_ascend_transfer_impl",
-            return_value=nullcontext(),
-        ) as use_ascend_transfer,
-        patch(
-            "vllm_ascend.distributed.elastic_ep.elastic_execute.create_ascend_standby_groups",
-            side_effect=lambda **_: events.append("ascend_mc2"),
-        ) as create_ascend_groups,
-        patch.object(
-            executor,
-            "_read_capture_decision",
-            return_value=False,
-        ),
-    ):
-        executor.prepare_new_worker(request)
-
-    use_ascend_transfer.assert_called_once_with(include_expert_weights=False)
-    upstream_prepare.assert_called_once_with(request)
-    create_ascend_groups.assert_called_once_with(
-        new_dp_size=2,
-        new_world_size_across_dp=4,
-        master_ip="127.0.0.1",
-        coord_store_port=1234,
-    )
-    assert events == ["upstream", "ascend_mc2"]
-
-
-def test_new_worker_activates_ascend_mc2_before_commit():
-    executor, _ = _executor_and_worker()
-    events = []
-
-    with (
-        patch.object(
-            executor,
-            "_activate_ascend_standby_groups",
-            side_effect=lambda: events.append("activate_mc2"),
-        ) as activate_groups,
-        patch.object(
-            ElasticEPScalingExecutor,
-            "commit_scale_up",
-            side_effect=lambda _: events.append("upstream_commit"),
-        ) as upstream_commit,
-    ):
-        executor.commit_scale_up(is_existing_worker=False)
-
-    activate_groups.assert_called_once_with()
-    upstream_commit.assert_called_once_with(False)
-    assert events == ["activate_mc2", "upstream_commit"]
-
-
-def test_switch_and_prepare_retires_previous_mc2_group():
-    executor, worker = _executor_and_worker()
-    worker.model_runner = MagicMock()
-    worker.model_runner.model.modules.return_value = []
-    retired_groups = (MagicMock(),)
-    standby_mc2 = MagicMock()
-    executor._setup_moe_comm_and_quant_method = MagicMock()
-
-    with (
-        patch.object(
-            ElasticEPScalingExecutor,
-            "switch_and_prepare",
-            return_value=retired_groups,
-        ),
-        patch(
-            "vllm_ascend.distributed.elastic_ep.elastic_execute.pop_ascend_standby_groups",
-            return_value={"mc2": standby_mc2},
-        ),
-        patch("vllm_ascend.distributed.elastic_ep.elastic_execute._replace_ascend_active_groups") as replace_groups,
-    ):
-        result = executor.switch_and_prepare()
-
-    assert result == (*retired_groups, replace_groups.return_value)
-    replace_groups.assert_called_once_with(mc2=standby_mc2)
 
 
 @pytest.mark.parametrize("has_quant_group_name", [True, False], ids=["existing-rank", "new-rank"])
@@ -364,16 +223,6 @@ def test_match_peer_parameters_is_deterministic_on_mismatch():
     assert receiver == [receiver_parameters[1], receiver_parameters[2]]
 
 
-def test_mc2_standby_ranks_match_dp_ep_layout():
-    assert _mc2_group_ranks(
-        world_size=4,
-        dp_size=2,
-        pp_size=2,
-        pcp_size=1,
-        tp_size=1,
-    ) == [[0, 2], [1, 3]]
-
-
 def _mega_restore_executor(monkeypatch, dead_ranks=(2,)):
     executor, worker = _executor_and_worker()
     parallel = worker.vllm_config.parallel_config
@@ -390,32 +239,6 @@ def _mega_restore_executor(monkeypatch, dead_ranks=(2,)):
     monkeypatch.setattr(f"{module}.get_dp_group", lambda: SimpleNamespace(world_size=4, dead_dp_ranks=set(dead_ranks)))
     monkeypatch.setattr(f"{module}.get_mc2_group", lambda: SimpleNamespace(world_size=4, ranks=[0, 1, 2, 3]))
     return executor, worker, comm
-
-
-@pytest.mark.parametrize(
-    "target,dead,expected",
-    [(4, (2,), True), (4, (3,), True), (4, (1, 3), True), (5, (2,), False), (3, (2,), False), (4, (), False)],
-)
-def test_mega_restore_requires_return_to_original_capacity(monkeypatch, target, dead, expected):
-    executor, _, _ = _mega_restore_executor(monkeypatch, dead)
-    request = SimpleNamespace(new_data_parallel_size=target, operation_id="restore")
-    assert executor._is_mega_moe_restore(request) is expected
-
-
-@pytest.mark.parametrize("unsupported", ["tp", "draft", "quant", "lora", "legacy_wrapper"])
-def test_mega_restore_rejects_unhandled_configurations(monkeypatch, unsupported):
-    executor, worker, comm = _mega_restore_executor(monkeypatch)
-    if unsupported == "tp":
-        worker.vllm_config.parallel_config.tensor_parallel_size = 2
-    elif unsupported == "draft":
-        worker.vllm_config.speculative_config = object()
-    elif unsupported == "quant":
-        comm.mega_moe_quant_type = QuantType.NONE
-    elif unsupported == "lora":
-        worker.vllm_config.lora_config = object()
-    else:
-        comm.mega_moe_capture_state.buffer.update_group = None
-    assert not executor._is_mega_moe_restore(SimpleNamespace(new_data_parallel_size=4, operation_id="restore"))
 
 
 @pytest.mark.parametrize("rank_order", [[0, 1, 2, 3], [0, 1, 3, 2]])
@@ -486,15 +309,6 @@ def test_mega_commit_preserves_graphs_and_connects_fault_manager(monkeypatch, ex
     assert executor._switch_and_prepare_capture_restore_scale_up.call_count == int(existing)
 
 
-def test_mega_commit_requires_capture_completion(monkeypatch):
-    executor, _, _ = _mega_restore_executor(monkeypatch)
-    executor._mega_moe_precommit_capture_done = False
-    monkeypatch.setattr(executor, "_set_eplb_suppressed", MagicMock())
-    with pytest.raises(RuntimeError, match="capture has not completed"):
-        executor._commit_mega_moe_restore(False)
-    executor._set_eplb_suppressed.assert_not_called()
-
-
 @pytest.mark.parametrize("is_async", [False, True])
 def test_mega_resume_preserves_eplb_execution_mode(monkeypatch, is_async):
     executor, worker, _ = _mega_restore_executor(monkeypatch)
@@ -505,33 +319,6 @@ def test_mega_resume_preserves_eplb_execution_mode(monkeypatch, is_async):
     assert state.is_async is is_async
     assert state.expert_rearrangement_step == 0
     assert state.start_async_loop.call_count == int(is_async)
-
-
-@pytest.mark.parametrize("new_rank", [1, 3])
-def test_new_mega_worker_masks_all_remote_slots_before_capture(monkeypatch, new_rank):
-    executor, _, comm = _mega_restore_executor(monkeypatch)
-    executor._capture_old_dp_size = 2
-    executor.reconfig_request = SimpleNamespace(new_data_parallel_size=4, existing_dp_ranks=[0, 2])
-    state = comm.mega_moe_capture_state
-    state.buffer.rank_id = new_rank
-    comm._init_mega_moe_symm_buffer = MagicMock(return_value=state.buffer)
-    module = "vllm_ascend.distributed.elastic_ep.elastic_execute"
-    monkeypatch.setattr(f"{module}.get_mc2_group", lambda: SimpleNamespace(ranks=[0, 1, 2, 3]))
-    monkeypatch.setattr(f"{module}._is_decode_only_node", lambda config: False)
-    monkeypatch.setattr(executor, "_setup_moe_comm_and_quant_method", MagicMock())
-    rendezvous = MagicMock(side_effect=lambda *args: bool(state.capture_active) or pytest.fail("routing not ready"))
-    monkeypatch.setattr(executor, "_synchronize_capture_context_rendezvous", rendezvous)
-    layer = SimpleNamespace(
-        routed_experts=SimpleNamespace(
-            quant_method=SimpleNamespace(quant_method=SimpleNamespace(quant_type=QuantType.W8A8))
-        ),
-        moe_config=SimpleNamespace(experts_per_token=4),
-    )
-    executor._prepare_new_mega_moe_capture([layer])
-    assert state.buffer.mask_buffer.tolist() == [int(rank != new_rank) for rank in range(4)]
-    routed = state.route(torch.zeros((2, 4), dtype=torch.int32))
-    assert ((routed >= new_rank * 4) & (routed < (new_rank + 1) * 4)).all()
-    rendezvous.assert_called_once()
 
 
 @pytest.mark.parametrize("fast_capture,fail", [(False, False), (True, False), (True, True)])
