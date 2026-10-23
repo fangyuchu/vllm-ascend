@@ -386,6 +386,15 @@ def _should_trans_nz(weight: torch.Tensor) -> bool:
     return True
 
 
+def transpose_weight_to_runtime(weight: torch.Tensor) -> torch.Tensor:
+    """Checkpoint ``[..., out, in]`` -> runtime ``[..., in, out]``.
+
+    Shared by the MoE load paths and the FT scale-down expert reload, which
+    feeds it single experts without the leading ``[E]`` dim.
+    """
+    return weight.transpose(-2, -1).contiguous()
+
+
 # NZ conversion policy:
 # - 310P: always convert supported weights to FRACTAL_NZ
 # - non-310P: follow additional_config.weight_nz_mode

@@ -35,10 +35,53 @@ from vllm_ascend.utils import (
     COMPRESSED_TENSORS_METHOD,
     dispose_tensor,
     maybe_trans_nz,
+    transpose_weight_to_runtime,
 )
 
 from ..base import AscendMoEScheme, QuantType
 from ..registry import register_scheme
+
+
+def scale_to_int64_bits(scale: torch.Tensor) -> torch.Tensor:
+    """Coerce to fp32 and reinterpret the 4-byte scale bits as int64, shape preserved (CPU).
+
+    Shared by load time and the FT scale-down expert reload: the runtime stores
+    per-channel scales as int64 raw bits for npu_grouped_matmul. Device
+    placement is the caller's job.
+    """
+    arr = scale.to(torch.float32).contiguous().cpu().numpy()
+    arr.dtype = np.uint32
+    return torch.from_numpy(arr.astype(np.int64))
+
+
+def reduce_scale_bias_modelslim(scale_bias: torch.Tensor) -> torch.Tensor:
+    """modelslim scale_bias: sum out the group dim, [..., out, group] -> [..., out].
+
+    Works on a whole layer ([E, out, group]) and on one expert ([out, group]),
+    so load time and the scale-down expert reload share it.
+    """
+    return scale_bias.transpose(-2, -1).contiguous().sum(-2)
+
+
+def maybe_squeeze_per_channel_weight_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Drop the per-channel group dim when it is a singleton, [..., 1, I] -> [..., I]."""
+    if scale.dim() > 1 and scale.shape[1] == 1:
+        return scale.squeeze(1)
+    return scale
+
+
+def process_scale_to_runtime(scale: torch.Tensor) -> torch.Tensor:
+    """Checkpoint [..., I, 1] -> runtime [..., 1, I] int64 scale bits (CPU).
+
+    The trailing 1 is the per-channel group dim; the transpose mirrors how the
+    weights are laid out at runtime. Device placement is the caller's job.
+    """
+    return scale_to_int64_bits(scale.transpose(-2, -1))
+
+
+def w13_scale_to_runtime(scale: torch.Tensor) -> torch.Tensor:
+    """Per-channel w13 scale -> the flat int64-bit form the runtime slots hold (CPU)."""
+    return maybe_squeeze_per_channel_weight_scale(process_scale_to_runtime(scale))
 
 
 @register_scheme("W4A8_DYNAMIC", "moe")
@@ -265,25 +308,12 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
             weights.extend([w13_scale_bias, w2_scale_bias])
         return weights
 
-    @staticmethod
-    def maybe_squeeze_per_channel_weight_scale(scale: torch.Tensor) -> torch.Tensor:
-        if scale.dim() > 1 and scale.shape[1] == 1:
-            return scale.squeeze(1)
-        return scale
-
     def _pack_to_int32(self, weight: torch.Tensor):
         # pack 4 int8(int4*2) to int32, because in pytorch, we need to use int32 to represent int4
         assert weight.shape[-1] % 4 == 0, (
             f"the last dim of weight needs to be divided by 4 but got shape {weight.shape}"
         )
         return weight.view(torch.int32).contiguous()
-
-    def _process_scale(self, scale):
-        scale = scale.transpose(1, 2).contiguous()
-        scale_np = scale.cpu().numpy()
-        scale_np.dtype = np.uint32
-        scale_uint64_tensor = torch.from_numpy(scale_np.astype(np.int64)).npu()
-        return scale_uint64_tensor
 
     def _pack_int4_to_int8(self, weight: torch.Tensor) -> torch.Tensor:
         shape = weight.shape
@@ -341,8 +371,8 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
             layer.w2_weight.data = self._pack_to_int32(layer.w2_weight.data)
 
     def process_weights_after_loading_compressed_tensors(self, layer):
-        layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
-        layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
+        layer.w13_weight.data = transpose_weight_to_runtime(layer.w13_weight.data)
+        layer.w2_weight.data = transpose_weight_to_runtime(layer.w2_weight.data)
 
         def update_bias_compressed_tensors(weight: torch.Tensor, scale: torch.Tensor):
             group_num, k, n = weight.shape
@@ -358,10 +388,9 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         w2_scale_bias = torch.nn.Parameter(w2_bias, requires_grad=False)
         layer.register_parameter("w2_scale_bias", w2_scale_bias)
 
-        layer.w13_weight_scale.data = self._process_scale(layer.w13_weight_scale.data.to(torch.float32))
-        layer.w2_weight_scale.data = self._process_scale(layer.w2_weight_scale.data.to(torch.float32))
         # To use torch_npu.npu_grouped_matmul, keep w2_weigh_scale unsqueezed
-        layer.w13_weight_scale.data = self.maybe_squeeze_per_channel_weight_scale(layer.w13_weight_scale.data)
+        layer.w13_weight_scale.data = w13_scale_to_runtime(layer.w13_weight_scale.data).npu()
+        layer.w2_weight_scale.data = process_scale_to_runtime(layer.w2_weight_scale.data).npu()
 
         # Packs 2 int4 into 1 int8 on-the-fly to mirror the modelslim path
         layer.w13_weight.data = self._pack_int4_to_int8(layer.w13_weight.data)
@@ -550,12 +579,12 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         )[0]
 
     def process_weights_after_loading_modelslim(self, layer):
-        layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
-        layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
+        layer.w13_weight.data = transpose_weight_to_runtime(layer.w13_weight.data)
+        layer.w2_weight.data = transpose_weight_to_runtime(layer.w2_weight.data)
 
-        layer.w13_weight_scale.data = self._process_scale(layer.w13_weight_scale.data)
-        layer.w2_weight_scale.data = self._process_scale(layer.w2_weight_scale.data)
+        # To use torch_npu.npu_grouped_matmul, keep w2_weigh_scale unsqueezed
+        layer.w13_weight_scale.data = w13_scale_to_runtime(layer.w13_weight_scale.data).npu()
+        layer.w2_weight_scale.data = process_scale_to_runtime(layer.w2_weight_scale.data).npu()
 
-        layer.w13_scale_bias.data = layer.w13_scale_bias.data.transpose(1, 2).contiguous().sum(axis=1)
-        layer.w2_scale_bias.data = layer.w2_scale_bias.data.transpose(1, 2).contiguous().sum(axis=1)
-        layer.w13_weight_scale.data = self.maybe_squeeze_per_channel_weight_scale(layer.w13_weight_scale.data)
+        layer.w13_scale_bias.data = reduce_scale_bias_modelslim(layer.w13_scale_bias.data)
+        layer.w2_scale_bias.data = reduce_scale_bias_modelslim(layer.w2_scale_bias.data)
