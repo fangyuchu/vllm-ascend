@@ -10,22 +10,10 @@ from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
 from vllm.distributed.utils import get_cached_tcp_store_client
 
 _STANDBY_MC2: StatelessGroupCoordinator | None = None
-_STANDBY_CAPTURE_DP: StatelessGroupCoordinator | None = None
 
 
 def get_standby_mc2_group() -> StatelessGroupCoordinator | None:
     return _STANDBY_MC2
-
-
-def get_standby_capture_dp_group() -> StatelessGroupCoordinator | None:
-    return _STANDBY_CAPTURE_DP
-
-
-def pop_standby_capture_dp_group() -> StatelessGroupCoordinator | None:
-    global _STANDBY_CAPTURE_DP
-    group = _STANDBY_CAPTURE_DP
-    _STANDBY_CAPTURE_DP = None
-    return group
 
 
 def _mc2_group_ranks(
@@ -52,14 +40,9 @@ def create_ascend_standby_groups(
     master_ip: str,
     coord_store_port: int,
     backend: str | None = None,
-    create_capture_dp: bool = False,
-    new_global_rank: int | None = None,
     mc2_rank_order: list[int] | None = None,
 ) -> None:
-    global _STANDBY_MC2, _STANDBY_CAPTURE_DP
-
-    if create_capture_dp and _STANDBY_CAPTURE_DP is not None:
-        raise RuntimeError("Elastic EP capture DP group already exists")
+    global _STANDBY_MC2
 
     assert new_world_size_across_dp == torch.distributed.get_world_size() * new_dp_size
     world_group = get_world_group()
@@ -92,32 +75,7 @@ def create_ascend_standby_groups(
         master_ip,
         backend,
         coord_store=coord_store,
-        global_rank=new_global_rank,
-        global_world_size=new_world_size_across_dp,
     )
-
-    if create_capture_dp:
-        all_ranks = torch.arange(new_world_size_across_dp).reshape(
-            -1,
-            new_dp_size,
-            pp_size,
-            pcp_size,
-            tp_size,
-        )
-        capture_dp_ranks = all_ranks.transpose(1, 4).reshape(
-            -1,
-            new_dp_size,
-        )
-        _STANDBY_CAPTURE_DP = _init_stateless_group(
-            [ranks.tolist() for ranks in capture_dp_ranks.unbind(0)],
-            "capture_dp",
-            master_ip,
-            "gloo",
-            use_device_communicator=False,
-            coord_store=coord_store,
-            global_rank=new_global_rank,
-            global_world_size=new_world_size_across_dp,
-        )
 
 
 def pop_ascend_standby_groups() -> dict:

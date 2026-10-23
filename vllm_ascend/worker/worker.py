@@ -273,11 +273,9 @@ class NPUWorker(WorkerBase):
             signal.signal(signal.SIGTERM, signal_handler)
             signal.signal(signal.SIGINT, signal_handler)
 
-    def set_elastic_ep_dp_collective_state(self, state: torch.Tensor) -> None:
-        """Expose serving DP collective progress to the EngineCore process."""
-        from vllm.v1.worker.gpu.dp_utils import configure_dp_collective_state
-
-        configure_dp_collective_state(state)
+    def get_elastic_ep_dp_collective_state(self):
+        """Share the Worker-owned progress storage before EngineCore starts serving."""
+        return self.model_runner._elastic_ep_dp_state.share()
 
     def handle_ft_command(self, ft_request):
         assert self.worker_sentinel is not None
@@ -1538,6 +1536,10 @@ class NPUWorker(WorkerBase):
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""
         init_batch_invariance()
+        if self.parallel_config.enable_elastic_ep and envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
+            from vllm_ascend.distributed.elastic_ep.readiness import publish_worker_dist_init_ready
+
+            publish_worker_dist_init_ready(self.parallel_config, self.rank)
         init_distributed_environment(
             self.parallel_config.world_size, self.rank, self.distributed_init_method, self.local_rank, "hccl"
         )

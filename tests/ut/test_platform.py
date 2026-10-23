@@ -564,7 +564,7 @@ class TestNPUPlatform(TestBase):
             vllm_config.parallel_config.eplb_config.communicator,
         )
 
-    def test_validate_eplb_config_async_rejects_elastic_ep(self):
+    def test_validate_eplb_config_async_allows_elastic_ep(self):
         vllm_config = self.mock_vllm_config()
         vllm_config.use_v2_model_runner = True
         vllm_config.parallel_config.enable_eplb = True
@@ -574,8 +574,12 @@ class TestNPUPlatform(TestBase):
             communicator=None,
         )
 
-        with patch.dict("os.environ", {}, clear=True), self.assertRaisesRegex(ValueError, "elastic EP"):
-            _validate_eplb_config(vllm_config)
+        with patch.dict("os.environ", {}, clear=True):
+            for communicator in (None, "torch_gloo", "pynccl", "nixl"):
+                with self.subTest(communicator=communicator):
+                    vllm_config.parallel_config.eplb_config.communicator = communicator
+                    _validate_eplb_config(vllm_config)
+                    self.assertEqual(vllm_config.parallel_config.eplb_config.communicator, "torch_gloo")
 
     def test_validate_eplb_config_async_rejects_nccl_communicator(self):
         vllm_config = self.mock_vllm_config()

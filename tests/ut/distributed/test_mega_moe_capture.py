@@ -27,7 +27,8 @@ def test_middle_rank_routing_and_capture_switch_preserve_storage():
     ids = torch.tensor([[0, 4, 8, 12], [3, 7, 11, 15]])
     expected = torch.tensor([[0, 4, 12, 8], [3, 7, 15, 11]], dtype=torch.int32)
     torch.testing.assert_close(state.route(ids), expected)
-    state.prepare_capture([2], topk=4)
+    state.buffer.rank_id = 2
+    state.prepare_capture(topk=4)
     addresses = (state.buffer.mask_buffer.data_ptr(), state.rank_map.data_ptr(), state.capture_active.data_ptr())
     captured = state.route(ids)
     assert state.buffer.mask_buffer.tolist() == [1, 1, 0, 1]
@@ -48,20 +49,22 @@ def test_middle_rank_routing_and_capture_switch_preserve_storage():
     assert not state.capture_active
 
 
-def test_capture_routes_to_multiple_noncontiguous_new_slots():
+@pytest.mark.parametrize("rank", [0, 1, 3])
+def test_capture_routes_only_to_local_slot(rank):
     state = make_capture_state()
-    state.prepare_capture([1, 3], topk=8)
-    ids = state.route(torch.zeros((4, 8), dtype=torch.int32))
-    assert set(ids.flatten().tolist()) == set(range(4, 8)) | set(range(12, 16))
-    assert all(row.unique().numel() == 8 for row in ids)
-    assert state.buffer.mask_buffer.tolist() == [1, 0, 1, 0]
+    state.buffer.rank_id = rank
+    state.prepare_capture(topk=4)
+    ids = state.route(torch.zeros((4, 4), dtype=torch.int32))
+    assert set(ids.flatten().tolist()) == set(range(rank * 4, (rank + 1) * 4))
+    assert all(row.unique().numel() == 4 for row in ids)
+    assert state.buffer.mask_buffer.tolist() == [int(peer != rank) for peer in range(4)]
 
 
-@pytest.mark.parametrize("active,topk", [([], 1), ([4], 1), ([1, 1], 1), ([1], 5)])
-def test_invalid_capture_topology_does_not_change_mask(active, topk):
+@pytest.mark.parametrize("topk", [0, 5])
+def test_invalid_capture_topology_does_not_change_mask(topk):
     state = make_capture_state()
-    with pytest.raises(ValueError, match="distinct experts"):
-        state.prepare_capture(active, topk)
+    with pytest.raises(ValueError, match="distinct local experts"):
+        state.prepare_capture(topk)
     assert not state.buffer.mask_buffer.any()
     assert state.capture_experts is None
 

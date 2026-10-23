@@ -1,5 +1,5 @@
-from typing import TYPE_CHECKING
 from contextlib import contextmanager
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -7,7 +7,6 @@ import vllm.envs as envs
 from torch.distributed.distributed_c10d import _world
 from vllm.config import ParallelConfig, get_current_vllm_config
 from vllm.distributed import parallel_state as vllm_parallel_state
-from vllm.distributed import get_cached_tcp_store_client
 from vllm.distributed.parallel_state import (
     GroupCoordinator,
     _init_stateless_group,
