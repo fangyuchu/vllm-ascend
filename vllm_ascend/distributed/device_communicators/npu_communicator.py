@@ -18,6 +18,9 @@
 import torch
 import torch.distributed as dist
 from vllm.distributed.device_communicators.base_device_communicator import DeviceCommunicatorBase
+from vllm.distributed.utils import StatelessProcessGroup
+
+from vllm_ascend.distributed.device_communicators.pyhccl import PyHcclCommunicator
 
 
 class _NpuAll2AllManager:
@@ -47,6 +50,16 @@ class _NpuAll2AllManager:
         if device is None:
             device = torch.device("npu", torch.npu.current_device())
         self._elastic_info = torch.zeros(size, dtype=torch.int32, device=device)
+
+    def stage_ep_size(self) -> None:
+        # Ascend stages communication groups in AscendElasticEPScalingExecutor;
+        # this mask manager has no connections to stage.
+        pass
+
+    def commit_ep_size(self) -> None:
+        # The Ascend executor switches groups and updates backend masks.
+        # Keep the upstream default no-op here to avoid changing them twice.
+        pass
 
     def update_mask(self, rank: int, masked: bool = True) -> None:
         """Mark an EP rank dead/alive and rebuild elastic_info in place."""
@@ -107,6 +120,9 @@ class NPUCommunicator(DeviceCommunicatorBase):
         device: torch.device | None = None,
         device_group: dist.ProcessGroup | None = None,
         unique_name: str = "",
+        global_ranks: list[int] | None = None,
+        global_world_size: int | None = None,
+        tcp_store_group: StatelessProcessGroup | None = None,
         use_all2all: bool = False,
     ):
         super().__init__(
@@ -114,9 +130,17 @@ class NPUCommunicator(DeviceCommunicatorBase):
             device,
             device_group,
             unique_name,
-            use_all2all=use_all2all,
+            global_ranks,
+            global_world_size,
+            use_all2all,
         )
         self.device = torch.npu.current_device()
+
+        # Create pyhccl_comm handle for batch_transfer_weights in elastic_ep
+        self.pyhccl_comm: PyHcclCommunicator | None = None
+        if self.world_size > 1 and tcp_store_group is not None:
+            self.pyhccl_comm = PyHcclCommunicator(group=tcp_store_group, device=self.device, warmup=False)
+
         self.ca_comm = None
         # vLLM #53576 reads this CUDA-only communicator during graph capture.
         # Keep the shared coordinator protocol available without enabling the
@@ -125,3 +149,15 @@ class NPUCommunicator(DeviceCommunicatorBase):
         # Only the EP group's instance is ever looked up (via the upstream
         # get_ep_all2all_manager()); the rest stay dormant.
         self.all2all_manager = _NpuAll2AllManager(dist.get_world_size(cpu_group), device)
+
+    def destroy(self):
+        if self.pyhccl_comm is not None:
+            self.pyhccl_comm.close()
+            self.pyhccl_comm = None
+
+    def batch_isend_irecv(self, p2p_ops: list):
+        pyhccl_comm = self.pyhccl_comm
+        if pyhccl_comm is not None and not pyhccl_comm.disabled:
+            pyhccl_comm.batch_isend_irecv(p2p_ops)
+        else:
+            raise ValueError("No PyHccl communicator found")

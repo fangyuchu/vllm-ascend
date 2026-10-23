@@ -4704,7 +4704,7 @@ class NPUModelRunner(GPUModelRunner):
         registry = getattr(self, "jit_warmup_registry", None)
         return registry.activate() if registry is not None else nullcontext()
 
-    def load_model(self) -> None:
+    def load_model(self, load_dummy_weights: bool = False) -> None:
         from vllm_ascend.model_executor.warmup.nz_warmup import (
             join_nz_warm_thread,
             start_nz_warm_thread,
@@ -4732,10 +4732,12 @@ class NPUModelRunner(GPUModelRunner):
                     return
                 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
                 DefaultModelLoader._init_ep_weight_filter = mock_pass
+            if load_dummy_weights:
+                self.load_config.load_format = "dummy"
             # Model construction (e.g. the DSV4.1 indexer) registers its JIT
             # warmup kernels under this window.
             with self._jit_warmup_window():
-                self.model: nn.Module = get_model(vllm_config=self.vllm_config)
+                self.model: nn.Module = get_model(vllm_config=self.vllm_config, load_config=self.load_config)
             for name, _ in self.model.named_parameters():
                 # sinks is a kind of parameter in attention
                 # only set in weight name
