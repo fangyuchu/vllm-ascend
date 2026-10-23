@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
-from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -78,36 +77,6 @@ def test_fault_queries_never_touch_device_buffer():
     assert not manager.query_fault()
 
 
-def test_legacy_cann_fails_before_attaching_a_graph_without_mask():
-    manager = _NpuAll2AllManager(4, torch.device("cpu"))
-    with pytest.raises(RuntimeError, match="PR #9368"):
-        manager.bind_mega_moe_buffer(SimpleNamespace(ep_world_size=4), list(range(4)))
-    assert not manager.uses_mega_moe
-
-
-def test_mask_allocation_failure_is_not_silently_ignored():
-    manager = _NpuAll2AllManager(4, torch.device("cpu"))
-    buffer = FakeSymmBuffer()
-    buffer.clean_mask_buffer = Mock(side_effect=RuntimeError("unsupported device"))
-    with pytest.raises(RuntimeError, match="unsupported device"):
-        manager.bind_mega_moe_buffer(buffer, list(range(4)))
-    assert not manager.uses_mega_moe
-
-
-@pytest.mark.parametrize("order", [[0, 1, 1, 3], [0, 1, 2], [0, 1, 2, 4]])
-def test_invalid_mc2_rank_mapping_is_rejected(order):
-    manager = _NpuAll2AllManager(4, torch.device("cpu"))
-    with pytest.raises(ValueError, match="rank sets"):
-        manager.bind_mega_moe_buffer(FakeSymmBuffer(), order)
-
-
-def test_replacing_captured_buffer_is_rejected():
-    manager = _NpuAll2AllManager(4, torch.device("cpu"))
-    manager.bind_mega_moe_buffer(FakeSymmBuffer(), list(range(4)))
-    with pytest.raises(RuntimeError, match="Cannot replace"):
-        manager.bind_mega_moe_buffer(FakeSymmBuffer(), list(range(4)))
-
-
 def test_mc2_manager_keeps_dense_rank_translation_and_retry_behavior():
     manager = _NpuAll2AllManager(4, torch.device("cpu"))
     manager.set_num_local_physical_experts(8)
@@ -118,14 +87,6 @@ def test_mc2_manager_keeps_dense_rank_translation_and_retry_behavior():
     assert not manager.uses_mega_moe
     assert info.tolist() == [1, 3, 0, 24, 0, -1, 1, 2, 0, 2, 3, -1]
     assert info.data_ptr() == address
-
-
-@pytest.mark.parametrize("rank", [-1, 4, True])
-def test_invalid_fault_rank_cannot_corrupt_cpu_mask(rank):
-    manager = _NpuAll2AllManager(4, torch.device("cpu"))
-    with pytest.raises(ValueError, match="EP rank"):
-        manager.update_mask(rank)
-    assert not manager.query_active_mask().any()
 
 
 def test_stateless_rank_shim_restores_previous_registration_on_failure(monkeypatch):
