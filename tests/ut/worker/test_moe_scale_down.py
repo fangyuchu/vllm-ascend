@@ -1,0 +1,81 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+import pytest
+import torch
+
+from vllm_ascend.worker.sentinel import npu_worker_sentinel as sentinel_module
+from vllm_ascend.worker.sentinel.eplb_redistribute import (
+    AscendW8A8DynamicFusedMoEMethod,
+    _reload_chunk,
+    scale_from_float_to_int64,
+)
+from vllm_ascend.worker.sentinel.npu_worker_sentinel import WorkerSentinel
+
+
+@pytest.mark.parametrize("mega_moe", [False, True])
+def test_scale_down_uses_backend_specific_physical_expert_ids(mega_moe):
+    # Rank 1 is dead: the expert on rank 2 must keep id 8 for MegaMoe,
+    # but become id 4 for MC2. A tail-rank-only test would miss this bug.
+    table = torch.tensor([[0], [8], [12]], dtype=torch.int32)
+    layer = SimpleNamespace(eplb_state=SimpleNamespace(expert_replica_routing_table=table))
+    state = SimpleNamespace(
+        physical_to_logical_map=torch.empty(1, 16),
+        logical_replica_count=torch.ones(1, 4),
+        model=SimpleNamespace(moe_layers=[layer]),
+    )
+    sentinel = object.__new__(WorkerSentinel)
+    sentinel.worker = SimpleNamespace(model_runner=SimpleNamespace(model=state.model))
+    sentinel._eplb_model_state = lambda: state
+    manager = SimpleNamespace(
+        uses_mega_moe=mega_moe,
+        query_active_mask=lambda: torch.tensor([0, 1, 0, 0]),
+        get_elastic_info=Mock(return_value=torch.zeros(12)),
+    )
+    with (
+        patch.object(sentinel_module, "mark_dead_expert_slots_inplace"),
+        patch.object(sentinel_module, "redistribute_expert_placement", return_value=[]),
+        patch.object(sentinel_module, "_commit_eplb_maps"),
+        patch.object(sentinel_module, "rebuild_model_expert_maps"),
+        patch.object(sentinel_module, "refresh_model_routing_tables"),
+        patch.object(sentinel_module, "get_ep_group", return_value=SimpleNamespace(world_size=4)),
+        patch.object(sentinel_module, "get_ep_all2all_manager", return_value=manager),
+    ):
+        sentinel._redistribute_experts({1})
+    assert table.flatten().tolist() == ([0, 8, 12] if mega_moe else [0, 4, 8])
+
+
+def test_expert_reload_updates_mega_moe_packed_scales_without_replacing_storage():
+    layer = SimpleNamespace(
+        moe_config=SimpleNamespace(moe_parallel_config=SimpleNamespace(tp_rank=0, tp_size=1)),
+        w13_weight_list=[torch.zeros(4, 6, dtype=torch.int8)],
+        w2_weight_list=[torch.zeros(3, 4, dtype=torch.int8)],
+        w13_weight_scale_fp32_list=[torch.zeros(6)],
+        w2_weight_scale_list=[torch.zeros(4)],
+        fused_w1_scale_list=[torch.zeros(6, dtype=torch.int64)],
+        fused_w2_scale_list=[torch.zeros(4, dtype=torch.int64)],
+    )
+    tensors = {
+        "gate_proj.weight": torch.full((3, 4), 2, dtype=torch.int8),
+        "up_proj.weight": torch.full((3, 4), 3, dtype=torch.int8),
+        "down_proj.weight": torch.full((4, 3), 4, dtype=torch.int8),
+        "gate_proj.weight_scale": torch.full((3,), 0.25),
+        "up_proj.weight_scale": torch.full((3,), 0.5),
+        "down_proj.weight_scale": torch.full((4,), 0.75),
+    }
+    weight_address = layer.w13_weight_list[0].data_ptr()
+    scale_address = layer.fused_w1_scale_list[0].data_ptr()
+    with (
+        patch("vllm_ascend.worker.sentinel.eplb_redistribute.torch_npu.npu_format_cast", side_effect=lambda x, _: x),
+        patch.object(torch.npu, "synchronize"),
+    ):
+        _reload_chunk(AscendW8A8DynamicFusedMoEMethod, [layer], [(0, 0)], {(0, 0): 0}, {(0, 0): tensors})
+    assert layer.w13_weight_list[0].data_ptr() == weight_address
+    assert layer.fused_w1_scale_list[0].data_ptr() == scale_address
+    assert layer.w13_weight_list[0][0].tolist() == [2, 2, 2, 3, 3, 3]
+    torch.testing.assert_close(
+        layer.fused_w1_scale_list[0], scale_from_float_to_int64(torch.tensor([0.25] * 3 + [0.5] * 3))
+    )
+    torch.testing.assert_close(layer.fused_w2_scale_list[0], scale_from_float_to_int64(torch.full((4,), 0.75)))

@@ -181,9 +181,8 @@ class ModelAclGraphManager(ModelCudaGraphManager):
 
         if use_updatable_graph(attn_backend):
             return self._updatable_graph_replay(desc, attn_metadata)
-        else:
-            # This will be removed once the refactoring is fully complete.
-            return self._graph_relay(attn_backend, desc, num_tokens, attn_metadata)
+        # This will be removed once the refactoring is fully complete.
+        return self._graph_relay(attn_backend, desc, num_tokens, attn_metadata)
 
     def _graph_relay(self, attn_backend, desc, num_tokens, attn_metadata):
         self.update_stream.wait_stream(torch.npu.current_stream())

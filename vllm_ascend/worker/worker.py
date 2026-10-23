@@ -31,6 +31,7 @@ import torch.nn as nn
 import torch_npu
 from torch_npu.op_plugin.atb._atb_ops import _register_atb_extensions
 from torch_npu.profiler import dynamic_profile as dp
+from vllm import envs
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.distributed import ensure_model_parallel_initialized, get_pcp_group, init_distributed_environment
 from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
@@ -167,6 +168,12 @@ class NPUWorker(WorkerBase):
             is_driver_worker=is_driver_worker,
         )
 
+        from vllm_ascend.distributed.elastic_ep.elastic_execute import AscendElasticEPScalingExecutor
+
+        self.elastic_ep_executor: AscendElasticEPScalingExecutor | None = None
+        if self.parallel_config.enable_elastic_ep:
+            self.elastic_ep_executor = AscendElasticEPScalingExecutor(self)
+
         if self.cache_config.cache_dtype == "auto":
             self.cache_dtype = self.model_config.dtype
         else:
@@ -215,6 +222,10 @@ class NPUWorker(WorkerBase):
 
             signal.signal(signal.SIGTERM, signal_handler)
             signal.signal(signal.SIGINT, signal_handler)
+
+    def get_elastic_ep_dp_collective_state(self):
+        """Share the Worker-owned progress storage before EngineCore starts serving."""
+        return self.model_runner._elastic_ep_dp_state.share()
 
     def handle_ft_command(self, ft_request):
         assert self.worker_sentinel is not None
@@ -381,6 +392,11 @@ class NPUWorker(WorkerBase):
         if weight_transfer_engine := getattr(self, "weight_transfer_engine", None):
             weight_transfer_engine.shutdown()
 
+        # Wait for the Elastic EP async group-cleanup thread before the
+        # worker (and its device context) goes away.
+        if elastic_ep_executor := getattr(self, "elastic_ep_executor", None):
+            elastic_ep_executor.shutdown()
+
         if model_runner := getattr(self, "model_runner", None):
             shutdown_fn = getattr(model_runner, "shutdown", None)
             if callable(shutdown_fn):
@@ -396,6 +412,12 @@ class NPUWorker(WorkerBase):
         # shift self.local_rank by dp_local_rank * tp_pp_world_size so
         # that each DP group binds to a distinct set of NPUs.
         parallel_config = self.parallel_config
+        logger.info(
+            "[FT_DIAG] NPU worker initializing: worker_rank=%s, dp_rank=%s, enable_fault_tolerance=%s",
+            self.rank,
+            parallel_config.data_parallel_rank,
+            parallel_config.enable_fault_tolerance,
+        )
         if self.parallel_config.enable_fault_tolerance:
             if self.use_v2_model_runner:
                 # Model Runner V2 + fault tolerance task queue
@@ -536,6 +558,11 @@ class NPUWorker(WorkerBase):
         self._init_worker_distributed_environment()
         if self.parallel_config.enable_fault_tolerance:
             self.worker_sentinel = WorkerSentinel(worker=self, device=device)
+            logger.info(
+                "[FT_DIAG] NPU WorkerSentinel created: worker_rank=%s, dp_rank=%s",
+                self.rank,
+                self.parallel_config.data_parallel_rank,
+            )
         # Set random seed.
         set_random_seed(self.model_config.seed)
         # Initialize device properties used by triton kernels.
@@ -892,7 +919,7 @@ class NPUWorker(WorkerBase):
             output.__class__ = AscendAsyncOutput
         return output
 
-    def load_model(self) -> None:
+    def load_model(self, *, load_dummy_weights: bool = False) -> None:
         if self.vllm_config.model_config.enable_sleep_mode:
             allocator = CaMemAllocator.get_instance()
             assert allocator.get_current_usage() == 0, "Sleep mode can only be used for one instance per process."
@@ -903,9 +930,10 @@ class NPUWorker(WorkerBase):
             context = nullcontext()  # type: ignore
 
         with context, set_current_vllm_config(self.vllm_config):
-            self.model_runner.load_model()
+            self.model_runner.load_model(load_dummy_weights)
 
-        if self.worker_sentinel is not None and self.use_v2_model_runner:
+        # Scale-up dummy loads defer EPLB and sentinel setup to the scaling executor.
+        if self.worker_sentinel is not None and self.use_v2_model_runner and not load_dummy_weights:
             self.worker_sentinel.init_num_local_experts()
 
         if self.vllm_config.weight_transfer_config is not None:
@@ -1306,6 +1334,10 @@ class NPUWorker(WorkerBase):
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""
         init_batch_invariance()
+        if self.parallel_config.enable_elastic_ep and envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
+            from vllm_ascend.distributed.elastic_ep.readiness import publish_worker_dist_init_ready
+
+            publish_worker_dist_init_ready(self.parallel_config, self.rank)
         init_distributed_environment(
             self.parallel_config.world_size, self.rank, self.distributed_init_method, self.local_rank, "hccl"
         )
@@ -1357,6 +1389,9 @@ class NPUWorker(WorkerBase):
         except Exception as e:
             logger.error("query NPU card %s fail: %s", self.local_rank, e)
         return
+
+    def elastic_ep_execute(self, execute_method: str, *args, **kwargs):
+        return self.elastic_ep_executor.execute(execute_method, *args, **kwargs)
 
 
 def parse_text_output(output) -> None:

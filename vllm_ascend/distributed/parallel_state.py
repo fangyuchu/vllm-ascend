@@ -1,11 +1,28 @@
+from contextlib import contextmanager
+
 import torch
+import torch.distributed as dist
+import vllm.envs as envs
+from torch.distributed.distributed_c10d import _world
 from vllm.config import ParallelConfig, get_current_vllm_config
-from vllm.distributed.parallel_state import GroupCoordinator, get_world_group, init_model_parallel_group
+from vllm.distributed.parallel_state import (
+    GroupCoordinator,
+    _init_stateless_group,
+    get_world_group,
+    init_model_parallel_group,
+)
+from vllm.distributed.utils import get_cached_tcp_store_client
 
 from vllm_ascend.ascend_config import get_ascend_config
 
 # Currently, mc2 op need their own group coordinator.
 _MC2: GroupCoordinator | None = None
+
+# MC2 is intentionally absent while a newly launched elastic-EP worker is
+# loading. Keep initialization state separate from the active MC2 group so the
+# remaining Ascend process groups are not initialized twice before the standby
+# MC2 group is installed during reconfiguration.
+_ASCEND_MODEL_PARALLEL_INITIALIZED = False
 
 # Module specific tensor parallel groups
 _MLP_TP: GroupCoordinator | None = None
@@ -49,18 +66,54 @@ class ReplicatedGroup:
 _REPLICATED = ReplicatedGroup()
 
 
+@contextmanager
+def register_stateless_group_rank(device_group, rank: int, world_size: int):
+    """Expose stateless ranks while CANN buffer constructors query c10d."""
+    try:
+        default_rank = dist.get_rank()
+    except Exception:
+        yield
+        return
+
+    had_mapping = device_group in _world.pg_group_ranks
+    previous_mapping = _world.pg_group_ranks.get(device_group)
+    try:
+        group_ranks = {group_rank: group_rank for group_rank in range(world_size)}
+        group_ranks[default_rank] = rank
+        _world.pg_group_ranks[device_group] = group_ranks
+        yield
+    finally:
+        if had_mapping:
+            _world.pg_group_ranks[device_group] = previous_mapping
+        else:
+            _world.pg_group_ranks.pop(device_group, None)
+
+
 def init_ascend_model_parallel(
     parallel_config: ParallelConfig,
 ):
     if model_parallel_initialized():
         return
     assert torch.distributed.is_initialized()
-    world_size = torch.distributed.get_world_size()
-    backend = torch.distributed.get_backend(get_world_group().device_group)
+    enable_elastic_ep = parallel_config.enable_elastic_ep
     global_tp_size = parallel_config.tensor_parallel_size
     global_dp_size = parallel_config.data_parallel_size
     global_pp_size = parallel_config.pipeline_parallel_size
     global_pcp_size = parallel_config.prefill_context_parallel_size
+    coord_store = None
+    if enable_elastic_ep:
+        coord_store = get_cached_tcp_store_client(
+            parallel_config.data_parallel_master_ip,
+            parallel_config._coord_store_port,
+        )
+        # Use stateless world group for global information
+        world_size = get_world_group().world_size
+        tp_pp_pcp_size = global_tp_size * global_pp_size * global_pcp_size
+        local_all_ranks = torch.arange(tp_pp_pcp_size).reshape(global_pp_size, global_pcp_size, global_tp_size)
+        backend = "hccl"
+    else:
+        world_size = torch.distributed.get_world_size()
+        backend = torch.distributed.get_backend(get_world_group().device_group)
 
     # The layout of all ranks: ExternalDP * EP
     # ExternalDP is the data parallel group that is not part of the model,
@@ -97,17 +150,21 @@ def init_ascend_model_parallel(
     if pd_head_ratio > 1 and get_current_vllm_config().kv_transfer_config.is_kv_producer:
         num_head_replica = get_ascend_config().num_head_replica
         remote_tp_size = global_tp_size // pd_tp_ratio
+        ranks_base = local_all_ranks if enable_elastic_ep else all_ranks
         if num_head_replica <= 1:
-            group_ranks = all_ranks.view(-1, prefill_tensor_model_parallel_size).unbind(0)
+            group_ranks = ranks_base.view(-1, prefill_tensor_model_parallel_size).unbind(0)
         else:
-            group_ranks = all_ranks.clone().view(
-                global_dp_size * global_pp_size * global_pcp_size, -1, num_head_replica
-            )  # [DP_size, num_head, num_head_replica]
+            reshape_dim = (
+                global_pp_size * global_pcp_size
+                if enable_elastic_ep
+                else global_dp_size * global_pp_size * global_pcp_size
+            )
+            group_ranks = ranks_base.clone().view(reshape_dim, -1, num_head_replica)
             group_ranks = group_ranks.permute(0, 2, 1)
             group_ranks = group_ranks.reshape(-1, group_ranks.size(-1))  # [DP_size * num_head_replica, num_head]
             alltoall_group_size = group_ranks.size(-1) // remote_tp_size
             group_ranks = group_ranks.unsqueeze(-1).view(
-                global_dp_size * global_pp_size * global_pcp_size,
+                reshape_dim,
                 num_head_replica,
                 -1,
                 alltoall_group_size,
@@ -129,8 +186,30 @@ def init_ascend_model_parallel(
     )
     group_ranks = [x.tolist() for x in group_ranks]
 
-    global _MC2
-    _MC2 = init_model_parallel_group(group_ranks, get_world_group().local_rank, backend, group_name="mc2")
+    global _ASCEND_MODEL_PARALLEL_INITIALIZED, _MC2
+    # The MC2 group must be stateless when elastic EP is enabled so that new
+    # ranks can join the topology dynamically during scaling.
+    if enable_elastic_ep:
+        # A scale-up worker starts before the existing workers enter the
+        # reconfiguration RPC. Creating the final MC2 group here would make the
+        # new non-root rank wait for ports that the existing root rank cannot
+        # publish yet, deadlocking worker initialization. All ranks create the
+        # standby MC2 group together in prepare_reconfiguration instead.
+        if not envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
+            _MC2 = _init_stateless_group(
+                group_ranks,
+                "mc2",
+                parallel_config.data_parallel_master_ip,
+                backend,
+                coord_store=coord_store,
+            )
+    else:
+        _MC2 = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="mc2",
+        )
 
     if get_ascend_config().eplb_config.dynamic_eplb:
         global _DYNAMIC_EPLB
@@ -179,9 +258,25 @@ def init_ascend_model_parallel(
     if mlp_tp_size > 0:
         _MLP_TP = _create_or_get_group(mlp_tp_size, "mlptp")
 
+    _ASCEND_MODEL_PARALLEL_INITIALIZED = True
+
+
+def _replace_ascend_active_groups(
+    *,
+    mc2: GroupCoordinator | None,
+) -> GroupCoordinator | None:
+    """Replace the current MC2 group and return the group it replaced.
+
+    The caller must destroy the returned MC2 group collectively.
+    """
+    global _MC2
+    retired_mc2 = _MC2
+    _MC2 = mc2
+    return retired_mc2
+
 
 def model_parallel_initialized():
-    return _MC2 is not None
+    return _ASCEND_MODEL_PARALLEL_INITIALIZED
 
 
 def get_mc2_group() -> GroupCoordinator:
@@ -234,7 +329,7 @@ def destroy_ascend_model_parallel():
         _KVPP.destroy()
     _KVPP = None
 
-    global _MC2
+    global _ASCEND_MODEL_PARALLEL_INITIALIZED, _MC2
     if _MC2:
         _MC2.destroy()
     _MC2 = None
@@ -268,6 +363,8 @@ def destroy_ascend_model_parallel():
     if _DYNAMIC_EPLB:
         _DYNAMIC_EPLB.destroy()
     _DYNAMIC_EPLB = None
+
+    _ASCEND_MODEL_PARALLEL_INITIALIZED = False
 
 
 def get_global_rank(parallel_config: ParallelConfig | None = None) -> int:

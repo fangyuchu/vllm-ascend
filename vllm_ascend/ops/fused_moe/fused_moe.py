@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
+import vllm.envs as envs
 from vllm.distributed import (
     get_dp_group,
     get_ep_group,
@@ -117,7 +118,12 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         self.moe_config.dp_group = get_dp_group()
         if self.moe_config.ep_size > 1:
             self.moe_config.ep_group = get_ep_group()
-            self.moe_config.mc2_group = get_mc2_group()
+            # A newly launched elastic-EP worker loads its dummy model before
+            # prepare_new_worker creates and activates the expanded MC2 group.
+            # Defer binding MC2 until that prepare phase; regular workers have
+            # already initialized MC2 and bind it here as usual.
+            if not envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
+                self.moe_config.mc2_group = get_mc2_group()
 
         # Internal-router: precast weight_fp32 at load to avoid hot-path Cast.
         # Use ctor `gate` (not self.is_internal_router): Module.__getattr__ shadows during init.
@@ -136,16 +142,17 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             if self._can_overlap_sp_shared_with(self.routed_input_transform):
                 self._forward_entry = torch.ops.vllm.ascend_moe_forward_shared_sp
 
-        setup_moe_comm_method(self.moe_config)
-        alltoall_comm = get_moe_comm_method(MoECommType.ALLTOALL)
-        if alltoall_comm is not None:
-            expert_ids_per_ep_rank = getattr(alltoall_comm.token_dispatcher, "expert_ids_per_ep_rank", None)
-            if expert_ids_per_ep_rank is not None:
-                self.routed_experts.register_buffer(
-                    "expert_ids_per_ep_rank",
-                    expert_ids_per_ep_rank,
-                    persistent=False,
-                )
+        if not envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
+            setup_moe_comm_method(self.moe_config)
+            alltoall_comm = get_moe_comm_method(MoECommType.ALLTOALL)
+            if alltoall_comm is not None:
+                expert_ids_per_ep_rank = getattr(alltoall_comm.token_dispatcher, "expert_ids_per_ep_rank", None)
+                if expert_ids_per_ep_rank is not None:
+                    self.routed_experts.register_buffer(
+                        "expert_ids_per_ep_rank",
+                        expert_ids_per_ep_rank,
+                        persistent=False,
+                    )
 
     def forward(
         self,

@@ -61,6 +61,11 @@ from vllm_ascend.core.profiling_chunk_predictor import (
     _finish_profiling_chunk_timing,
     _start_profiling_chunk_timing,
 )
+from vllm_ascend.distributed.elastic_ep.dp_collective import (
+    WorkerDPCollectiveState,
+    needs_worker_progress,
+    track_dp_collectives,
+)
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.utils import (
     is_pd_decode_recompute_scheduler_enabled,
@@ -107,6 +112,7 @@ class NPUModelRunner(GPUModelRunner):
         # capacity while setting up MC2 communication.
         set_potential_max_tokens(vllm_config)
         parallel_config = vllm_config.parallel_config
+        self._elastic_ep_dp_state = WorkerDPCollectiveState() if needs_worker_progress(vllm_config) else None
 
         # Only release versions need PP hidden during upstream initialization.
         spec_pp_support = resolve_spec_pp_support(vllm_config)
@@ -311,6 +317,7 @@ class NPUModelRunner(GPUModelRunner):
         self.model_state.kvpp_runtime = self.kvpp
 
     @torch.inference_mode()
+    @track_dp_collectives
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,

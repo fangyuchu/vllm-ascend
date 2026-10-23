@@ -19,12 +19,14 @@ from __future__ import annotations
 
 import math
 import os
+from datetime import timedelta
 from importlib import import_module, util
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 import torch
 import vllm.envs as envs_vllm
+from torch.distributed.distributed_c10d import PrefixStore, ProcessGroup
 from vllm.logger import logger
 from vllm.platforms import Platform, PlatformEnum
 
@@ -200,6 +202,14 @@ class NPUPlatform(Platform):
     def get_current_memory_usage(cls, device: torch.types.Device | None = None) -> float:
         torch.npu.reset_peak_memory_stats(device)
         return torch.npu.max_memory_allocated(device)
+
+    @classmethod
+    def get_elastic_ep_prepare_controller(cls, scaling_state):
+        if scaling_state.scale_type == "scale_up" and scaling_state.worker_type == "existing":
+            from vllm_ascend.distributed.elastic_ep.prepare_drain import AscendPrepareDrain
+
+            return AscendPrepareDrain(scaling_state)
+        return None
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:
@@ -547,9 +557,11 @@ class NPUPlatform(Platform):
         """
         # NOTE(Ronald1995): avoid circular import.
         from vllm_ascend.ascend_forward_context import (
+            _is_decode_only_node,
             get_mc2_mask,
             get_mrv2_in_profile_run,
             select_moe_comm_method,
+            use_cann_megamoe,
         )
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
         from vllm_ascend.quantization.utils import get_dynamic_mx_quant_scale_alg
@@ -624,6 +636,8 @@ class NPUPlatform(Platform):
         return {
             "moe_comm_type": moe_comm_type,
             "moe_comm_method": moe_comm_method,
+            "is_decode_only_node": _is_decode_only_node(vllm_config),
+            "use_mega_moe": use_cann_megamoe(vllm_config),
             "capturing": capturing,
             "mmrs_fusion": mmrs_fusion,
             "num_tokens": num_tokens,
@@ -638,6 +652,60 @@ class NPUPlatform(Platform):
             "sinks": sinks,
             "dynamic_mx_quant_scale_alg": dynamic_mx_quant_scale_alg,
         }
+
+    @classmethod
+    def stateless_init_device_torch_dist_pg(
+        cls,
+        backend: str,
+        prefix_store: PrefixStore,
+        group_rank: int,
+        group_size: int,
+        timeout: timedelta,
+    ) -> ProcessGroup:
+        """Create a stateless HCCL process group for Elastic EP."""
+        if backend != "hccl":
+            raise ValueError(f"NPU stateless process groups require HCCL, got {backend!r}.")
+
+        from torch_npu._C._distributed_c10d import ProcessGroupHCCL
+
+        process_group = ProcessGroup(prefix_store, group_rank, group_size)
+        group_store = process_group.get_group_store()
+        if group_rank == 0:
+            hccl_comm_name = uuid4().hex
+            group_store.set("hccl_comm_name", hccl_comm_name)
+        else:
+            hccl_comm_name = group_store.get("hccl_comm_name").decode("utf-8")
+
+        backend_options = ProcessGroupHCCL.Options()
+
+        backend_options.group_id = hccl_comm_name
+        backend_options._timeout = timeout
+        if hasattr(backend_options, "group_id"):
+            # ProcessGroupHCCL derives its internal HCCL group name in the
+            # constructor. Set a unique ID before construction so concurrently
+            # prepared standby DP/EP/EPLB groups do not share ``group_name_``.
+            backend_device = torch.device("npu")
+        comm_device = torch.device(f"npu:{torch.npu.current_device()}")
+        if hasattr(backend_options, "_device"):
+            # Elastic EP creates stateless groups from a background thread.
+            # Bind HCCL to the NPU already selected by this worker.
+            backend_options._device = comm_device
+
+        hccl_backend = ProcessGroupHCCL(
+            prefix_store,
+            group_rank,
+            group_size,
+            backend_options,
+        )
+
+        backend_type = ProcessGroup.BackendType.CUSTOM
+        process_group._set_default_backend(backend_type)
+        hccl_backend._set_sequence_number_for_group()
+        process_group._register_backend(backend_device, backend_type, hccl_backend)
+
+        hccl_backend._set_hccl_comm_name(hccl_comm_name)
+        process_group._set_group_desc("undefined")
+        return process_group
 
 
 def _fix_incompatible_config(vllm_config: VllmConfig) -> None:
@@ -898,7 +966,11 @@ def _validate_eplb_config(vllm_config: VllmConfig) -> None:
             raise ValueError("additional_config.eplb_config.load_collection_phase requires --enable-eplb.")
         if vllm_config.parallel_config.enable_eplb:
             upstream_eplb_config = vllm_config.parallel_config.eplb_config
-            if upstream_eplb_config.communicator not in (None, "torch_gloo"):
+            # vLLM presets "pynccl" (or "nixl" when NIXL is detected) when
+            # elastic EP is enabled; Ascend uses the torch_gloo CPU-staging
+            # communicator for both regular and elastic EP, so normalize
+            # "pynccl"/"nixl" to "torch_gloo" here.
+            if upstream_eplb_config.communicator not in (None, "torch_gloo", "pynccl", "nixl"):
                 raise ValueError(
                     "Async EPLB on Ascend requires the torch_gloo communicator "
                     f"(CPU staging), but got {upstream_eplb_config.communicator!r}. "
@@ -911,9 +983,7 @@ def _validate_eplb_config(vllm_config: VllmConfig) -> None:
                     "action: forcing asynchronous EPLB."
                 )
                 upstream_eplb_config.use_async = True
-                upstream_eplb_config.communicator = "torch_gloo"
-            if vllm_config.parallel_config.enable_elastic_ep:
-                raise ValueError("Async EPLB is not supported with elastic EP on Ascend.")
+            upstream_eplb_config.communicator = "torch_gloo"
     elif "load_collection_phase" in eplb_config:
         raise ValueError(
             "additional_config.eplb_config.load_collection_phase is only supported by "
