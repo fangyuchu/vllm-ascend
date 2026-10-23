@@ -10,7 +10,6 @@ from vllm.distributed.eplb.eplb_state import _commit_eplb_maps
 from vllm.distributed.parallel_state import (
     get_dp_group,
     get_ep_group,
-    get_pcp_group,
     get_tp_group,
 )
 from vllm.distributed.utils import set_gloo_backend_timeout
@@ -27,17 +26,9 @@ from vllm.v1.worker.sentinel.gpu_worker_sentinel import (
     WorkerSentinel as GPUWorkerSentinel,
 )
 
-import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import use_cann_megamoe
 from vllm_ascend.distributed.eplb.state import refresh_model_routing_tables
-from vllm_ascend.distributed.parallel_state import (
-    set_v3_elastic_info_from_ep,
-)
-from vllm_ascend.ops.fused_moe.moe_distribute_v3 import (
-    clean_moe_distribute_v3_buffers,
-    trace_moe_distribute_v3_contexts,
-)
 from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.worker.sentinel.eplb_redistribute import (
     build_orig_to_dense_rank_table,
@@ -100,51 +91,23 @@ class WorkerSentinel(GPUWorkerSentinel):
         # device until FT recovery rebuilds the groups.
         self.worker_faulted = False
         _sentinel = self
-        self.ft_replay_debug = envs_ascend.VLLM_ASCEND_FT_REPLAY_DEBUG
-
-    def _trace_recovery(self, stage: str) -> None:
-        if self.ft_replay_debug:
-            logger.info("[FT_REPLAY] %s", stage)
 
     def query_mask(self, ft_request: FaultToleranceRequest) -> dict:
         """Report the dead-rank mask (upstream convention: 0=live, 1=dead)."""
         return {"mask": get_ep_all2all_manager().query_active_mask().tolist()}
 
     def reset_device(self) -> None:
-        trace_moe_distribute_v3_contexts("before_reset_cached", read_device=False)
-        self._trace_recovery("reset.begin")
         NPUPlatform.set_device(self.device)
         torch_npu.npu.stop_device(self.device.index)
-        self._trace_recovery("reset.device_stopped")
         torch_npu.npu.restart_device(self.device.index)
-        self._trace_recovery("reset.device_restarted")
         torch_npu.distributed.reinit_process_group(None, False)
-        self._trace_recovery("reset.groups_reinitialized; device_sync.begin")
         torch.npu.synchronize()
-        self._trace_recovery("reset.device_sync.done")
-        trace_moe_distribute_v3_contexts("after_reset", read_device=True)
-        if self.ft_replay_debug and self.worker.use_v2_model_runner:
-            graph_manager = getattr(self.worker.model_runner, "cudagraph_manager", None)
-            if graph_manager is not None:
-                graph_manager.ft_replay_debug = self.ft_replay_debug
 
     def retry(self, ft_request: FaultToleranceRequest):
         # Reset first so hung device collectives are aborted, then run the
         # base flow and lift the quarantine after the groups are rebuilt.
         self.reset_device()
         super().retry(ft_request)
-        if envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3 and not use_cann_megamoe(self.worker.vllm_config):
-            # The rebuilt CPU groups contain only survivors. Wait until every
-            # peer has stopped old device work before clearing its CCL window,
-            # then wait for all clears before any rank replays the model.
-            groups = (get_dp_group(), get_pcp_group(), get_tp_group())
-            for group in groups:
-                if group.world_size > 1:
-                    torch.distributed.barrier(group=group.cpu_group)
-            clean_moe_distribute_v3_buffers()
-            for group in groups:
-                if group.world_size > 1:
-                    torch.distributed.barrier(group=group.cpu_group)
         if use_cann_megamoe(self.worker.vllm_config):
             # Publish buffer cleanup and mask writes before any graph replay
             # on a different stream.
@@ -168,11 +131,7 @@ class WorkerSentinel(GPUWorkerSentinel):
         and a dummy-batch runnability check on top.
         """
         self._validate_scale_down_preconditions()
-        if self.ft_replay_debug:
-            logger.info("[FT_REPLAY] scale_down.begin request_id=%s", ft_request.request_id)
         super().scale_down(ft_request)
-        trace_moe_distribute_v3_contexts("after_scale_down_mapping", read_device=True)
-        self._trace_recovery("scale_down.base_recovery.done; dummy_batch.begin")
 
         # Verify the redistributed model is runnable before reporting healthy.
         parallel_config = self.worker.parallel_config
@@ -183,9 +142,7 @@ class WorkerSentinel(GPUWorkerSentinel):
             set_gloo_backend_timeout(get_tp_group().cpu_group, timeout)
         self.worker.execute_dummy_batch()
         self.activate_cpu_group_timeouts(ft_request)
-        self._trace_recovery("scale_down.dummy_batch.returned; device_sync.begin")
         torch.npu.synchronize()
-        self._trace_recovery("scale_down.device_sync.done")
         logger.info("[FT] Ascend scale_down validation complete; worker is ready for the engine recovery vote.")
 
     def _validate_scale_down_preconditions(self) -> None:
@@ -201,7 +158,7 @@ class WorkerSentinel(GPUWorkerSentinel):
         mega_moe = use_cann_megamoe(self.worker.vllm_config)
         if mega_moe and not get_ep_all2all_manager().uses_mega_moe:
             raise ValueError("[FT] MegaMoe scale_down requires a fault-tolerance buffer initialized during warmup.")
-        if ascend_config.enable_fused_mc2 and not mega_moe and not envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3:
+        if ascend_config.enable_fused_mc2 and not mega_moe:
             raise ValueError(
                 "[FT] scale_down is not supported with enable_fused_mc2: the "
                 "fused dispatch_ffn_combine operators take no elastic_info."
@@ -210,11 +167,7 @@ class WorkerSentinel(GPUWorkerSentinel):
             raise ValueError(
                 "[FT] scale_down (elastic_info) is mutually exclusive with mc2 hierarchy comm (comm_alg='hierarchy')."
             )
-        if (
-            not mega_moe
-            and not envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3
-            and not hasattr(torch_npu, "npu_moe_distribute_dispatch_v2")
-        ):
+        if not mega_moe and not hasattr(torch_npu, "npu_moe_distribute_dispatch_v2"):
             raise ValueError(
                 "[FT] scale_down requires npu_moe_distribute_dispatch_v2 "
                 "(aclnn V3+); please upgrade the CANN/torch_npu version."
@@ -261,8 +214,6 @@ class WorkerSentinel(GPUWorkerSentinel):
         refresh_model_routing_tables(eplb_model_state)
         if not get_ep_all2all_manager().uses_mega_moe:
             self._densify_routing_tables(eplb_model_state)
-            if envs_ascend.VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3:
-                set_v3_elastic_info_from_ep(get_ep_all2all_manager().get_elastic_info())
 
     def _densify_routing_tables(self, eplb_model_state) -> None:
         """Renumber the kernel-facing routing tables into the densified id space.
