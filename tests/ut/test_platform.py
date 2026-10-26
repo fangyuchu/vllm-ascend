@@ -544,20 +544,35 @@ class TestNPUPlatform(TestBase):
         )
 
     def test_validate_eplb_config_async_allows_elastic_ep(self):
+        from vllm_ascend.patch.platform import patch_eplb
+
         vllm_config = self.mock_vllm_config()
         vllm_config.use_v2_model_runner = True
         vllm_config.parallel_config.enable_eplb = True
         vllm_config.parallel_config.enable_elastic_ep = True
-        vllm_config.parallel_config.eplb_config = MagicMock(
+        vllm_config.parallel_config.eplb_config = SimpleNamespace(
             use_async=True,
             communicator=None,
         )
+        ascend_eplb_config = SimpleNamespace(stair_config=object())
 
-        with patch.dict("os.environ", {}, clear=True):
-            for communicator in (None, "torch_gloo", "pynccl", "nixl"):
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch.object(
+                patch_eplb,
+                "_group_hixl_binding_consensus",
+                side_effect=AssertionError("Joining ranks cannot run EPLB selection collectives alone"),
+            ),
+        ):
+            for communicator in (None, "hixl", "torch_gloo", "pynccl", "nixl"):
                 with self.subTest(communicator=communicator):
                     vllm_config.parallel_config.eplb_config.communicator = communicator
+                    patch_eplb._mark_auto_selected(vllm_config.parallel_config.eplb_config)
                     _validate_eplb_config(vllm_config)
+                    self.assertIs(
+                        patch_eplb.resolve_ascend_eplb_communicator(vllm_config.parallel_config, ascend_eplb_config),
+                        ascend_eplb_config.stair_config,
+                    )
                     self.assertEqual(vllm_config.parallel_config.eplb_config.communicator, "torch_gloo")
 
     def test_validate_eplb_config_async_rejects_nccl_communicator(self):

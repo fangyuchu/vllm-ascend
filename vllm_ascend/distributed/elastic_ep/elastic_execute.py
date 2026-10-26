@@ -691,9 +691,6 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
 
     def _activate_ascend_standby_groups(self):
         retired_mc2 = _replace_ascend_active_groups(**pop_ascend_standby_groups())
-        parallel_config = self.worker.vllm_config.parallel_config
-        self.worker.model_runner.dp_size = parallel_config.data_parallel_size
-        self.worker.model_runner.dp_rank = parallel_config.data_parallel_rank
         moe_modules = [module for module in self.worker.model_runner.model.modules() if is_moe_layer(module)]
         for module in moe_modules:
             module.moe_config.tp_group = get_tp_group()
@@ -871,8 +868,6 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         parallel_config._coord_store_port = request.coord_store_port
         parallel_config._data_parallel_master_rank = request.data_parallel_master_rank
         parallel_config._eep_existing_dp_ranks = request.existing_dp_ranks
-        self.worker.model_runner.dp_size = request.new_data_parallel_size
-        self.worker.model_runner.dp_rank = parallel_config.data_parallel_rank
 
     def receive_expert_mapping(self) -> torch.Tensor:
         mapping = super().receive_expert_mapping()
