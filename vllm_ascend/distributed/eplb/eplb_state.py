@@ -281,15 +281,20 @@ class AscendEplbState(_eplb_state.EplbState):
         if rank_node_ids is not None:
             return rank_node_ids
 
-        cpu_group = get_eplb_group().cpu_group
-        num_ranks = cpu_group.size()
+        group = get_eplb_group()
+        # Stateless groups have their own rank space, independent of torch's
+        # default group. Use the store group so node discovery reads that rank.
+        node_group = getattr(group, "tcp_store_group", None)
+        if node_group is None:
+            node_group = group.cpu_group
+        num_ranks = group.cpu_group.size()
         rank_node_ids = np.full(num_ranks, -1, dtype=np.int64)
         next_node_id = 0
         for source_rank in range(num_ranks):
             if rank_node_ids[source_rank] >= 0:
                 continue
             same_node = np.asarray(
-                in_the_same_node_as(cpu_group, source_rank),
+                in_the_same_node_as(node_group, source_rank),
                 dtype=bool,
             )
             if same_node.shape != (num_ranks,) or not same_node[source_rank]:

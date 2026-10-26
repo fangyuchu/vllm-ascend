@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 import torch
 from vllm.distributed.eplb import eplb_state as upstream_eplb_state
 
@@ -188,13 +189,16 @@ def test_publish_async_load_stats_is_atomic(monkeypatch):
     state.rearrange_event.record.assert_called_once_with()
 
 
-def test_rank_node_ids_are_discovered_once(monkeypatch):
+@pytest.mark.parametrize("use_store_group", [False, True])
+def test_rank_node_ids_are_discovered_once(monkeypatch, use_store_group):
     cpu_group = MagicMock()
     cpu_group.size.return_value = 5
+    store_group = SimpleNamespace(rank=3, world_size=5) if use_store_group else None
+    node_group = store_group if use_store_group else cpu_group
     monkeypatch.setattr(
         state_module,
         "get_eplb_group",
-        lambda: SimpleNamespace(cpu_group=cpu_group),
+        lambda: SimpleNamespace(cpu_group=cpu_group, tcp_store_group=store_group),
     )
     same_node = MagicMock(
         side_effect=(
@@ -212,7 +216,7 @@ def test_rank_node_ids_are_discovered_once(monkeypatch):
     np.testing.assert_array_equal(first, [0, 1, 0, 1, 2])
     np.testing.assert_array_equal(second, first)
     assert [call.args for call in same_node.call_args_list] == [
-        (cpu_group, 0),
-        (cpu_group, 1),
-        (cpu_group, 4),
+        (node_group, 0),
+        (node_group, 1),
+        (node_group, 4),
     ]
