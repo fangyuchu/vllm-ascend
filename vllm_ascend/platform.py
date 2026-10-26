@@ -1186,7 +1186,10 @@ def _validate_eplb_config(vllm_config: VllmConfig) -> None:
                 )
                 upstream_eplb_config.use_async = True
             if vllm_config.parallel_config.enable_elastic_ep:
+                from vllm_ascend.patch.platform.patch_eplb import _clear_auto_selected
+
                 upstream_eplb_config.communicator = "torch_gloo"
+                _clear_auto_selected(upstream_eplb_config)
     elif {"load_collection_phase", "stair_config"} & eplb_config.keys():
         raise ValueError(
             "stair_config and load_collection_phase are only supported by Model Runner V2; "

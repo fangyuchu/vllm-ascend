@@ -4,6 +4,8 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from vllm.v1.engine import ReconfigureRankType
+from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 from tests.ut.distributed.test_mega_moe_capture import make_capture_state
 from vllm_ascend.distributed.device_communicators.npu_communicator import _NpuAll2AllManager
@@ -41,6 +43,43 @@ def _executor_and_worker():
     executor.worker_ref = lambda: worker
     executor.reconfig_request = None
     return executor, worker
+
+
+def test_standby_activation_and_reconfiguration_use_live_runner_dp_properties(monkeypatch):
+    executor, worker = _executor_and_worker()
+    parallel = worker.vllm_config.parallel_config
+    parallel.data_parallel_rank = 1
+    runner = object.__new__(GPUModelRunner)
+    runner.parallel_config = parallel
+    moe = SimpleNamespace(moe_config=SimpleNamespace())
+    runner.model = SimpleNamespace(modules=lambda: [moe])
+    worker.model_runner = runner
+    module = "vllm_ascend.distributed.elastic_ep.elastic_execute"
+    groups = {kind: object() for kind in ("tp", "dp", "ep", "mc2")}
+    retired = object()
+    monkeypatch.setattr(f"{module}.pop_ascend_standby_groups", lambda: {"mc2": groups["mc2"]})
+    monkeypatch.setattr(f"{module}._replace_ascend_active_groups", lambda **kwargs: retired)
+    monkeypatch.setattr(f"{module}.is_moe_layer", lambda candidate: candidate is moe)
+    for kind, group in groups.items():
+        monkeypatch.setattr(f"{module}.get_{kind}_group", lambda group=group: group)
+
+    assert executor._activate_ascend_standby_groups() is retired
+    for kind, group in groups.items():
+        assert getattr(moe.moe_config, f"{kind}_group") is group
+
+    executor.reconfig_request = SimpleNamespace(
+        new_data_parallel_size=4,
+        new_data_parallel_rank=ReconfigureRankType.KEEP_CURRENT_RANK,
+        new_data_parallel_rank_local=ReconfigureRankType.KEEP_CURRENT_RANK,
+        new_data_parallel_master_ip="127.0.0.1",
+        new_data_parallel_master_port=29500,
+        new_data_parallel_master_port_list=[],
+        coord_store_port=1234,
+        data_parallel_master_rank=1,
+        existing_dp_ranks=[1, 2, 3],
+    )
+    executor._update_parallel_config_from_request()
+    assert (runner.dp_size, runner.dp_rank) == (4, 1)
 
 
 def _capture_mapping_executor(monkeypatch, width, dead_ranks):
