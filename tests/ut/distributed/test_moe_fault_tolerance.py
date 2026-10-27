@@ -38,6 +38,7 @@ def test_mega_moe_cumulative_mask_and_retry_preserve_captured_storage(inference_
     address = buffer.mask_buffer.data_ptr()
     manager.update_mask(1)
     manager.update_mask(3)
+    manager.disconnect_ranks([1, 3])
     assert manager.query_active_mask().tolist() == [0, 1, 0, 1]
     assert buffer.mask_buffer.tolist() == [0, 0, 1, 1]
     manager.clean_buffers()
@@ -83,6 +84,7 @@ def test_mc2_manager_keeps_dense_rank_translation_and_retry_behavior():
     info = manager.get_elastic_info()
     address = info.data_ptr()
     manager.update_mask(1)
+    manager.disconnect_ranks([1])
     manager.clean_buffers()
     assert not manager.uses_mega_moe
     assert info.tolist() == [1, 3, 0, 24, 0, -1, 1, 2, 0, 2, 3, -1]
