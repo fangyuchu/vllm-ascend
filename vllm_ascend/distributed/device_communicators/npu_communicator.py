@@ -64,6 +64,10 @@ class _NpuAll2AllManager:
         # Keep the upstream default no-op here to avoid changing them twice.
         pass
 
+    def disconnect_ranks(self, ranks: list[int]) -> None:
+        """Peer connections are managed by Ascend communication-group recovery."""
+        pass
+
     @property
     def uses_mega_moe(self) -> bool:
         return self._mega_moe_buffer is not None
