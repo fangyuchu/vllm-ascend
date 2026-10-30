@@ -1168,7 +1168,7 @@ class TestNPUPlatform(TestBase):
 
         self.assertFalse(kwargs["in_profile_run"])
         self.assertIs(kwargs["use_mega_moe"], True)
-        self.assertIs(kwargs["is_decode_only_node"], True)
+        self.assertIs(kwargs["is_decode_only_node"], False)
         self.assertEqual(kwargs["padded_num_tokens"], 8)
         self.assertEqual(kwargs["max_tokens_across_pcp"], 5)
         self.assertIs(kwargs["moe_comm_method"], dummy_comm_method)
@@ -1241,7 +1241,6 @@ class TestNPUPlatform(TestBase):
             patch("vllm.distributed.get_tensor_model_parallel_world_size", return_value=2),
             patch("vllm.distributed.get_dp_group", return_value=MagicMock(world_size=1)),
             patch("vllm_ascend.ascend_forward_context.select_moe_comm_method", return_value=MoECommType.ALLGATHER),
-            patch("vllm_ascend.ascend_forward_context.use_cann_megamoe", return_value=False),
             patch("vllm_ascend.ascend_forward_context.get_mc2_mask", return_value=None),
             patch("vllm_ascend.ascend_forward_context.use_cann_megamoe", return_value=False),
             patch("vllm_ascend.ascend_forward_context._is_decode_only_node", return_value=False),

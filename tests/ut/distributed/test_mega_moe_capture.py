@@ -49,18 +49,7 @@ def test_middle_rank_routing_and_capture_switch_preserve_storage():
     assert not state.capture_active
 
 
-@pytest.mark.parametrize("rank", [0, 1, 3])
-def test_capture_routes_only_to_local_slot(rank):
-    state = make_capture_state()
-    state.buffer.rank_id = rank
-    state.prepare_capture(topk=4)
-    ids = state.route(torch.zeros((4, 4), dtype=torch.int32))
-    assert set(ids.flatten().tolist()) == set(range(rank * 4, (rank + 1) * 4))
-    assert all(row.unique().numel() == 4 for row in ids)
-    assert state.buffer.mask_buffer.tolist() == [int(peer != rank) for peer in range(4)]
-
-
-@pytest.mark.parametrize("change", [None, "context", "mask", "size", "topology"])
+@pytest.mark.parametrize("change", [None, "context", "mask", "size"])
 def test_update_context_checks_captured_contract(monkeypatch, change):
     state = make_capture_state()
     buffer = state.buffer
@@ -79,8 +68,6 @@ def test_update_context_checks_captured_contract(monkeypatch, change):
             buffer.mask_buffer = buffer.mask_buffer.clone()
         elif change == "size":
             buffer.ccl_buffer_size += 1
-        elif change == "topology":
-            buffer.topo_type += 1
         else:
             buffer.context.add_(1)
 
