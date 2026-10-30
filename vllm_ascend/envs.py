@@ -28,8 +28,6 @@ from typing import Any
 # begin-env-vars-definition
 
 
-
-
 env_variables: dict[str, Callable[[], Any]] = {
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which

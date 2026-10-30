@@ -8,9 +8,8 @@ from functools import wraps
 from multiprocessing.reduction import ForkingPickler
 
 import torch
-import torch.distributed as dist
 from vllm.distributed import get_dp_group
-from vllm.v1.worker.gpu import dp_utils
+from vllm.distributed.parallel_state import GroupCoordinator
 
 _CURRENT_STATE: ContextVar[torch.Tensor | None] = ContextVar("ascend_dp_collective_state", default=None)
 
@@ -55,28 +54,25 @@ def track_dp_collectives(execute_model):
     return wrapped
 
 
-class _ServingDPCollectives:
-    """Extend only the metadata collective issued by vLLM's DP dispatch helper."""
+_cpu_all_reduce = GroupCoordinator.cpu_all_reduce_
 
-    def __getattr__(self, name):
-        return getattr(dist, name)
 
-    def all_reduce(self, tensor, *args, **kwargs):
-        state = _CURRENT_STATE.get()
-        if state is None:
-            return dist.all_reduce(tensor, *args, **kwargs)
-        entered = int(state[0].item()) + 1
-        state[0] = entered
-        metadata = torch.cat((tensor, torch.zeros_like(tensor[:1])))
-        metadata[-1, get_dp_group().rank_in_group] = entered
-        result = dist.all_reduce(metadata, *args, **kwargs)
-        tensor.copy_(metadata[:-1])
-        completed = int(metadata[-1].max().item())
-        state[0] = completed
-        state[1] = completed
-        return result
+@wraps(_cpu_all_reduce)
+def _tracked_cpu_all_reduce(group, tensor):
+    state = _CURRENT_STATE.get()
+    if state is None or group is not get_dp_group():
+        return _cpu_all_reduce(group, tensor)
+    entered = int(state[0].item()) + 1
+    state[0] = entered
+    metadata = torch.cat((tensor, torch.zeros_like(tensor[:1])))
+    metadata[-1, group.rank_in_group] = entered
+    _cpu_all_reduce(group, metadata)
+    tensor.copy_(metadata[:-1])
+    completed = int(metadata[-1].max().item())
+    state[0] = completed
+    state[1] = completed
+    return tensor
 
 
 def install_dp_collective_tracking() -> None:
-    if not isinstance(dp_utils.dist, _ServingDPCollectives):
-        dp_utils.dist = _ServingDPCollectives()
+    GroupCoordinator.cpu_all_reduce_ = _tracked_cpu_all_reduce

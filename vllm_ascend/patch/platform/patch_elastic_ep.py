@@ -6,6 +6,7 @@
 from functools import wraps
 
 import torch
+from vllm.distributed.utils import cpu_all_reduce_
 from vllm.logger import init_logger
 from vllm.v1.engine.core import DPEngineCoreProc, EngineCore
 
@@ -98,7 +99,7 @@ def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
         dtype=torch.int32,
         device="cpu",
     )
-    torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM, group=self.dp_group)
+    cpu_all_reduce_(tensor, self.dp_group, timeout=self.vllm_config.parallel_config.cpu_distributed_timeout)
     dp_size = self.dp_group.size()
     pause_count = tensor[1].item()
     prepare_count = tensor[2].item()
