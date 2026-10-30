@@ -24,6 +24,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     filter_duplicate_safetensors_files,
 )
 
+from vllm_ascend.worker.moe_utils import unwrap_moe
 from vllm_ascend.worker.sentinel.eplb_quant_schemes import (
     _WANTED_SUFFIXES,
     _WEIGHT_ATTRS,
@@ -56,6 +57,25 @@ def build_orig_to_dense_rank_table(ep_world_size: int, dead_ranks: set[int]) -> 
     for dense_rank, orig_rank in enumerate(alive):
         table[orig_rank] = dense_rank
     return table
+
+
+def _layer_lookup_key(layer: torch.nn.Module, module_paths: dict[int, str]) -> str:
+    """Key prefix of one MoE layer's experts, relative to the reloaded model.
+
+    Expert weights are named ``<key>.<expert_id>.<proj>`` in the checkpoint,
+    where ``<key>`` is the registered path of the module owning the experts
+    (e.g. ``model.layers.3.mlp.experts``) -- the namespace the model's
+    ``hf_to_vllm_mapper`` emits. Resolving it per layer avoids guessing a
+    wrapper-wide nesting prefix; ``moe_layers`` may hold that module or its
+    ``routed_experts`` child, so fold both onto the owning module's path.
+    """
+    path = module_paths.get(id(layer))
+    if path is None:
+        raise RuntimeError(
+            f"[FT] MoE layer {type(layer).__name__} is not a module of the reloaded model; "
+            "cannot derive its checkpoint prefix."
+        )
+    return path.removesuffix(".routed_experts")
 
 
 def densify_routing_table_physical_ids(
@@ -280,6 +300,7 @@ def reload_experts_from_disk(
     if not reassignments:
         return 0
 
+    model = unwrap_moe(model)
     moe_layers = list(model.moe_layers)
     routed_layers = [getattr(layer, "routed_experts", layer) for layer in moe_layers]
     ep_rank = get_ep_group().rank_in_group
@@ -303,11 +324,16 @@ def reload_experts_from_disk(
         return 0
 
     name_mapper = _get_ckpt_name_mapper(model)
+    # Derive each wanted layer's lookup key from its registered path (the
+    # namespace hf_to_vllm_mapper emits) instead of guessing a wrapper-wide
+    # nesting prefix and rewriting every checkpoint key.
+    module_paths = {id(module): path for path, module in model.named_modules()}
 
-    # "<layer_name>.<expert_id>" -> key for O(1) matching.
+    # "<layer_key>.<expert_id>" -> key for O(1) matching.
     wanted: dict[str, dict[int, tuple[int, int]]] = {}
     for layer_idx, logical_id in local_slots:
-        wanted.setdefault(routed_layers[layer_idx].layer_name, {})[logical_id] = (layer_idx, logical_id)
+        layer_key = _layer_lookup_key(moe_layers[layer_idx], module_paths)
+        wanted.setdefault(layer_key, {})[logical_id] = (layer_idx, logical_id)
 
     expert_weights: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
     matched: set[tuple[int, int]] = set()

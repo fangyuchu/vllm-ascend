@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import re
 import typing
 from collections.abc import Callable, Iterable
 from contextlib import contextmanager
@@ -46,7 +47,13 @@ from vllm.model_executor.models.interfaces import (
     SupportsLoRA,
     SupportsPP,
 )
-from vllm.model_executor.models.utils import PPMissingLayer, is_pp_missing_parameter, make_layers, maybe_prefix
+from vllm.model_executor.models.utils import (
+    PPMissingLayer,
+    WeightsMapper,
+    is_pp_missing_parameter,
+    make_layers,
+    maybe_prefix,
+)
 
 # Upstream #56741 normalized the V4.1 model package name.
 from vllm.models.deepseek_v41.common.engram import EngramLayout
@@ -1652,6 +1659,36 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
 class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, SupportsPP, SupportsLoRA, SupportsEagle3):
     packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
     model_cls = DeepseekV41Model
+
+    # Checkpoint weights use the native DSV4.1 naming (ffn/w1/w3/w2, no
+    # "model." prefix, ".scale" quant suffixes); this mirrors the inline
+    # renames of ``_load_model_weights`` so the FT scale-down expert reload
+    # can match checkpoint keys against the runtime namespace. Based on
+    # ``AscendDeepseekV4ForCausalLM.hf_to_vllm_mapper`` plus the DSV4.1
+    # engram scale rename; keep both in sync with ``_load_model_weights``.
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_regex={
+            re.compile(r"^(?!model)"): "model.",
+            # Engram scales land on ``...engram.embed_tokens.weight_scale_inv``
+            # (after the embed. rename below), not the generic weight_scale.
+            re.compile(r"\.engram\.embed\.scale$"): ".engram.embed.weight_scale_inv",
+        },
+        orig_to_new_substr={
+            ".w1.": ".gate_proj.",
+            ".w2.": ".down_proj.",
+            ".w3.": ".up_proj.",
+            "embed.": "embed_tokens.",
+            ".attn.": ".self_attn.",
+            ".ffn.": ".mlp.",
+            ".ffn_norm.": ".post_attention_layernorm.",
+            ".attn_norm.": ".input_layernorm.",
+        },
+        orig_to_new_prefix={
+            "model.head.": "lm_head.",
+            "model.lm_head.": "lm_head.",
+        },
+        orig_to_new_suffix={".scale": ".weight_scale"},
+    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()

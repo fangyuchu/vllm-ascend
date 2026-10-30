@@ -28,6 +28,7 @@ from vllm.v1.worker.sentinel.gpu_worker_sentinel import (
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.eplb.eplb_state import refresh_model_routing_tables
 from vllm_ascend.platform import NPUPlatform
+from vllm_ascend.worker.moe_utils import unwrap_moe
 from vllm_ascend.worker.sentinel.eplb_redistribute import (
     build_orig_to_dense_rank_table,
     densify_routing_table_physical_ids,
@@ -186,6 +187,11 @@ class WorkerSentinel(GPUWorkerSentinel):
         model_runner = self.worker.model_runner
         eplb_model_state = self._eplb_model_state()
 
+        # The served object can be a multimodal wrapper (e.g.
+        # AscendDeepseekV41ForCausalLM) without moe_layers; the EPLB state is
+        # registered against the inner MoE-owning model, so the map rebuild
+        # and reload must use that same module.
+        model = unwrap_moe(model_runner.model)
         p2l = eplb_model_state.physical_to_logical_map
         num_logical = eplb_model_state.logical_replica_count.shape[1]
         ep_world_size = get_ep_group().world_size
@@ -199,7 +205,7 @@ class WorkerSentinel(GPUWorkerSentinel):
         # map is physical-id indexed, so p2l (logical ids) must not be written into it.
 
         if reassignments:
-            reload_experts_from_disk(model_runner.model, self.worker.vllm_config, reassignments)
+            reload_experts_from_disk(model, self.worker.vllm_config, reassignments)
 
         logger.info(
             "[FT] Expert redistribution: num_logical=%d, ep_world_size=%d, reassignments=%d",
