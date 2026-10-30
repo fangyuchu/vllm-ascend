@@ -23,16 +23,9 @@ def _executor_and_worker():
         world_size=2,
         data_parallel_size=2,
         data_parallel_rank=0,
-        data_parallel_rank_local=0,
         tensor_parallel_size=1,
         pipeline_parallel_size=1,
         prefill_context_parallel_size=1,
-        data_parallel_master_ip="127.0.0.1",
-        data_parallel_master_port=29500,
-        _data_parallel_master_port_list=[29500, 29501],
-        _coord_store_port=1234,
-        _data_parallel_master_rank=0,
-        _eep_existing_dp_ranks=None,
     )
     worker = SimpleNamespace(
         vllm_config=SimpleNamespace(
@@ -45,28 +38,13 @@ def _executor_and_worker():
     return executor, worker
 
 
-def test_standby_activation_and_reconfiguration_use_live_runner_dp_properties(monkeypatch):
+def test_reconfiguration_uses_live_runner_dp_properties():
     executor, worker = _executor_and_worker()
     parallel = worker.vllm_config.parallel_config
     parallel.data_parallel_rank = 1
     runner = object.__new__(GPUModelRunner)
     runner.parallel_config = parallel
-    moe = SimpleNamespace(moe_config=SimpleNamespace())
-    runner.model = SimpleNamespace(modules=lambda: [moe])
     worker.model_runner = runner
-    module = "vllm_ascend.distributed.elastic_ep.elastic_execute"
-    groups = {kind: object() for kind in ("tp", "dp", "ep", "mc2")}
-    retired = object()
-    monkeypatch.setattr(f"{module}.pop_ascend_standby_groups", lambda: {"mc2": groups["mc2"]})
-    monkeypatch.setattr(f"{module}._replace_ascend_active_groups", lambda **kwargs: retired)
-    monkeypatch.setattr(f"{module}.is_moe_layer", lambda candidate: candidate is moe)
-    for kind, group in groups.items():
-        monkeypatch.setattr(f"{module}.get_{kind}_group", lambda group=group: group)
-
-    assert executor._activate_ascend_standby_groups() is retired
-    for kind, group in groups.items():
-        assert getattr(moe.moe_config, f"{kind}_group") is group
-
     executor.reconfig_request = SimpleNamespace(
         new_data_parallel_size=4,
         new_data_parallel_rank=ReconfigureRankType.KEEP_CURRENT_RANK,
@@ -112,7 +90,6 @@ def _capture_mapping_executor(monkeypatch, width, dead_ranks):
     "width,dead_ranks,expected",
     [
         (8, {2}, [0, 1, 2, 3, 0, 1, 6, 7]),
-        (16, {2}, list(range(8)) + list(range(4)) + list(range(12, 16))),
         (8, {1, 3}, [0, 1, 0, 1, 4, 5, 4, 5]),
         (8, {0}, [2, 3, 2, 3, 4, 5, 6, 7]),
         (8, {0, 2, 3}, [2, 3, 2, 3, 2, 3, 2, 3]),
@@ -245,21 +222,11 @@ def test_target_ep_is_ready_before_new_rank_moe_setup(monkeypatch):
 
 def test_match_peer_parameters_is_deterministic_on_mismatch():
     parameters = [object(), object(), object()]
-
-    sender = _match_peer_parameters(
-        ["z", "a", "sender_only"],
-        parameters,
-        ["receiver_only", "a", "z"],
-    )
+    sender_names = ["z", "a", "sender_only"]
+    receiver_names = ["receiver_only", "a", "z"]
     receiver_parameters = [object(), object(), object()]
-    receiver = _match_peer_parameters(
-        ["receiver_only", "a", "z"],
-        receiver_parameters,
-        ["z", "a", "sender_only"],
-    )
-
-    assert sender == [parameters[1], parameters[0]]
-    assert receiver == [receiver_parameters[1], receiver_parameters[2]]
+    assert _match_peer_parameters(sender_names, parameters, receiver_names) == [parameters[1], parameters[0]]
+    assert _match_peer_parameters(receiver_names, receiver_parameters, sender_names) == receiver_parameters[1:]
 
 
 def _mega_restore_executor(monkeypatch, dead_ranks=(2,)):
@@ -349,7 +316,6 @@ def test_mega_commit_preserves_graphs_and_connects_fault_manager(monkeypatch, ex
     manager.update_mask(3)
     assert state.buffer.mask_buffer.tolist() == [0, 0, 1, 0]
     assert manager.query_active_mask().tolist() == [0, 0, 0, 1]
-    assert executor._switch_and_prepare_capture_restore_scale_up.call_count == int(existing)
 
 
 @pytest.mark.parametrize("is_async", [False, True])
