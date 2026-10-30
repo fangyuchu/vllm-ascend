@@ -229,6 +229,7 @@ def test_engram_dp_pcp_group_reuses_upstream_node_partition(monkeypatch, shared,
     monkeypatch.setattr(parallel_state, "get_ascend_config", lambda: config)
     monkeypatch.setattr(parallel_state, "init_model_parallel_group", init_group)
     topology = SimpleNamespace(
+        enable_elastic_ep=False,
         tensor_parallel_size=2,
         pipeline_parallel_size=1,
         data_parallel_size=2,

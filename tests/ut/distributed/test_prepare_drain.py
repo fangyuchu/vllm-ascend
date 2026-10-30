@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed.parallel_state import GroupCoordinator
 from vllm.v1.worker.dp_utils import skip_dp_coordination
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.dp_utils import sync_cudagraph_and_dp_padding
@@ -39,7 +40,9 @@ def test_prepare_consensus_uses_normal_dp_sync_even_before_local_prepare(monkeyp
 
     controller = None if ready is None else SimpleNamespace(draining=False, is_ready=lambda: ready, begin=MagicMock())
     engine = SimpleNamespace(
-        vllm_config=SimpleNamespace(parallel_config=SimpleNamespace(enable_elastic_ep=True)),
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(enable_elastic_ep=True, cpu_distributed_timeout=None)
+        ),
         eep_scaling_state=SimpleNamespace(prepare_controller=controller),
         step_counter=0,
         dp_sync_interval=16,
@@ -49,12 +52,12 @@ def test_prepare_consensus_uses_normal_dp_sync_even_before_local_prepare(monkeyp
         enable_fault_tolerance=False,
     )
 
-    def reduce(tensor, **kwargs):
+    def reduce(tensor, group, timeout=None):
         assert tensor.tolist() == [0, int(engine.pending_pause), int(bool(ready))]
-        assert kwargs["group"] is engine.dp_group
+        assert group is engine.dp_group
         tensor.copy_(torch.tensor(counts))
 
-    monkeypatch.setattr(patch_elastic_ep.torch.distributed, "all_reduce", reduce)
+    monkeypatch.setattr(patch_elastic_ep, "cpu_all_reduce_", reduce)
     assert patch_elastic_ep._has_global_unfinished_reqs(engine, False) is running
     assert engine.ignore_start_dp_wave is (counts[1] == 3)
     if controller is not None:
@@ -156,24 +159,30 @@ def test_serving_collective_aligns_joiner_epoch_and_preserves_failed_progress(mo
     progress = WorkerDPCollectiveState()
     runner = SimpleNamespace(_elastic_ep_dp_state=progress)
     install_dp_collective_tracking()
-    monkeypatch.setattr(dp_collective, "get_dp_group", lambda: SimpleNamespace(rank_in_group=0))
+    group = object.__new__(GroupCoordinator)
+    group.rank_in_group = 0
+    group.cpu_group = object()
+    group.cpu_timeout = None
+    monkeypatch.setattr(dp_collective, "get_dp_group", lambda: group)
 
-    def reduce(tensor, **kwargs):
-        assert tensor.shape == (7, 2)
+    def reduce(tensor, *args):
+        assert tensor.shape == (8, 2)
         assert progress.tensor.tolist() == [1, 0]
         tensor[-1, 1] = 50
 
-    monkeypatch.setattr(dp_collective.dist, "all_reduce", reduce)
+    monkeypatch.setattr("vllm.distributed.parallel_state.cpu_all_reduce_", reduce)
 
     @track_dp_collectives
     def run(self):
-        tensor = torch.zeros((6, 2), dtype=torch.int32)
-        dp_collective.dp_utils.dist.all_reduce(tensor, group=object())
+        tensor = torch.zeros((7, 2), dtype=torch.int32)
+        group.cpu_all_reduce_(tensor)
         return tensor
 
-    assert run(runner).shape == (6, 2)
+    assert run(runner).shape == (7, 2)
     assert progress.tensor.tolist() == [50, 50]
-    monkeypatch.setattr(dp_collective.dist, "all_reduce", MagicMock(side_effect=RuntimeError("collective failed")))
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.cpu_all_reduce_", MagicMock(side_effect=RuntimeError("collective failed"))
+    )
     with pytest.raises(RuntimeError, match="collective failed"):
         run(runner)
     assert progress.tensor.tolist() == [51, 50]

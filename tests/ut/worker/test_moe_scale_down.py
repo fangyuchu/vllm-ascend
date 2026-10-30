@@ -6,11 +6,13 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+from vllm_ascend.quantization.methods.w8a8.w8a8_dynamic import (
+    AscendW8A8DynamicFusedMoEMethod,
+    scale_from_float_to_int64,
+)
 from vllm_ascend.worker.sentinel import npu_worker_sentinel as sentinel_module
 from vllm_ascend.worker.sentinel.eplb_redistribute import (
-    AscendW8A8DynamicFusedMoEMethod,
-    _reload_chunk,
-    scale_from_float_to_int64,
+    _reload_local_slots,
 )
 from vllm_ascend.worker.sentinel.npu_worker_sentinel import WorkerSentinel
 
@@ -38,7 +40,6 @@ def test_scale_down_uses_backend_specific_physical_expert_ids(mega_moe):
         patch.object(sentinel_module, "mark_dead_expert_slots_inplace"),
         patch.object(sentinel_module, "redistribute_expert_placement", return_value=[]),
         patch.object(sentinel_module, "_commit_eplb_maps"),
-        patch.object(sentinel_module, "rebuild_model_expert_maps"),
         patch.object(sentinel_module, "refresh_model_routing_tables"),
         patch.object(sentinel_module, "get_ep_group", return_value=SimpleNamespace(world_size=4)),
         patch.object(sentinel_module, "get_ep_all2all_manager", return_value=manager),
@@ -49,6 +50,7 @@ def test_scale_down_uses_backend_specific_physical_expert_ids(mega_moe):
 
 def test_expert_reload_updates_mega_moe_packed_scales_without_replacing_storage():
     layer = SimpleNamespace(
+        quant_method=object.__new__(AscendW8A8DynamicFusedMoEMethod),
         moe_config=SimpleNamespace(moe_parallel_config=SimpleNamespace(tp_rank=0, tp_size=1)),
         w13_weight_list=[torch.zeros(4, 6, dtype=torch.int8)],
         w2_weight_list=[torch.zeros(3, 4, dtype=torch.int8)],
@@ -68,10 +70,10 @@ def test_expert_reload_updates_mega_moe_packed_scales_without_replacing_storage(
     weight_address = layer.w13_weight_list[0].data_ptr()
     scale_address = layer.fused_w1_scale_list[0].data_ptr()
     with (
-        patch("vllm_ascend.worker.sentinel.eplb_redistribute.torch_npu.npu_format_cast", side_effect=lambda x, _: x),
+        patch("vllm_ascend.worker.sentinel.eplb_quant_schemes.torch_npu.npu_format_cast", side_effect=lambda x, _: x),
         patch.object(torch.npu, "synchronize"),
     ):
-        _reload_chunk(AscendW8A8DynamicFusedMoEMethod, [layer], [(0, 0)], {(0, 0): 0}, {(0, 0): tensors})
+        _reload_local_slots([layer], {(0, 0): 0}, {(0, 0): tensors})
     assert layer.w13_weight_list[0].data_ptr() == weight_address
     assert layer.fused_w1_scale_list[0].data_ptr() == scale_address
     assert layer.w13_weight_list[0][0].tolist() == [2, 2, 2, 3, 3, 3]

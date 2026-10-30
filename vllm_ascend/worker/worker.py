@@ -1064,7 +1064,10 @@ class NPUWorker(WorkerBase):
             empty_cache_context = nullcontext()
 
         with context, empty_cache_context, set_current_vllm_config(self.vllm_config):
-            self.model_runner.load_model(load_dummy_weights)
+            if load_dummy_weights:
+                self.model_runner.load_model(True)
+            else:
+                self.model_runner.load_model()
 
         if getattr(self, "use_v2_model_runner", False) and has_ec_transfer():
             get_ec_transfer().start_worker_services()

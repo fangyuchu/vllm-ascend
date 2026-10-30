@@ -63,6 +63,7 @@ class TestNPUWorkerV2(TestBase):
         with patch.object(NPUWorker, "__init__", lambda self, **kwargs: None):
             worker = NPUWorker()
         worker.use_v2_model_runner = True
+        worker.worker_sentinel = None
         worker.model_runner = MagicMock()
         worker.vllm_config = MagicMock()
         worker.vllm_config.model_config.enable_sleep_mode = False
@@ -197,11 +198,13 @@ class TestNPUWorkerV2(TestBase):
 
                 worker.load_model(load_dummy_weights=load_dummy_weights)
 
-                worker.model_runner.load_model.assert_called_once_with(load_dummy_weights)
                 if load_dummy_weights:
+                    worker.model_runner.load_model.assert_called_once_with(True)
                     mock_get_manager.assert_not_called()
                     model_states["model"] = model_state
                     worker.worker_sentinel.init_num_local_experts()
+                else:
+                    worker.model_runner.load_model.assert_called_once_with()
                 mock_get_manager.return_value.set_num_local_physical_experts.assert_called_once_with(64)
 
     @patch("vllm_ascend.worker.worker.get_ascend_config")
@@ -351,6 +354,7 @@ class TestNPUWorkerV2(TestBase):
         with patch.object(NPUWorker, "__init__", lambda self, **kwargs: None):
             worker = NPUWorker()
             worker.use_v2_model_runner = True
+            worker.parallel_config = SimpleNamespace(enable_fault_tolerance=False)
 
             profiling_config = SimpleNamespace(need_timing=True)
             model_runner = MagicMock()
