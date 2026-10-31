@@ -13,7 +13,7 @@ import vllm.distributed.elastic_ep.elastic_execute as upstream_elastic_execute
 from torch.distributed import P2POp
 from vllm.compilation.wrapper import reset_compile_wrapper
 from vllm.config import set_current_vllm_config
-from vllm.distributed import get_dp_group, get_ep_group, get_tp_group, get_world_group
+from vllm.distributed import get_dp_group, get_ep_group, get_tp_group
 from vllm.distributed.elastic_ep.elastic_execute import ElasticEPScalingExecutor
 from vllm.distributed.elastic_ep.standby_state import (
     get_standby_dp_group,
@@ -289,73 +289,20 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
             reconfig_request.coord_store_port,
         )
 
-    def _synchronize_capture_mapping_setup(
-        self,
-        reconfig_request: ReconfigureDistributedRequest,
-        *,
-        is_existing_worker: bool,
-    ) -> None:
-        """Rendezvous after new ranks finish device-side EPLB mapping setup."""
+    def _synchronize_capture_mapping_setup(self, reconfig_request: ReconfigureDistributedRequest) -> None:
+        """Wait for every target rank before initializing target MC2 communication."""
+        # Fast restore requires TP=PP=PCP=1 and preserves DP identities.
+        # Old ranks arrive after draining; new ranks arrive after mapping setup.
         operation_id = reconfig_request.operation_id
-        if not operation_id:
-            raise RuntimeError("MegaMoe mapping synchronization requires operation_id")
-
-        old_dp_size = getattr(self, "_capture_old_dp_size", None)
-        if old_dp_size is None:
-            raise RuntimeError("MegaMoe mapping synchronization requires old_dp_size")
-
-        parallel_config = self.worker.vllm_config.parallel_config
-        world_size_per_dp = parallel_config.world_size
-        old_world_size = old_dp_size * world_size_per_dp
-        new_world_size = reconfig_request.new_data_parallel_size * world_size_per_dp
-        existing, new = self.scale_up_members(old_dp_size, reconfig_request.new_data_parallel_size)
-        old_workers = [rank * world_size_per_dp + offset for rank in existing for offset in range(world_size_per_dp)]
-        new_workers = [rank * world_size_per_dp + offset for rank in new for offset in range(world_size_per_dp)]
-        ready_keys = [self._capture_key(operation_id, f"mapping/ready/{rank}") for rank in new_workers]
-        ack_keys = [self._capture_key(operation_id, f"mapping/ack/{rank}") for rank in old_workers]
-        worker_global_rank = get_world_group().rank
+        rank = self.worker.vllm_config.parallel_config.data_parallel_rank
         store = self._capture_store(reconfig_request)
-
-        if is_existing_worker:
-            if worker_global_rank not in old_workers:
-                raise RuntimeError(
-                    "Existing MegaMoe worker rank is outside the old world: "
-                    f"rank={worker_global_rank}, old_world_size={old_world_size}"
-                )
-            # Do not enter target HCCL initialization while any new rank is
-            # still issuing device-side EPLB mapping allocations.
-            store.wait(ready_keys)
-            store.set(
-                self._capture_key(
-                    operation_id,
-                    f"mapping/ack/{worker_global_rank}",
-                ),
-                b"1",
-            )
-        else:
-            if worker_global_rank not in new_workers:
-                raise RuntimeError(
-                    "New MegaMoe worker rank is inside the old world: "
-                    f"rank={worker_global_rank}, old_world_size={old_world_size}"
-                )
-            store.set(
-                self._capture_key(
-                    operation_id,
-                    f"mapping/ready/{worker_global_rank}",
-                ),
-                b"1",
-            )
-
-        # Every target rank enters MC2 creation only after every old Worker
-        # acknowledged that all new-rank mappings are ready.
-        store.wait(ack_keys)
-        logger.info(
-            "[Elastic EP] MegaMoe mapping rendezvous completed: role=%s, rank=%s, old_world_size=%s, new_world_size=%s",
-            "existing" if is_existing_worker else "new",
-            worker_global_rank,
-            old_world_size,
-            new_world_size,
-        )
+        ready_keys = [
+            self._capture_key(operation_id, f"mapping/ready/{rank}")
+            for rank in range(reconfig_request.new_data_parallel_size)
+        ]
+        store.set(self._capture_key(operation_id, f"mapping/ready/{rank}"), b"1")
+        store.wait(ready_keys)
+        logger.info("[Elastic EP] MegaMoe mapping rendezvous completed: rank=%s", rank)
 
     def _publish_capture_decision(
         self,
@@ -366,17 +313,6 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         self._capture_bootstrap_mapping = None
         enabled = self._mega_moe_precommit_capture
         store = self._capture_store(reconfig_request)
-        store.set(
-            self._capture_key(reconfig_request.operation_id, "backend"),
-            b"mega_moe",
-        )
-        if enabled:
-            # Replacement ranks occupy the original physical slots.
-            self._capture_mc2_rank_order = list(get_mc2_group().ranks)
-            store.set(
-                self._capture_key(reconfig_request.operation_id, "mc2_rank_order"),
-                ",".join(map(str, self._capture_mc2_rank_order)).encode(),
-            )
         store.set(
             self._capture_key(reconfig_request.operation_id, "enabled"),
             b"1" if enabled else b"0",
@@ -397,17 +333,8 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
             return False
         store = self._capture_store(reconfig_request)
         enabled = store.get(self._capture_key(reconfig_request.operation_id, "enabled")) == b"1"
-        self._mega_moe_precommit_capture = enabled and (
-            store.get(self._capture_key(reconfig_request.operation_id, "backend")) == b"mega_moe"
-        )
+        self._mega_moe_precommit_capture = enabled
         self._mega_moe_precommit_capture_done = False
-        if enabled:
-            self._capture_mc2_rank_order = [
-                int(rank)
-                for rank in store.get(self._capture_key(reconfig_request.operation_id, "mc2_rank_order"))
-                .decode()
-                .split(",")
-            ]
         self._capture_old_dp_size = int(
             store.get(
                 self._capture_key(
@@ -627,10 +554,7 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         # ranks. This broadcast must not overlap the active serving
         # metadata all-reduce on only a subset of old ranks.
         self.broadcast_expert_mapping()
-        self._synchronize_capture_mapping_setup(
-            reconfig_request,
-            is_existing_worker=True,
-        )
+        self._synchronize_capture_mapping_setup(reconfig_request)
         create_ascend_standby_groups(
             new_dp_size=reconfig_request.new_data_parallel_size,
             new_world_size_across_dp=(
@@ -638,7 +562,6 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
             ),
             master_ip=reconfig_request.new_data_parallel_master_ip,
             coord_store_port=reconfig_request.coord_store_port,
-            mc2_rank_order=self._capture_mc2_rank_order,
         )
         # Lazy HCCL construction and MegaMoe context update are both
         # target-group collectives. Keep them in the same drained phase so
@@ -647,7 +570,6 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         group = get_standby_mc2_group()
         comm = self._mega_moe_comm()
         comm.mega_moe_capture_state.update_context(group)
-        # The MC2 permutation keeps survivors in their captured physical slots.
         self._synchronize_capture_context_rendezvous(group, "existing MegaMoe")
 
     def transfer_weights(self, old_dp_size: int, new_dp_size: int) -> None:
@@ -744,16 +666,7 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
 
         model_config = model_runner.model_config
         model_state = eplb_state.model_states[model_config.compute_hash()]
-        physical_to_logical = model_state.physical_to_logical_map
-        current_num_physical_experts = physical_to_logical.shape[1]
-        if current_num_physical_experts > num_physical_experts:
-            raise RuntimeError(
-                "MegaMoe restore target is smaller than the active expert map: "
-                f"current={current_num_physical_experts}, "
-                f"target={num_physical_experts}"
-            )
-        model_state.physical_to_logical_map = model_state.physical_to_logical_map_buffer[:, :num_physical_experts]
-
+        assert model_state.physical_to_logical_map.shape[1] == num_physical_experts
         bootstrap_mapping = getattr(self, "_capture_bootstrap_mapping", None)
         if bootstrap_mapping is None:
             raise RuntimeError("MegaMoe scale-up cannot commit without a bootstrap expert mapping")
@@ -767,26 +680,13 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         # MegaMoe FT preserves the full physical width, including load history.
         # Restoring the same topology requires no storage expansion.
         assert model_state.expert_load_window.shape[-1] == num_physical_experts
-        model_state.expert_load_pass = model_state.expert_load_pass_buffer[:, :num_physical_experts]
+        assert model_state.expert_load_pass.shape[1] == num_physical_experts
 
         num_logical_experts = model_state.logical_replica_count.shape[1]
         parallel_config = self.worker.vllm_config.parallel_config
         parallel_config.eplb_config.num_redundant_experts = num_physical_experts - num_logical_experts
-        model.expert_weights = []
-        with set_current_vllm_config(self.worker.vllm_config):
-            model.set_eplb_state(
-                model_state.expert_load_pass_buffer,
-                model_state.logical_to_physical_map,
-                model_state.logical_replica_count,
-            )
-            eplb_state._propagate_shared_tensors(
-                model,
-                model_state.num_unpadded_tokens_tensors,
-            )
-            model.update_physical_experts_metadata(
-                num_physical_experts=num_physical_experts,
-                num_local_physical_experts=num_local_experts,
-            )
+        # FT preserves capacity, weight storage and layer-state bindings.
+        # Install the restored placement without re-registering those objects.
 
         # The new ranks received exact copies of their source ranks' expert
         # tensors during background preparation. Commit the matching mapping
@@ -805,11 +705,10 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         logger.info(
             "[Elastic EP] Restored MegaMoe model state without graph recapture: "
             "ep_size=%s, local_physical_experts=%s, "
-            "physical_experts=%s, previously_active_experts=%s",
+            "physical_experts=%s",
             target_ep_size,
             num_local_experts,
             num_physical_experts,
-            current_num_physical_experts,
         )
 
     def _switch_and_prepare_capture_restore_scale_up(self):
@@ -912,8 +811,7 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
             )
             return
 
-        if reconfig_request is None:
-            raise RuntimeError("MegaMoe pre-commit capture requires a reconfiguration request")
+        assert reconfig_request is not None
 
         # Receive the mapping without installing MoE communication methods yet:
         # get_hccl_comm_name must not run until every target MC2 rank enters the
@@ -923,10 +821,7 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         self._set_eplb_suppressed(True)
         self._capture_eplb_suppression_operation_id = reconfig_request.operation_id
 
-        self._synchronize_capture_mapping_setup(
-            reconfig_request,
-            is_existing_worker=False,
-        )
+        self._synchronize_capture_mapping_setup(reconfig_request)
 
         # New ranks install the final-size group early so graph capture can use
         # it before commit. The mapping rendezvous above ensures all target
@@ -936,7 +831,6 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
             new_world_size_across_dp=(parallel_config.world_size * parallel_config.data_parallel_size),
             master_ip=parallel_config.data_parallel_master_ip,
             coord_store_port=parallel_config._coord_store_port,
-            mc2_rank_order=self._capture_mc2_rank_order,
         )
         self._activate_ascend_standby_groups()
 
@@ -950,16 +844,11 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
 
     def warmup_new_worker(self) -> None:
         if not getattr(self, "_mega_moe_precommit_capture", False):
-            self.warmup_local_kernels()
             return
         # Remote ranks stay masked while new ranks capture without serving DP sync.
         with skip_dp_coordination():
-            self.warmup_local_kernels()
             self.warm_and_capture()
         self._mega_moe_precommit_capture_done = True
-
-    def warmup_local_kernels(self) -> None:
-        pass
 
     def _prepare_new_mega_moe_capture(self, moe_modules: list[nn.Module]) -> None:
         self._setup_moe_comm_and_quant_method()

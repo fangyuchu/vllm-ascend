@@ -40,7 +40,6 @@ def create_ascend_standby_groups(
     master_ip: str,
     coord_store_port: int,
     backend: str | None = None,
-    mc2_rank_order: list[int] | None = None,
 ) -> None:
     global _STANDBY_MC2
 
@@ -62,11 +61,6 @@ def create_ascend_standby_groups(
         pcp_size,
         tp_size,
     )
-    if mc2_rank_order is not None:
-        if sorted(mc2_rank_order) != list(range(new_world_size_across_dp)):
-            raise ValueError("MC2 rank order must cover the target world exactly")
-        standby_mc2_ranks = [[mc2_rank_order[rank] for rank in ranks] for ranks in standby_mc2_ranks]
-
     # The standby MC2 group is always stateless: it is only built for elastic
     # EP scaling, so new ranks must be able to join the topology dynamically.
     _STANDBY_MC2 = _init_stateless_group(

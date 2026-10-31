@@ -1,4 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -139,10 +141,14 @@ def test_mega_restore_preserves_full_capacity_eplb_storage(monkeypatch):
 
     executor._restore_capture_scale_up_model_state(4)
 
-    assert state.physical_to_logical_map.data_ptr() == mapping.data_ptr()
-    assert state.expert_load_pass.data_ptr() == load_pass.data_ptr()
+    assert state.physical_to_logical_map is mapping
+    assert state.expert_load_pass is load_pass
     assert state.expert_load_window is load_window
+    model.set_eplb_state.assert_not_called()
+    model.update_physical_experts_metadata.assert_not_called()
+    eplb._propagate_shared_tensors.assert_not_called()
     eplb.update_mapping.assert_called_once_with(worker.model_runner.model_config, executor._capture_bootstrap_mapping)
+    eplb.update_communicator.assert_called_once()
 
 
 @pytest.mark.parametrize("has_quant_group_name", [True, False], ids=["existing-rank", "new-rank"])
@@ -251,26 +257,44 @@ def _mega_restore_executor(monkeypatch, dead_ranks=(2,)):
     return executor, worker, comm
 
 
-@pytest.mark.parametrize("rank_order", [[0, 1, 2, 3], [0, 1, 3, 2]])
-def test_mega_middle_restore_exchanges_backend_and_preserves_mc2_slots(monkeypatch, rank_order):
+def test_mega_middle_restore_exchanges_capture_decision(monkeypatch):
     executor, _, _ = _mega_restore_executor(monkeypatch)
-    monkeypatch.setattr(
-        "vllm_ascend.distributed.elastic_ep.elastic_execute.get_mc2_group",
-        lambda: SimpleNamespace(world_size=4, ranks=rank_order),
-    )
     values = {}
     store = SimpleNamespace(set=values.__setitem__, get=values.__getitem__)
     monkeypatch.setattr(executor, "_capture_store", lambda request: store)
     request = SimpleNamespace(new_data_parallel_size=4, operation_id="mega-restore")
     assert executor._publish_capture_decision(request, old_dp_size=3)
     assert executor._mega_moe_precommit_capture
-    assert executor._capture_mc2_rank_order == rank_order
     new_executor, _ = _executor_and_worker()
     monkeypatch.setattr(new_executor, "_capture_store", lambda request: store)
     assert new_executor._read_capture_decision(request)
     assert new_executor._mega_moe_precommit_capture
     assert new_executor._capture_old_dp_size == 3
-    assert new_executor._capture_mc2_rank_order == rank_order
+
+
+@pytest.mark.parametrize("last_rank", [0, 1], ids=["late-survivor", "late-joiner"])
+def test_mapping_rendezvous_waits_for_all_ranks_in_current_operation(monkeypatch, last_rank):
+    store = torch.distributed.HashStore()
+    store.set_timeout(timedelta(seconds=5))
+    key = AscendElasticEPScalingExecutor._capture_key
+    for rank in range(4):
+        store.set(key("previous", f"mapping/ready/{rank}"), b"1")
+    request = SimpleNamespace(operation_id="current", new_data_parallel_size=4)
+    monkeypatch.setattr(AscendElasticEPScalingExecutor, "_capture_store", staticmethod(lambda _: store))
+
+    def arrive(rank):
+        executor, worker = _executor_and_worker()
+        worker.vllm_config.parallel_config.data_parallel_rank = rank
+        executor._synchronize_capture_mapping_setup(request)
+
+    early_ranks = [rank for rank in range(4) if rank != last_rank]
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [pool.submit(arrive, rank) for rank in early_ranks]
+        store.wait([key("current", f"mapping/ready/{rank}") for rank in early_ranks])
+        assert all(not future.done() for future in futures)
+        arrive(last_rank)
+        for future in futures:
+            future.result(timeout=5)
 
 
 @pytest.mark.parametrize("existing", [True, False])
@@ -340,10 +364,6 @@ def test_new_rank_capture_skips_dp_only_within_warmup(monkeypatch, fast_capture,
     executor._mega_moe_precommit_capture_done = False
     calls = []
 
-    def warmup():
-        assert should_skip_dp_coordination() is fast_capture
-        calls.append("warmup")
-
     def capture():
         assert should_skip_dp_coordination()
         assert comm.mega_moe_capture_state.buffer.mask_buffer.tolist() == [0, 1, 1, 1]
@@ -351,11 +371,10 @@ def test_new_rank_capture_skips_dp_only_within_warmup(monkeypatch, fast_capture,
         if fail:
             raise RuntimeError("capture failed")
 
-    monkeypatch.setattr(executor, "warmup_local_kernels", warmup)
     monkeypatch.setattr(executor, "warm_and_capture", capture)
     with pytest.raises(RuntimeError, match="capture failed") if fail else nullcontext():
         executor.warmup_new_worker()
-    assert calls == (["warmup", "capture"] if fast_capture else ["warmup"])
+    assert calls == (["capture"] if fast_capture else [])
     assert not should_skip_dp_coordination()
     assert executor._mega_moe_precommit_capture_done is (fast_capture and not fail)
     # Restore remote peers only at coordinated commit, never when capture ends.
