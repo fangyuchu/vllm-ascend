@@ -52,6 +52,16 @@ _WANTED_SUFFIXES = frozenset(
     + (_W2_WEIGHT_SUFFIX, _W2_SCALE_SUFFIX, _W2_SCALE_BIAS_SUFFIX)
 )
 
+# Drafter checkpoints name projections w1/w3/w2; derive the map from
+# ``_WANTED_SUFFIXES`` so new tensor kinds (e.g. W4A8 scale_bias) are covered.
+_DRAFTER_PROJ_ALIASES = {"w1": "gate_proj", "w3": "up_proj", "w2": "down_proj"}
+_TENSOR_SUFFIXES = tuple(sorted({name.split(".", 1)[1] for name in _WANTED_SUFFIXES}))
+DRAFTER_SUFFIX_MAP = {
+    f"{alias}.{suffix}": f"{proj}.{suffix}"
+    for alias, proj in _DRAFTER_PROJ_ALIASES.items()
+    for suffix in _TENSOR_SUFFIXES
+}
+
 
 def _shard_row(t: torch.Tensor, tp_rank: int, tp_size: int) -> torch.Tensor:
     """Take this TP rank's row shard (dim 0) of a full checkpoint tensor."""

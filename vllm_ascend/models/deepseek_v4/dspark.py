@@ -45,6 +45,7 @@ from vllm.platforms import current_platform
 from vllm_ascend.attention.dsa_v1 import AscendDSAImpl, OProjBufferPool
 from vllm_ascend.models.common.ops.sequence_parallel import sp_padding_mask, sp_shard
 from vllm_ascend.models.deepseek_v4.model import (
+    AscendDeepseekV4ForCausalLM,
     DeepseekV2MixtureOfExperts,
     DeepseekV4DecoderLayer,
     DeepseekV4MoE,
@@ -130,7 +131,9 @@ class DeepseekV4DSparkModel(nn.Module):
             {
                 str(self.mtp_start_layer_idx + idx): DeepseekV4DecoderLayer(
                     vllm_config,
-                    prefix=f"mtp.{idx}",
+                    # Keep the parent prefix: quant description and FT reload
+                    # keys use the mapper's "model.mtp.N" namespace.
+                    prefix=maybe_prefix(prefix, f"mtp.{idx}"),
                     is_draft_layer=True,
                 )
                 for idx in range(self.num_dspark_layers)
@@ -146,6 +149,8 @@ class DeepseekV4DSparkModel(nn.Module):
 
         first_layer = self.layers[str(self.mtp_start_layer_idx)]
         self.use_sequence_parallel_moe = first_layer.use_sequence_parallel_moe
+        # Cover the redundant slots the draft MoE allocates (upstream #57549).
+        self.num_redundant_experts = first_layer.mlp.n_redundant_experts
 
         # Stack the WKV projections from all DSpark layers into one linear.
         #
@@ -153,14 +158,15 @@ class DeepseekV4DSparkModel(nn.Module):
         # ModelSlim chooses the quantization method according to the linear prefix.
         # context_wkv_proj is a synthetic runtime module and does not exist in the
         # checkpoint quantization description, so reuse the first DSpark WKV prefix
-        # when selecting its quantization scheme.
+        # when selecting its quantization scheme. The description keys on the
+        # mapped "model.mtp.N" namespace.
         self.context_wkv_proj = MergedColumnParallelLinear(
             config.hidden_size,
             [config.head_dim] * self.num_dspark_layers,
             bias=False,
             return_bias=False,
             quant_config=vllm_config.quant_config,
-            prefix="mtp.0.self_attn.wkv",
+            prefix=maybe_prefix(prefix, "mtp.0.self_attn.wkv"),
             disable_tp=True,
         )
 
@@ -393,13 +399,16 @@ class DeepseekV4DSparkModel(nn.Module):
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts,
-            num_redundant_experts=0,
+            num_redundant_experts=self.num_redundant_experts,
         )
 
 
 @support_torch_compile
 class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV2MixtureOfExperts, SupportsEagle3):
     draft_id_to_target_id = None
+    # Shares the target's mapper: quant description and FT reload both key on
+    # the mapped namespace. Reuse the instance so the two cannot drift.
+    hf_to_vllm_mapper = AscendDeepseekV4ForCausalLM.hf_to_vllm_mapper
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -441,6 +450,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV2MixtureOfExperts, Support
                 self.moe_layers.append(layer.mlp.experts)
 
         self.extract_moe_parameters(example_moe)
+        # EPLB identifies a MoE model via num_moe_layers > 0
+        self.num_moe_layers = len(self.moe_layers)
 
     def forward(
         self,
