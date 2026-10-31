@@ -214,11 +214,7 @@ class NPUCommunicator(DeviceCommunicatorBase):
         # Create pyhccl_comm handle for batch_transfer_weights in elastic_ep
         self.pyhccl_comm: PyHcclCommunicator | None = None
         if self.world_size > 1 and tcp_store_group is not None:
-            self.pyhccl_comm = PyHcclCommunicator(
-                group=tcp_store_group,
-                device=self.device,
-                warmup=False,
-            )
+            self.pyhccl_comm = PyHcclCommunicator(group=tcp_store_group, device=self.device, warmup=False)
 
         self.ca_comm = None
         # vLLM #53576 reads this CUDA-only communicator during graph capture.
@@ -229,59 +225,10 @@ class NPUCommunicator(DeviceCommunicatorBase):
         # get_ep_all2all_manager()); the rest stay dormant.
         self.all2all_manager = _NpuAll2AllManager(self.world_size, self.device)
 
-    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        pyhccl_comm = self.pyhccl_comm
-        if pyhccl_comm is None or pyhccl_comm.disabled:
-            return super().all_gather(input_, dim)
-
-        if dim < 0:
-            dim += input_.dim()
-        input_size = input_.size()
-        output_size = (input_size[0] * self.world_size,) + input_size[1:]
-        output_tensor = torch.empty(
-            output_size,
-            dtype=input_.dtype,
-            device=input_.device,
-        )
-        pyhccl_comm.all_gather(input_.contiguous(), output_tensor)
-        output_tensor = output_tensor.reshape((self.world_size,) + input_size)
-        output_tensor = output_tensor.movedim(0, dim)
-        return output_tensor.reshape(input_size[:dim] + (self.world_size * input_size[dim],) + input_size[dim + 1 :])
-
     def destroy(self) -> None:
         if self.pyhccl_comm is not None:
             self.pyhccl_comm.destroy()
             self.pyhccl_comm = None
-
-    def broadcast(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
-        pyhccl_comm = self.pyhccl_comm
-        if pyhccl_comm is None or pyhccl_comm.disabled:
-            return super().broadcast(tensor, src)
-        pyhccl_comm.broadcast(tensor, src)
-        return tensor
-
-    def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
-        pyhccl_comm = self.pyhccl_comm
-        if pyhccl_comm is None or pyhccl_comm.disabled:
-            return super().send(tensor, dst)
-        if dst is None:
-            dst = (self.rank_in_group + 1) % self.world_size
-        pyhccl_comm.send(tensor, dst)
-
-    def recv(
-        self,
-        size: torch.Size,
-        dtype: torch.dtype,
-        src: int | None = None,
-    ) -> torch.Tensor:
-        pyhccl_comm = self.pyhccl_comm
-        if pyhccl_comm is None or pyhccl_comm.disabled:
-            return super().recv(size, dtype, src)
-        if src is None:
-            src = (self.rank_in_group - 1) % self.world_size
-        tensor = torch.empty(size, dtype=dtype, device=self.device)
-        pyhccl_comm.recv(tensor, src)
-        return tensor
 
     def batch_isend_irecv(self, p2p_ops: list, stream=None) -> None:
         pyhccl_comm = self.pyhccl_comm

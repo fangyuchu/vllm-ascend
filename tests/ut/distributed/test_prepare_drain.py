@@ -64,6 +64,36 @@ def test_prepare_consensus_uses_normal_dp_sync_even_before_local_prepare(monkeyp
         assert controller.begin.call_count == int(counts[2] == 3)
 
 
+def test_explicit_pause_can_drain_after_fault_scale_down(monkeypatch):
+    from vllm_ascend.patch.platform import patch_elastic_ep
+
+    engine = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(enable_elastic_ep=True, cpu_distributed_timeout=None)
+        ),
+        step_counter=0,
+        dp_sync_interval=1,
+        dp_group=SimpleNamespace(size=lambda: 3),
+        pending_pause=False,
+        ignore_start_dp_wave=False,
+        enable_fault_tolerance=True,
+        ft_sentinel=SimpleNamespace(coordinator_disabled=True),
+    )
+    counts = iter(([0, 0, 0], [3, 3, 0], [1, 0, 0], [0, 0, 0], [0, 0, 0]))
+    monkeypatch.setattr(
+        patch_elastic_ep, "cpu_all_reduce_", lambda tensor, *args, **kwargs: tensor.copy_(torch.tensor(next(counts)))
+    )
+    sync = patch_elastic_ep._has_global_unfinished_reqs
+    assert sync(engine, False)  # FT survivors keep stepping without a pause.
+    engine.pending_pause = True
+    assert sync(engine, True)
+    assert engine.ignore_start_dp_wave and not engine.pending_pause
+    assert sync(engine, False)  # A peer still has an outstanding request.
+    assert not sync(engine, False)  # All requests drained after pause consensus.
+    engine.ignore_start_dp_wave = False  # resume_scheduler clears the pause.
+    assert sync(engine, False)
+
+
 def test_prepare_waits_for_worker_startup_without_rechecking_a_busy_store(monkeypatch):
     state = SimpleNamespace(
         _ensure_new_dp_group=MagicMock(return_value=False),

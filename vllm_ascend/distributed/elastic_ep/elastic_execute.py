@@ -141,7 +141,11 @@ def ascend_batch_transfer_weights(
                 for tensor in tensors:
                     ptr = tensor.data_ptr()
                     if ptr not in expert_param_ptrs:
-                        expert_params.append(tensor.data)
+                        param = tensor.data
+                        # EPLB registers 1-byte weights as uint8; joiners expose their original dtype.
+                        if param.element_size() == 1:
+                            param = param.view(torch.uint8)
+                        expert_params.append(param)
                         expert_param_ptrs.add(ptr)
         for index, param in enumerate(expert_params):
             all_params.append(param)

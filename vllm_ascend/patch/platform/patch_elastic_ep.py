@@ -111,7 +111,8 @@ def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
         self.ignore_start_dp_wave = True
         self.pending_pause = False
         logger.debug("DP pause consensus reached, ignoring START_DP_WAVE.")
-    elif self.enable_fault_tolerance and self.ft_sentinel.coordinator_disabled:
+    elif self.enable_fault_tolerance and self.ft_sentinel.coordinator_disabled and not self.ignore_start_dp_wave:
+        # After pause consensus, let outstanding requests drain and stop stepping.
         return True
     return tensor[0].item() > 0 or pause_count % dp_size != 0 or prepare_count > 0
 
