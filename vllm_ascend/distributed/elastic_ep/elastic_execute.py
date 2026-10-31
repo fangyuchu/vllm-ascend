@@ -72,7 +72,8 @@ def ascend_batch_transfer_weights(
     include_expert_weights: bool = False,
 ) -> None:
     # Ascend HCCL P2P weight transfer. Replaces upstream batch_transfer_weights via
-    # monkey-patch. Also collect unregistered runtime tensors and negotiate names.
+    # monkey-patch. Differs from upstream: collects params from __dict__/AttentionImplBase,
+    # negotiates parameter names via the TCP store.
     device_comm = dp_group.device_communicator
     tcp_store_group = dp_group.tcp_store_group
     if device_comm is None:
@@ -143,31 +144,21 @@ def ascend_batch_transfer_weights(
         peer_rank_all_params_name = tcp_store_group.recv_obj(src=peer_rank)
         tcp_store_group.send_obj(all_params_name, dst=peer_rank)
 
-    # Restore the original Ascend filtering without reordering shared parameters.
     if len(all_params_name) != len(peer_rank_all_params_name):
-        common_names = set(all_params_name) & set(peer_rank_all_params_name)
-        all_params = [param for name, param in zip(all_params_name, all_params) if name in common_names]
-    logger.info(
-        "[Elastic EP] Weight parameter matching: role=%s peer=%s path=%s local=%d peer_count=%d matched=%d",
-        "sender" if is_sender else "receiver",
-        peer_rank,
-        "legacy-filter" if len(all_params_name) != len(peer_rank_all_params_name) else "original-order",
-        len(all_params_name),
-        len(peer_rank_all_params_name),
-        len(all_params),
-    )
+        common = list(set(all_params_name) & set(peer_rank_all_params_name))
+        ids = [all_params_name.index(name) for name in common]
+        all_params = [param for idx, param in enumerate(all_params) if idx in ids]
 
     assert len(all_params) > 0
     transfer_stream = stream or torch.npu.current_stream()
-    with torch.npu.stream(transfer_stream):
-        p2p_ops = []
-        for param in all_params:
-            op = object.__new__(P2POp)
-            op.op = torch.distributed.isend if is_sender else torch.distributed.irecv
-            op.tensor = param
-            op.group_peer = peer_rank
-            p2p_ops.append(op)
-        device_comm.batch_isend_irecv(p2p_ops, stream=transfer_stream)
+    p2p_ops = []
+    for param in all_params:
+        op = object.__new__(P2POp)
+        op.op = torch.distributed.isend if is_sender else torch.distributed.irecv
+        op.tensor = param
+        op.group_peer = peer_rank
+        p2p_ops.append(op)
+    device_comm.batch_isend_irecv(p2p_ops, stream=transfer_stream)
 
 
 def setup_moe_comm_and_quant_method(module: nn.Module) -> None:
