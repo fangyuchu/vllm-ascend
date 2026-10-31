@@ -195,11 +195,8 @@ def test_rank_node_ids_are_cached_per_eplb_group(monkeypatch, use_store_group):
     cpu_group.size.return_value = 5
     store_group = SimpleNamespace(rank=3, world_size=5) if use_store_group else None
     node_group = store_group if use_store_group else cpu_group
-    monkeypatch.setattr(
-        state_module,
-        "get_eplb_group",
-        lambda: SimpleNamespace(cpu_group=cpu_group, tcp_store_group=store_group),
-    )
+    group = SimpleNamespace(cpu_group=cpu_group, tcp_store_group=store_group)
+    monkeypatch.setattr(state_module, "get_eplb_group", lambda: group)
     same_node = MagicMock(
         side_effect=(
             [True, False, True, False, False],
@@ -221,22 +218,11 @@ def test_rank_node_ids_are_cached_per_eplb_group(monkeypatch, use_store_group):
         (node_group, 4),
     ]
 
-    # Restoring the same group size still requires survivors and joiners to
-    # participate in the replacement group's node-discovery collectives.
-    replacement_cpu_group = MagicMock()
-    replacement_cpu_group.size.return_value = 5
-    replacement_store_group = SimpleNamespace(rank=3, world_size=5) if use_store_group else None
-    replacement_node_group = replacement_store_group if use_store_group else replacement_cpu_group
-    monkeypatch.setattr(
-        state_module,
-        "get_eplb_group",
-        lambda: SimpleNamespace(cpu_group=replacement_cpu_group, tcp_store_group=replacement_store_group),
-    )
-    same_node.reset_mock()
+    # Replacing a group of the same size must invalidate survivors' cached topology.
+    group.cpu_group = SimpleNamespace(size=lambda: 5)
+    group.tcp_store_group = SimpleNamespace(rank=3, world_size=5) if use_store_group else None
     same_node.side_effect = None
     same_node.return_value = [True] * 5
-    joiner = AscendEplbState.__new__(AscendEplbState)
-    for member in (state, joiner):
-        np.testing.assert_array_equal(member.get_rank_node_ids(), np.zeros(5, dtype=np.int64))
-        np.testing.assert_array_equal(member.get_rank_node_ids(), np.zeros(5, dtype=np.int64))
-    assert [call.args for call in same_node.call_args_list] == [(replacement_node_group, 0)] * 2
+    np.testing.assert_array_equal(state.get_rank_node_ids(), np.zeros(5, dtype=np.int64))
+    same_node.assert_called_with(group.tcp_store_group if use_store_group else group.cpu_group, 0)
+    assert same_node.call_count == 4

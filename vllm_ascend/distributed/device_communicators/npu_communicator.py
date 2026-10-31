@@ -199,17 +199,9 @@ class NPUCommunicator(DeviceCommunicatorBase):
             unique_name,
             global_ranks,
             global_world_size,
-            use_all2all=use_all2all,
+            use_all2all,
         )
-        if tcp_store_group is not None:
-            # StatelessGroupCoordinator passes its logical device index here.
-            # Under Ray, the worker may already be bound to a different NPU,
-            # especially when Ray does not rewrite ASCEND_RT_VISIBLE_DEVICES.
-            # HCCL requires every communicator rank to use the device selected
-            # by its worker, so prefer the active NPU for stateless groups.
-            self.device = torch.device(f"npu:{torch.npu.current_device()}")
-        else:
-            self.device = device or torch.device(f"npu:{torch.npu.current_device()}")
+        self.device = torch.npu.current_device()
 
         # Create pyhccl_comm handle for batch_transfer_weights in elastic_ep
         self.pyhccl_comm: PyHcclCommunicator | None = None
@@ -223,18 +215,16 @@ class NPUCommunicator(DeviceCommunicatorBase):
         self.fi_pcie_ipc_ar_comm = None
         # Only the EP group's instance is ever looked up (via the upstream
         # get_ep_all2all_manager()); the rest stay dormant.
-        self.all2all_manager = _NpuAll2AllManager(self.world_size, self.device)
+        self.all2all_manager = _NpuAll2AllManager(dist.get_world_size(cpu_group), device)
 
-    def destroy(self) -> None:
+    def destroy(self):
         if self.pyhccl_comm is not None:
-            self.pyhccl_comm.destroy()
+            self.pyhccl_comm.close()
             self.pyhccl_comm = None
 
-    def batch_isend_irecv(self, p2p_ops: list, stream=None) -> None:
+    def batch_isend_irecv(self, p2p_ops: list, stream=None):
         pyhccl_comm = self.pyhccl_comm
-        if pyhccl_comm is None or pyhccl_comm.disabled:
-            raise ValueError("No PyHccl communicator found")
-        if stream is None:
-            pyhccl_comm.batch_isend_irecv(p2p_ops)
-        else:
+        if pyhccl_comm is not None and not pyhccl_comm.disabled:
             pyhccl_comm.batch_isend_irecv(p2p_ops, stream=stream)
+        else:
+            raise ValueError("No PyHccl communicator found")
