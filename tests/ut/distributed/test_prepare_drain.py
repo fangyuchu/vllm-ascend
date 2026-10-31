@@ -24,6 +24,29 @@ from vllm_ascend.distributed.elastic_ep.dp_collective import (
 from vllm_ascend.distributed.elastic_ep.prepare_drain import AscendPrepareDrain
 
 
+@pytest.mark.parametrize("phase", ["restore", "fallback", "missing", "scale-down", "unprepared", "internal"])
+def test_commit_keeps_requests_only_for_prepared_mega_restore(monkeypatch, phase):
+    from vllm_ascend.distributed.elastic_ep.elastic_execute import AscendElasticEPScalingExecutor
+    from vllm_ascend.patch.platform import patch_elastic_ep
+
+    store = torch.distributed.HashStore()
+    key = AscendElasticEPScalingExecutor._capture_key
+    store.set(key("previous", "enabled"), b"1")
+    if phase != "missing":
+        store.set(key("current", "enabled"), b"0" if phase == "fallback" else b"1")
+    prepared = SimpleNamespace(
+        scale_up=phase != "scale-down",
+        bootstrap=SimpleNamespace(operation_id="current"),
+        reconfig_store=store,
+    )
+    coordinator = SimpleNamespace(prepared_scale=None if phase == "unprepared" else prepared)
+    client = SimpleNamespace(external_eep_coordinator=None if phase == "internal" else coordinator)
+    original = MagicMock(return_value="wait")
+    monkeypatch.setattr(patch_elastic_ep, "_original_eep_commit_pause_mode", original)
+    assert patch_elastic_ep._eep_commit_pause_mode(client) == ("keep" if phase == "restore" else "wait")
+    assert original.call_count == int(phase != "restore")
+
+
 @pytest.mark.parametrize(
     "ready,counts,running,ft_paused",
     [

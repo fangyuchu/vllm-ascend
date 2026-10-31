@@ -28,6 +28,14 @@
 
 # What's Patched and how it works:
 # --------------------------------
+# * platform/patch_elastic_ep.py:
+#   Target: DPAsyncMPClient._eep_commit_pause_mode.
+#   Why: MegaMoe restore preserves serving graphs and KV cache across commit.
+#   How: Use keep only when the prepared operation enabled local capture;
+#        retain upstream pause selection for other operations.
+#   Related PR: No upstream platform hook for commit pause selection yet.
+#   Future plan: Replace this wrapper with a platform capability hook.
+# --------------------------------
 # * worker/patch_kda_recoverssm.py:
 #   Target: Kimi KDA's KDARecoverSSMCommitContext module binding.
 #   Why: The upstream metadata builder imports its CUDA context directly.

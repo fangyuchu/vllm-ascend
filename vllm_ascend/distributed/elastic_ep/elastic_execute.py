@@ -62,19 +62,6 @@ _PATCH_LOCK = threading.Lock()
 _BOOTSTRAP_EXPERT_PARAMETER_PREFIX = "__elastic_bootstrap_expert__."
 
 
-def _match_peer_parameters(
-    parameter_names: list[str],
-    parameters: list[torch.Tensor],
-    peer_parameter_names: list[str],
-) -> list[torch.Tensor]:
-    if parameter_names == peer_parameter_names:
-        return parameters
-    parameters_by_name = dict(zip(parameter_names, parameters, strict=True))
-    common_names = sorted(parameters_by_name.keys() & set(peer_parameter_names))
-    return [parameters_by_name[name] for name in common_names]
-
-
-@torch.inference_mode()
 def ascend_batch_transfer_weights(
     model: nn.Module,
     is_sender: bool,
@@ -85,8 +72,7 @@ def ascend_batch_transfer_weights(
     include_expert_weights: bool = False,
 ) -> None:
     # Ascend HCCL P2P weight transfer. Replaces upstream batch_transfer_weights via
-    # monkey-patch. Differs from upstream: collects params from __dict__/AttentionImplBase,
-    # negotiates parameter names via the TCP store.
+    # monkey-patch. Also collect unregistered runtime tensors and negotiate names.
     device_comm = dp_group.device_communicator
     tcp_store_group = dp_group.tcp_store_group
     if device_comm is None:
@@ -129,6 +115,8 @@ def ascend_batch_transfer_weights(
             if isinstance(attr_value, AttentionImplBase):
                 handle_sub_module(attr_value, submodule_name + "." + attr_name)
 
+    # Static quantization uses plain tensor attributes, including input scale
+    # reciprocals and offsets, which are absent from state_dict().
     for module_name, module in model.named_modules():
         handle_sub_module(module, module_name)
 
@@ -142,9 +130,6 @@ def ascend_batch_transfer_weights(
                     ptr = tensor.data_ptr()
                     if ptr not in expert_param_ptrs:
                         param = tensor.data
-                        # EPLB registers 1-byte weights as uint8; joiners expose their original dtype.
-                        if param.element_size() == 1:
-                            param = param.view(torch.uint8)
                         expert_params.append(param)
                         expert_param_ptrs.add(ptr)
         for index, param in enumerate(expert_params):
@@ -158,20 +143,18 @@ def ascend_batch_transfer_weights(
         peer_rank_all_params_name = tcp_store_group.recv_obj(src=peer_rank)
         tcp_store_group.send_obj(all_params_name, dst=peer_rank)
 
-    local_expert_names = {name for name in all_params_name if name.startswith(_BOOTSTRAP_EXPERT_PARAMETER_PREFIX)}
-    peer_expert_names = {
-        name for name in peer_rank_all_params_name if name.startswith(_BOOTSTRAP_EXPERT_PARAMETER_PREFIX)
-    }
-    if local_expert_names != peer_expert_names:
-        raise RuntimeError(
-            "MegaMoe bootstrap expert weights do not match between peers: "
-            f"local={len(local_expert_names)}, peer={len(peer_expert_names)}"
-        )
-
-    all_params = _match_peer_parameters(
-        all_params_name,
-        all_params,
-        peer_rank_all_params_name,
+    # Restore the original Ascend filtering without reordering shared parameters.
+    if len(all_params_name) != len(peer_rank_all_params_name):
+        common_names = set(all_params_name) & set(peer_rank_all_params_name)
+        all_params = [param for name, param in zip(all_params_name, all_params) if name in common_names]
+    logger.info(
+        "[Elastic EP] Weight parameter matching: role=%s peer=%s path=%s local=%d peer_count=%d matched=%d",
+        "sender" if is_sender else "receiver",
+        peer_rank,
+        "legacy-filter" if len(all_params_name) != len(peer_rank_all_params_name) else "original-order",
+        len(all_params_name),
+        len(peer_rank_all_params_name),
+        len(all_params),
     )
 
     assert len(all_params) > 0
@@ -179,27 +162,12 @@ def ascend_batch_transfer_weights(
     with torch.npu.stream(transfer_stream):
         p2p_ops = []
         for param in all_params:
-            # HCCL P2P transfers flat memory and does not honor tensor strides.
-            transfer_param = param.contiguous()
             op = object.__new__(P2POp)
             op.op = torch.distributed.isend if is_sender else torch.distributed.irecv
-            op.tensor = transfer_param
+            op.tensor = param
             op.group_peer = peer_rank
             p2p_ops.append(op)
-            if transfer_param is not param:
-                device_comm.batch_isend_irecv(
-                    p2p_ops,
-                    stream=transfer_stream,
-                )
-                p2p_ops.clear()
-                if not is_sender:
-                    param.copy_(transfer_param)
-
-        if p2p_ops:
-            device_comm.batch_isend_irecv(
-                p2p_ops,
-                stream=transfer_stream,
-            )
+        device_comm.batch_isend_irecv(p2p_ops, stream=transfer_stream)
 
 
 def setup_moe_comm_and_quant_method(module: nn.Module) -> None:
@@ -365,8 +333,7 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         try:
             yield
         finally:
-            # Also drain the stream on exceptional exits before temporary
-            # contiguous transfer tensors leave scope.
+            # Drain queued P2P work before restoring the upstream transfer function.
             try:
                 self._weight_transfer_stream.synchronize()
             finally:

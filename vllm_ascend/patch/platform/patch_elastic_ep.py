@@ -9,6 +9,7 @@ import torch
 from vllm.distributed.utils import cpu_all_reduce_
 from vllm.logger import init_logger
 from vllm.v1.engine.core import DPEngineCoreProc, EngineCore
+from vllm.v1.engine.core_client import DPAsyncMPClient
 
 from vllm_ascend.distributed.elastic_ep.dp_collective import (
     install_dp_collective_tracking,
@@ -21,12 +22,30 @@ _original_step = EngineCore.step
 _original_step_with_batch_queue = EngineCore.step_with_batch_queue
 _original_execute_dummy_batch = EngineCore.execute_dummy_batch
 _original_has_global_unfinished_reqs = DPEngineCoreProc._has_global_unfinished_reqs
+_original_eep_commit_pause_mode = DPAsyncMPClient._eep_commit_pause_mode
 logger = init_logger(__name__)
 
 
 def _get_prepare_controller(engine):
     state = getattr(engine, "eep_scaling_state", None)
     return state.prepare_controller if state is not None else None
+
+
+@wraps(_original_eep_commit_pause_mode)
+def _eep_commit_pause_mode(self):
+    coordinator = self.external_eep_coordinator
+    prepared = coordinator.prepared_scale if coordinator is not None else None
+    if prepared is not None and prepared.scale_up:
+        # Load the Worker implementation only when an external operation is prepared.
+        from vllm_ascend.distributed.elastic_ep.elastic_execute import AscendElasticEPScalingExecutor
+
+        key = AscendElasticEPScalingExecutor._capture_key(prepared.bootstrap.operation_id, "enabled")
+        store = prepared.reconfig_store
+        # Use this operation's actual decision, not just the MegaMoe config.
+        # Old graphs and KV cache survive commit; pause batches, not whole requests.
+        if store.check([key]) and store.get(key) == b"1":
+            return "keep"
+    return _original_eep_commit_pause_mode(self)
 
 
 @wraps(_original_init)
@@ -122,4 +141,5 @@ EngineCore.step = _step
 EngineCore.step_with_batch_queue = _step_with_batch_queue
 EngineCore.execute_dummy_batch = _execute_dummy_batch
 DPEngineCoreProc._has_global_unfinished_reqs = _has_global_unfinished_reqs
+DPAsyncMPClient._eep_commit_pause_mode = _eep_commit_pause_mode
 install_dp_collective_tracking()
