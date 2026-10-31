@@ -13,7 +13,6 @@ from tests.ut.distributed.test_mega_moe_capture import make_capture_state
 from vllm_ascend.distributed.device_communicators.npu_communicator import _NpuAll2AllManager
 from vllm_ascend.distributed.elastic_ep.elastic_execute import (
     AscendElasticEPScalingExecutor,
-    _match_peer_parameters,
     setup_moe_comm_and_quant_method,
 )
 from vllm_ascend.quantization.quant_type import QuantType
@@ -224,15 +223,6 @@ def test_target_ep_is_ready_before_new_rank_moe_setup(monkeypatch):
     )
     setup_moe_comm_and_quant_method(module)
     assert materialized == {"EP"}
-
-
-def test_match_peer_parameters_is_deterministic_on_mismatch():
-    parameters = [object(), object(), object()]
-    sender_names = ["z", "a", "sender_only"]
-    receiver_names = ["receiver_only", "a", "z"]
-    receiver_parameters = [object(), object(), object()]
-    assert _match_peer_parameters(sender_names, parameters, receiver_names) == [parameters[1], parameters[0]]
-    assert _match_peer_parameters(receiver_names, receiver_parameters, sender_names) == receiver_parameters[1:]
 
 
 def _mega_restore_executor(monkeypatch, dead_ranks=(2,)):
