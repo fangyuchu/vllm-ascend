@@ -26,6 +26,7 @@ from vllm.v1.worker.sentinel.gpu_worker_sentinel import (
 )
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ascend_forward_context import use_cann_megamoe
 from vllm_ascend.distributed.eplb.eplb_state import refresh_model_routing_tables
 from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.worker.sentinel.eplb_redistribute import (
@@ -42,16 +43,7 @@ _sentinel: "WorkerSentinel | None" = None
 
 
 def fault_barrier_wrapper(func: Callable):
-    """Barrier between device faults and the async step loop.
-
-    On the first device-touching fault (e.g. an EP-group allreduce failing on a
-    dead peer that poisons the model stream) it quarantines the worker and
-    resets the device immediately, before any tensor teardown on the broken
-    stream can std::terminate the process. While quarantined, wrapped methods
-    short-circuit with an empty output so in-flight async steps drain safely
-    without re-hitting the device; retry lifts the quarantine only after the
-    groups are rebuilt.
-    """
+    """Quarantine and reset the worker, then propagate its first fault."""
 
     def wrapped(self, *args, **kwargs):
         sentinel = _sentinel
@@ -115,6 +107,10 @@ class WorkerSentinel(GPUWorkerSentinel):
         # base flow and lift the quarantine after the groups are rebuilt.
         self.reset_device()
         super().retry(ft_request)
+        if use_cann_megamoe(self.worker.vllm_config):
+            # Publish buffer cleanup and mask writes before any graph replay
+            # on a different stream.
+            torch.npu.synchronize()
         self.worker_faulted = False
 
     def init_num_local_experts(self) -> None:
@@ -146,6 +142,7 @@ class WorkerSentinel(GPUWorkerSentinel):
         self.worker.execute_dummy_batch()
         self.activate_cpu_group_timeouts(ft_request)
         torch.npu.synchronize()
+        logger.info("[FT] Ascend scale_down validation complete; worker is ready for the engine recovery vote.")
 
     def _validate_scale_down_preconditions(self) -> None:
         if not self.worker.use_v2_model_runner:
@@ -157,7 +154,10 @@ class WorkerSentinel(GPUWorkerSentinel):
                 "[FT] scale_down requires EPLB with num_redundant_experts > 0 to re-host the dead rank's experts."
             )
         ascend_config = get_ascend_config()
-        if ascend_config.enable_fused_mc2:
+        mega_moe = use_cann_megamoe(self.worker.vllm_config)
+        if mega_moe and not get_ep_all2all_manager().uses_mega_moe:
+            raise ValueError("[FT] MegaMoe scale_down requires a fault-tolerance buffer initialized during warmup.")
+        if ascend_config.enable_fused_mc2 and not mega_moe:
             raise ValueError(
                 "[FT] scale_down is not supported with enable_fused_mc2: the "
                 "fused dispatch_ffn_combine operators take no elastic_info."
@@ -166,7 +166,7 @@ class WorkerSentinel(GPUWorkerSentinel):
             raise ValueError(
                 "[FT] scale_down (elastic_info) is mutually exclusive with mc2 hierarchy comm (comm_alg='hierarchy')."
             )
-        if not hasattr(torch_npu, "npu_moe_distribute_dispatch_v2"):
+        if not mega_moe and not hasattr(torch_npu, "npu_moe_distribute_dispatch_v2"):
             raise ValueError(
                 "[FT] scale_down requires npu_moe_distribute_dispatch_v2 "
                 "(aclnn V3+); please upgrade the CANN/torch_npu version."
@@ -212,7 +212,8 @@ class WorkerSentinel(GPUWorkerSentinel):
         # so captured graphs keep pointing at valid storage), then renumber
         # their ids into the densified space for the MC2 kernels.
         refresh_model_routing_tables(eplb_model_state)
-        self._densify_routing_tables(eplb_model_state)
+        if not get_ep_all2all_manager().uses_mega_moe:
+            self._densify_routing_tables(eplb_model_state)
 
     def _densify_routing_tables(self, eplb_model_state) -> None:
         """Renumber the kernel-facing routing tables into the densified id space.

@@ -19,30 +19,37 @@ from vllm_ascend.distributed.eplb.eplb_state import (
 from vllm_ascend.distributed.eplb.policy.stair import StairEplbPolicy
 
 
-def test_update_mapping_refreshes_ascend_routing_without_replacing_state():
+@pytest.mark.parametrize("capacity", [2, 4])
+def test_update_mapping_refreshes_ascend_routing_without_replacing_state(capacity):
     state = AscendEplbState.__new__(AscendEplbState)
     state._hixl_session = None
     state._close_error = None
     state._suspended = False
     model_config = MagicMock()
     model_config.compute_hash.return_value = "target"
-    model_state = object()
+    buffer = torch.full((1, capacity), 7, dtype=torch.int32)
+    model_state = SimpleNamespace(physical_to_logical_map_buffer=buffer)
     state.model_states = {"target": model_state}
     mapping = torch.tensor([[1, 0]], dtype=torch.int32)
     events = []
+
+    def copy_mapping(_, expanded):
+        buffer.copy_(expanded)
+        events.append("update")
+
     with (
-        patch.object(
-            upstream_eplb_state.EplbState, "update_mapping", side_effect=lambda *_: events.append("update")
-        ) as update,
+        patch.object(upstream_eplb_state.EplbState, "update_mapping", side_effect=copy_mapping),
         patch.object(
             eplb_state, "refresh_model_routing_tables", side_effect=lambda *_: events.append("refresh")
         ) as refresh,
     ):
         state.update_mapping(model_config, mapping)
-    update.assert_called_once_with(model_config, mapping)
     refresh.assert_called_once_with(model_state)
     assert events == ["update", "refresh"]
     assert state.model_states["target"] is model_state
+    assert model_state.physical_to_logical_map_buffer is buffer
+    torch.testing.assert_close(buffer[:, :2], mapping)
+    assert torch.all(buffer[:, 2:] == -1)
 
 
 def test_uses_upstream_policy_and_async_worker_lifecycle():

@@ -682,6 +682,8 @@ class AscendConfig:
             _MEGA_MOE_SUPPORTED = False
         elif self.enable_fused_mc2 == 2:
             _MEGA_MOE_SUPPORTED = importlib.util.find_spec("cann_ops_transformer") is not None
+            if not _MEGA_MOE_SUPPORTED:
+                raise ValueError("enable_fused_mc2=2 requires cann_ops_transformer.")
             self.enable_fused_mc2 = 1
         return self
 
@@ -863,9 +865,10 @@ class AscendConfig:
                 "cannot be enabled at the same time. Setting multistream_overlap_shared_expert to False."
             )
         if self.enable_fused_mc2 == 1 and is_mega_moe_supported() and not self._is_megamoe_supported_by_config(vc):
-            self.enable_fused_mc2 = 0
+            # Temporarily force MegaMoe for debugging unsupported model configs.
+            # self.enable_fused_mc2 = 0
             logger.warning_once(
-                "MegaMoe is not supported for this model config; additional_config.enable_fused_mc2 will be set to 0."
+                "Forcing MegaMoe for an unsupported model config; compatibility fallback is disabled for debugging."
             )
 
         # mlapo_keep_prefill_weights preconditions: the prefill weights are only
@@ -956,6 +959,7 @@ class AscendConfig:
         self.enable_sp_by_pass = vc.model_config is not None and not vc.model_config.enforce_eager and enable_sp_by_pass
 
         self._validate_mc2_comm_alg(vc)
+        self._validate_elastic_ep(vc)
 
         # mega_moe_max_tokens range
         if self.mega_moe_max_tokens <= 0:
@@ -1036,6 +1040,20 @@ class AscendConfig:
             raise ValueError(
                 "fused mc2 op cannot be used with hierarchy communication. "
                 "Please set additional_config.enable_fused_mc2 to 0."
+            )
+
+    def _validate_elastic_ep(self, vllm_config: VllmConfig) -> None:
+        parallel_config = vllm_config.parallel_config
+        if not parallel_config.enable_elastic_ep:
+            return
+        from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+        if get_ascend_device_type() != AscendDeviceType.A3:
+            raise ValueError("Elastic EP is only supported on A3.")
+
+        if not getattr(vllm_config, "use_v2_model_runner", False):
+            raise ValueError(
+                "Elastic EP is only supported with Model Runner V2. Set VLLM_USE_V2_MODEL_RUNNER=1 to enable it."
             )
 
     def _validate_sparse_packed_kv_offload_compatibility(self) -> None:
