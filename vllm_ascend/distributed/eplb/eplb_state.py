@@ -276,12 +276,12 @@ class AscendEplbState(_eplb_state.EplbState):
         self._load_stats_window_write_index = 0
 
     def get_rank_node_ids(self) -> np.ndarray:
-        """Return cached node ordinals in stage-local EPLB rank order."""
+        """Cache node ordinals only for the current EPLB communication group."""
+        group = get_eplb_group()
         rank_node_ids = getattr(self, "_rank_node_ids", None)
-        if rank_node_ids is not None:
+        if rank_node_ids is not None and getattr(self, "_rank_node_ids_group", None) is group.cpu_group:
             return rank_node_ids
 
-        group = get_eplb_group()
         # Stateless groups have their own rank space, independent of torch's
         # default group. Use the store group so node discovery reads that rank.
         node_group = getattr(group, "tcp_store_group", None)
@@ -302,6 +302,7 @@ class AscendEplbState(_eplb_state.EplbState):
             rank_node_ids[same_node] = next_node_id
             next_node_id += 1
         self._rank_node_ids = rank_node_ids
+        self._rank_node_ids_group = group.cpu_group
         return rank_node_ids
 
     def _discard_samples_from_old_mapping(self) -> None:

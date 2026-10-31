@@ -190,7 +190,7 @@ def test_publish_async_load_stats_is_atomic(monkeypatch):
 
 
 @pytest.mark.parametrize("use_store_group", [False, True])
-def test_rank_node_ids_are_discovered_once(monkeypatch, use_store_group):
+def test_rank_node_ids_are_cached_per_eplb_group(monkeypatch, use_store_group):
     cpu_group = MagicMock()
     cpu_group.size.return_value = 5
     store_group = SimpleNamespace(rank=3, world_size=5) if use_store_group else None
@@ -220,3 +220,23 @@ def test_rank_node_ids_are_discovered_once(monkeypatch, use_store_group):
         (node_group, 1),
         (node_group, 4),
     ]
+
+    # Restoring the same group size still requires survivors and joiners to
+    # participate in the replacement group's node-discovery collectives.
+    replacement_cpu_group = MagicMock()
+    replacement_cpu_group.size.return_value = 5
+    replacement_store_group = SimpleNamespace(rank=3, world_size=5) if use_store_group else None
+    replacement_node_group = replacement_store_group if use_store_group else replacement_cpu_group
+    monkeypatch.setattr(
+        state_module,
+        "get_eplb_group",
+        lambda: SimpleNamespace(cpu_group=replacement_cpu_group, tcp_store_group=replacement_store_group),
+    )
+    same_node.reset_mock()
+    same_node.side_effect = None
+    same_node.return_value = [True] * 5
+    joiner = AscendEplbState.__new__(AscendEplbState)
+    for member in (state, joiner):
+        np.testing.assert_array_equal(member.get_rank_node_ids(), np.zeros(5, dtype=np.int64))
+        np.testing.assert_array_equal(member.get_rank_node_ids(), np.zeros(5, dtype=np.int64))
+    assert [call.args for call in same_node.call_args_list] == [(replacement_node_group, 0)] * 2
