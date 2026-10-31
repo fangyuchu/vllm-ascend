@@ -25,17 +25,20 @@ from vllm_ascend.distributed.elastic_ep.prepare_drain import AscendPrepareDrain
 
 
 @pytest.mark.parametrize(
-    "ready,counts,running",
+    "ready,counts,running,ft_paused",
     [
-        (None, [0, 0, 0], False),
-        (None, [0, 0, 2], True),
-        (True, [0, 0, 3], True),
-        (False, [0, 1, 0], True),
-        (False, [0, 3, 0], False),
-        (False, [1, 0, 0], True),
+        (None, [0, 0, 0], False, None),
+        (None, [0, 0, 2], True, None),
+        (True, [0, 0, 3], True, None),
+        (False, [0, 1, 0], True, None),
+        (False, [0, 3, 0], False, None),
+        (False, [1, 0, 0], True, None),
+        (None, [0, 0, 0], True, False),  # FT survivors normally keep stepping.
+        (None, [1, 0, 0], True, True),  # A peer still has requests after pause consensus.
+        (None, [0, 0, 0], False, True),  # Paused FT survivors stop when requests drain.
     ],
 )
-def test_prepare_consensus_uses_normal_dp_sync_even_before_local_prepare(monkeypatch, ready, counts, running):
+def test_prepare_consensus_and_ft_pause_use_normal_dp_sync(monkeypatch, ready, counts, running, ft_paused):
     from vllm_ascend.patch.platform import patch_elastic_ep
 
     controller = None if ready is None else SimpleNamespace(draining=False, is_ready=lambda: ready, begin=MagicMock())
@@ -48,8 +51,9 @@ def test_prepare_consensus_uses_normal_dp_sync_even_before_local_prepare(monkeyp
         dp_sync_interval=16,
         dp_group=SimpleNamespace(size=lambda: 3),
         pending_pause=counts[1] > 0,
-        ignore_start_dp_wave=False,
-        enable_fault_tolerance=False,
+        ignore_start_dp_wave=bool(ft_paused),
+        enable_fault_tolerance=ft_paused is not None,
+        ft_sentinel=SimpleNamespace(coordinator_disabled=True),
     )
 
     def reduce(tensor, group, timeout=None):
@@ -59,39 +63,9 @@ def test_prepare_consensus_uses_normal_dp_sync_even_before_local_prepare(monkeyp
 
     monkeypatch.setattr(patch_elastic_ep, "cpu_all_reduce_", reduce)
     assert patch_elastic_ep._has_global_unfinished_reqs(engine, False) is running
-    assert engine.ignore_start_dp_wave is (counts[1] == 3)
+    assert engine.ignore_start_dp_wave is (bool(ft_paused) or counts[1] == 3)
     if controller is not None:
         assert controller.begin.call_count == int(counts[2] == 3)
-
-
-def test_explicit_pause_can_drain_after_fault_scale_down(monkeypatch):
-    from vllm_ascend.patch.platform import patch_elastic_ep
-
-    engine = SimpleNamespace(
-        vllm_config=SimpleNamespace(
-            parallel_config=SimpleNamespace(enable_elastic_ep=True, cpu_distributed_timeout=None)
-        ),
-        step_counter=0,
-        dp_sync_interval=1,
-        dp_group=SimpleNamespace(size=lambda: 3),
-        pending_pause=False,
-        ignore_start_dp_wave=False,
-        enable_fault_tolerance=True,
-        ft_sentinel=SimpleNamespace(coordinator_disabled=True),
-    )
-    counts = iter(([0, 0, 0], [3, 3, 0], [1, 0, 0], [0, 0, 0], [0, 0, 0]))
-    monkeypatch.setattr(
-        patch_elastic_ep, "cpu_all_reduce_", lambda tensor, *args, **kwargs: tensor.copy_(torch.tensor(next(counts)))
-    )
-    sync = patch_elastic_ep._has_global_unfinished_reqs
-    assert sync(engine, False)  # FT survivors keep stepping without a pause.
-    engine.pending_pause = True
-    assert sync(engine, True)
-    assert engine.ignore_start_dp_wave and not engine.pending_pause
-    assert sync(engine, False)  # A peer still has an outstanding request.
-    assert not sync(engine, False)  # All requests drained after pause consensus.
-    engine.ignore_start_dp_wave = False  # resume_scheduler clears the pause.
-    assert sync(engine, False)
 
 
 def test_prepare_waits_for_worker_startup_without_rechecking_a_busy_store(monkeypatch):

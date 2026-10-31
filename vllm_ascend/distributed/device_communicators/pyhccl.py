@@ -129,13 +129,6 @@ class PyHcclCommunicator:
                 stream.synchronize()
                 del data
 
-    def destroy(self):
-        if self.available and not self.disabled:
-            with torch.accelerator.device_index(self.device.index):
-                self.hccl.hcclCommDestroy(self.comm)
-            self.available = False
-            self.disabled = True
-
     def _check_tensor_device(self, tensor: torch.Tensor) -> None:
         assert tensor.device == self.device, (
             f"this hccl communicator is created to work on {self.device}, but the tensor is on {tensor.device}"
@@ -170,21 +163,6 @@ class PyHcclCommunicator:
             in_tensor.numel(),
             hcclDataTypeEnum.from_torch(in_tensor.dtype),
             hcclRedOpTypeEnum.from_torch(op),
-            self.comm,
-            aclrtStream_t(stream.npu_stream),
-        )
-        return out_tensor
-
-    def all_gather(self, in_tensor: torch.Tensor, out_tensor: torch.Tensor, stream=None) -> torch.Tensor:
-        if self.disabled:
-            return None
-        self._check_tensor_device(in_tensor)
-        stream = self._get_stream(stream)
-        self.hccl.hcclAllGather(
-            buffer_type(in_tensor.data_ptr()),
-            buffer_type(out_tensor.data_ptr()),
-            in_tensor.numel(),
-            hcclDataTypeEnum.from_torch(in_tensor.dtype),
             self.comm,
             aclrtStream_t(stream.npu_stream),
         )

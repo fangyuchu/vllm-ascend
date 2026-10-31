@@ -146,22 +146,6 @@ class HCCLLibrary:
                 aclrtStream_t,
             ],
         ),
-        # HcclResult HcclAllGather(
-        #   void *sendBuf, void *recvBuf, uint64_t sendCount,
-        #   HcclDataType dataType, HcclComm comm,
-        #   aclrtStream stream);
-        Function(
-            "HcclAllGather",
-            hcclResult_t,
-            [
-                buffer_type,
-                buffer_type,
-                ctypes.c_size_t,
-                hcclDataType_t,
-                hcclComm_t,
-                aclrtStream_t,
-            ],
-        ),
         # HcclResult HcclSend(
         #   void *buf, uint64_t count,
         #   HcclDataType dataType, uint32_t root,
@@ -291,17 +275,6 @@ class HCCLLibrary:
         # when we pass int to a function, it will be converted to `ctypes.c_int`
         # by ctypes automatically
         self.HCCL_CHECK(self._funcs["HcclAllReduce"](sendbuff, recvbuff, count, datatype, op, comm, stream))
-
-    def hcclAllGather(
-        self,
-        sendbuff: buffer_type,
-        recvbuff: buffer_type,
-        sendcount: int,
-        datatype: int,
-        comm: hcclComm_t,
-        stream: aclrtStream_t,
-    ) -> None:
-        self.HCCL_CHECK(self._funcs["HcclAllGather"](sendbuff, recvbuff, sendcount, datatype, comm, stream))
 
     def hcclSend(
         self,
