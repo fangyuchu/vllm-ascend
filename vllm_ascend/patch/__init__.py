@@ -29,12 +29,12 @@
 # What's Patched and how it works:
 # --------------------------------
 # * platform/patch_elastic_ep.py:
-#   Target: DPAsyncMPClient._eep_commit_pause_mode.
-#   Why: MegaMoe restore preserves serving graphs and KV cache across commit.
-#   How: Use keep only when the prepared operation enabled local capture;
+#   Target: ElasticEPScalingState.__init__, DPAsyncMPClient._eep_commit_pause_mode.
+#   Why: MegaMoe restore needs a common Worker boundary and preserves serving graphs.
+#   How: Attach the Ascend prepare controller and select keep for local capture;
 #        retain upstream pause selection for other operations.
-#   Related PR: No upstream platform hook for commit pause selection yet.
-#   Future plan: Replace this wrapper with a platform capability hook.
+#   Related PR: No upstream hooks for prepare controllers or commit pause selection.
+#   Future plan: Use upstream preparation and pause hooks when available.
 # --------------------------------
 # * worker/patch_kda_recoverssm.py:
 #   Target: Kimi KDA's KDARecoverSSMCommitContext module binding.
