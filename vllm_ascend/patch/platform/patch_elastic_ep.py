@@ -6,6 +6,7 @@
 from functools import wraps
 
 import torch
+from vllm.distributed.elastic_ep.elastic_state import ElasticEPScalingState
 from vllm.distributed.utils import cpu_all_reduce_
 from vllm.logger import init_logger
 from vllm.v1.engine.core import DPEngineCoreProc, EngineCore
@@ -23,7 +24,18 @@ _original_step_with_batch_queue = EngineCore.step_with_batch_queue
 _original_execute_dummy_batch = EngineCore.execute_dummy_batch
 _original_has_global_unfinished_reqs = DPEngineCoreProc._has_global_unfinished_reqs
 _original_eep_commit_pause_mode = DPAsyncMPClient._eep_commit_pause_mode
+_original_scaling_state_init = ElasticEPScalingState.__init__
 logger = init_logger(__name__)
+
+
+@wraps(_original_scaling_state_init)
+def _init_scaling_state(self, *args, **kwargs):
+    _original_scaling_state_init(self, *args, **kwargs)
+    self.prepare_controller = None
+    if self.scale_type == "scale_up" and self.worker_type == "existing":
+        from vllm_ascend.distributed.elastic_ep.prepare_drain import AscendPrepareDrain
+
+        self.prepare_controller = AscendPrepareDrain(self)
 
 
 def _get_prepare_controller(engine):
@@ -137,6 +149,7 @@ def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
 
 
 EngineCore.__init__ = _init_with_worker_progress
+ElasticEPScalingState.__init__ = _init_scaling_state
 EngineCore.step = _step
 EngineCore.step_with_batch_queue = _step_with_batch_queue
 EngineCore.execute_dummy_batch = _execute_dummy_batch
