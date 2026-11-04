@@ -198,7 +198,7 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
             == 1
             and config.lora_config is None
             and getattr(config, "speculative_config", None) is None
-            and comm.mega_moe_quant_type == QuantType.W8A8
+            and comm.mega_moe_quant_type in (QuantType.NONE, QuantType.W8A8)
             and upstream_elastic_execute.get_active_dp_size(dp_group) < request.new_data_parallel_size
             and request.new_data_parallel_size == state.buffer.ep_world_size == get_mc2_group().world_size
             and bool(getattr(dp_group, "dead_dp_ranks", ()))
@@ -823,15 +823,16 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
             return
         # Remote ranks stay masked while new ranks capture without serving DP sync.
         with skip_dp_coordination():
-            self.warm_and_capture()
+            self.warm_and_capture(release_graphs=False)
         self._mega_moe_precommit_capture_done = True
 
     def _prepare_new_mega_moe_capture(self, moe_modules: list[nn.Module]) -> None:
         self._setup_moe_comm_and_quant_method()
         comm = self._get_fused_mc2_comm()
-        scheme = moe_modules[0].routed_experts.quant_method.quant_method
-        if scheme.quant_type != QuantType.W8A8:
-            raise RuntimeError("MegaMoe restore capture currently requires W8A8")
+        method = moe_modules[0].routed_experts.quant_method
+        scheme = getattr(method, "quant_method", method)
+        if scheme.quant_type not in (QuantType.NONE, QuantType.W8A8):
+            raise RuntimeError("MegaMoe restore capture requires unquantized or W8A8 weights")
         mode, dtype, _ = _get_cann_mega_moe_quant_settings(scheme.quant_type)
         comm.mega_moe_quant_type = scheme.quant_type
         comm.mega_moe_symm_buffer = comm._init_mega_moe_symm_buffer(
@@ -883,14 +884,15 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
             if not completed:
                 logger.warning("[Elastic EP] Keeping EPLB suppressed because MegaMoe restore did not complete")
 
-    def warm_and_capture(self) -> None:
+    def warm_and_capture(self, *, release_graphs: bool = True) -> None:
         # No need to save/clear/restore the KV-cache block tables like the
         # upstream warm_and_capture: the V2 runner's dummy attention uses
         # all-zero block tables (reserved null block) and PAD_SLOT_ID slot
         # mappings, so real KV-cache blocks are never written during the
         # dummy run.
         runner = self.worker.model_runner
-        self._release_cuda_graphs()
+        if release_graphs:
+            self._release_cuda_graphs()
         unlock_workspace()
         try:
             runner._dummy_run(

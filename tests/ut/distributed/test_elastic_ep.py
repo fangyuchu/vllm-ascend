@@ -225,7 +225,7 @@ def test_target_ep_is_ready_before_new_rank_moe_setup(monkeypatch):
     assert materialized == {"EP"}
 
 
-def _mega_restore_executor(monkeypatch, dead_ranks=(2,)):
+def _mega_restore_executor(monkeypatch, dead_ranks=(2,), quant_type=QuantType.W8A8):
     executor, worker = _executor_and_worker()
     parallel = worker.vllm_config.parallel_config
     parallel.world_size = 1
@@ -233,7 +233,7 @@ def _mega_restore_executor(monkeypatch, dead_ranks=(2,)):
     parallel.enable_fault_tolerance = True
     comm = SimpleNamespace(
         mega_moe_capture_state=make_capture_state(),
-        mega_moe_quant_type=QuantType.W8A8,
+        mega_moe_quant_type=quant_type,
         token_dispatcher=SimpleNamespace(refresh_hccl_group=MagicMock()),
     )
     module = "vllm_ascend.distributed.elastic_ep.elastic_execute"
@@ -247,19 +247,48 @@ def _mega_restore_executor(monkeypatch, dead_ranks=(2,)):
     return executor, worker, comm
 
 
-def test_mega_middle_restore_exchanges_capture_decision(monkeypatch):
-    executor, _, _ = _mega_restore_executor(monkeypatch)
+@pytest.mark.parametrize("quant_type", [QuantType.NONE, QuantType.W8A8, QuantType.W4A8])
+def test_mega_middle_restore_exchanges_capture_decision(monkeypatch, quant_type):
+    executor, _, _ = _mega_restore_executor(monkeypatch, quant_type=quant_type)
     values = {}
     store = SimpleNamespace(set=values.__setitem__, get=values.__getitem__)
     monkeypatch.setattr(executor, "_capture_store", lambda request: store)
     request = SimpleNamespace(new_data_parallel_size=4, operation_id="mega-restore")
-    assert executor._publish_capture_decision(request, old_dp_size=3)
-    assert executor._mega_moe_precommit_capture
+    enabled = quant_type in (QuantType.NONE, QuantType.W8A8)
+    assert executor._publish_capture_decision(request, old_dp_size=3) is enabled
+    assert executor._mega_moe_precommit_capture is enabled
     new_executor, _ = _executor_and_worker()
     monkeypatch.setattr(new_executor, "_capture_store", lambda request: store)
-    assert new_executor._read_capture_decision(request)
-    assert new_executor._mega_moe_precommit_capture
+    assert new_executor._read_capture_decision(request) is enabled
+    assert new_executor._mega_moe_precommit_capture is enabled
     assert new_executor._capture_old_dp_size == 3
+
+
+@pytest.mark.parametrize("quant_type,mode,dtype", [(QuantType.NONE, 0, None), (QuantType.W8A8, 2, 258)])
+def test_new_rank_capture_initializes_buffer_for_weight_type(monkeypatch, quant_type, mode, dtype):
+    from vllm_ascend.ops.fused_moe.routed_experts import AscendUnquantizedFusedMoEMethod
+
+    executor, _, comm = _mega_restore_executor(monkeypatch, quant_type=quant_type)
+    method = (
+        object.__new__(AscendUnquantizedFusedMoEMethod)
+        if quant_type == QuantType.NONE
+        else SimpleNamespace(quant_method=SimpleNamespace(quant_type=quant_type))
+    )
+    moe = SimpleNamespace(
+        routed_experts=SimpleNamespace(quant_method=method), moe_config=SimpleNamespace(experts_per_token=4)
+    )
+    buffer = comm.mega_moe_capture_state.buffer
+    comm._init_mega_moe_symm_buffer = MagicMock(return_value=buffer)
+    monkeypatch.setattr(executor, "_setup_moe_comm_and_quant_method", MagicMock())
+    monkeypatch.setattr(executor, "_get_fused_mc2_comm", lambda: comm)
+    monkeypatch.setattr(executor, "_synchronize_capture_context_rendezvous", MagicMock())
+    monkeypatch.setattr("vllm_ascend.distributed.elastic_ep.elastic_execute._is_decode_only_node", lambda _: False)
+    executor._prepare_new_mega_moe_capture([moe])
+    comm._init_mega_moe_symm_buffer.assert_called_once_with(mode, dtype, is_decode_only_node=False)
+    assert comm.mega_moe_quant_type == quant_type
+    assert comm.mega_moe_symm_buffer is buffer
+    assert comm.mega_moe_capture_state.capture_active.item()
+    assert buffer.mask_buffer.tolist() == [0, 1, 1, 1]
 
 
 @pytest.mark.parametrize("last_rank", [0, 1], ids=["late-survivor", "late-joiner"])
@@ -348,7 +377,7 @@ def test_mega_resume_preserves_eplb_execution_mode(monkeypatch, is_async):
 def test_new_rank_capture_skips_dp_only_within_warmup(monkeypatch, fast_capture, fail):
     from vllm.v1.worker.dp_utils import should_skip_dp_coordination
 
-    executor, _, comm = _mega_restore_executor(monkeypatch)
+    executor, worker, comm = _mega_restore_executor(monkeypatch)
     executor._mega_moe_precommit_capture = fast_capture
     comm.mega_moe_capture_state.prepare_capture(topk=4)
     executor._mega_moe_precommit_capture_done = False
@@ -361,11 +390,20 @@ def test_new_rank_capture_skips_dp_only_within_warmup(monkeypatch, fast_capture,
         if fail:
             raise RuntimeError("capture failed")
 
-    monkeypatch.setattr(executor, "warm_and_capture", capture)
+    worker.model_runner = SimpleNamespace(max_num_tokens=128, _dummy_run=MagicMock())
+    worker.compile_or_warm_up_model = capture
+    monkeypatch.setattr(
+        executor, "_release_cuda_graphs", MagicMock(side_effect=AssertionError("fresh rank released graphs"))
+    )
+    module = "vllm_ascend.distributed.elastic_ep.elastic_execute"
+    monkeypatch.setattr(f"{module}.unlock_workspace", MagicMock())
+    lock = MagicMock()
+    monkeypatch.setattr(f"{module}.lock_workspace", lock)
     with pytest.raises(RuntimeError, match="capture failed") if fail else nullcontext():
         executor.warmup_new_worker()
     assert calls == (["capture"] if fast_capture else [])
     assert not should_skip_dp_coordination()
     assert executor._mega_moe_precommit_capture_done is (fast_capture and not fail)
+    assert lock.call_count == int(fast_capture)
     # Restore remote peers only at coordinated commit, never when capture ends.
     assert comm.mega_moe_capture_state.buffer.mask_buffer.tolist() == [0, 1, 1, 1]
