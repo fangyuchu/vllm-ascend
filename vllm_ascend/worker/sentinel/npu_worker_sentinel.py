@@ -196,6 +196,15 @@ class WorkerSentinel(GPUWorkerSentinel):
         ]
         drafter = self._resolve_drafter()
         if drafter is not None:
+            draft_layer = drafter[1].model.moe_layers[0]
+            draft_ep_size = getattr(draft_layer, "routed_experts", draft_layer).moe_config.ep_size
+            target_ep_size = get_ep_group().world_size
+            if draft_ep_size != target_ep_size:
+                raise ValueError(
+                    f"[FT] scale_down requires the drafter's EP size ({draft_ep_size}) to match the "
+                    f"target's ({target_ep_size}); otherwise expert weights are reloaded into the "
+                    f"wrong physical slots."
+                )
             models.append(drafter)
 
         for model, model_state, model_path in models:
