@@ -1,7 +1,6 @@
 import torch
 from vllm.distributed.parallel_state import (
     _init_stateless_group,
-    get_pcp_group,
     get_pp_group,
     get_tp_group,
     get_world_group,
@@ -14,24 +13,6 @@ _STANDBY_MC2: StatelessGroupCoordinator | None = None
 
 def get_standby_mc2_group() -> StatelessGroupCoordinator | None:
     return _STANDBY_MC2
-
-
-def _mc2_group_ranks(
-    world_size: int,
-    dp_size: int,
-    pp_size: int,
-    pcp_size: int,
-    tp_size: int,
-) -> list[list[int]]:
-    all_ranks = torch.arange(world_size).reshape(
-        -1,
-        dp_size,
-        pp_size,
-        pcp_size,
-        tp_size,
-    )
-    group_ranks = all_ranks.transpose(1, 2).reshape(-1, dp_size * pcp_size * tp_size).unbind(0)
-    return [ranks.tolist() for ranks in group_ranks]
 
 
 def create_ascend_standby_groups(
@@ -52,19 +33,15 @@ def create_ascend_standby_groups(
 
     tp_size = get_tp_group().world_size
     pp_size = get_pp_group().world_size
-    pcp_size = get_pcp_group().world_size
 
-    standby_mc2_ranks = _mc2_group_ranks(
-        new_world_size_across_dp,
-        new_dp_size,
-        pp_size,
-        pcp_size,
-        tp_size,
-    )
+    all_ranks = torch.arange(new_world_size_across_dp).reshape(-1, new_dp_size * pp_size * tp_size)
+    group_ranks = all_ranks.unbind(0)
+    standby_ep_ranks = [x.tolist() for x in group_ranks]
+
     # The standby MC2 group is always stateless: it is only built for elastic
     # EP scaling, so new ranks must be able to join the topology dynamically.
     _STANDBY_MC2 = _init_stateless_group(
-        standby_mc2_ranks,
+        standby_ep_ranks,
         "mc2",
         master_ip,
         backend,
