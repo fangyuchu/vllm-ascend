@@ -240,7 +240,7 @@ class DeepSeekMultiTokenPredictor(nn.Module):
 
 @support_torch_compile
 class DeepSeekV4MTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
-    # Shares the target's mapper; see DSparkDeepseekV4ForCausalLM.
+    # Quantization lookup and FT reload use the target's checkpoint-name mapping.
     hf_to_vllm_mapper = AscendDeepseekV4ForCausalLM.hf_to_vllm_mapper
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):

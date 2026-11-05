@@ -244,15 +244,11 @@ def _collect_matching_weights(
     wanted_suffixes: Set[str],
     expert_weights: dict[tuple[int, int], dict[str, torch.Tensor]],
     matched: set[tuple[int, int]],
-    suffix_map: dict[str, str] | None = None,
 ) -> None:
     """Read only the wanted experts' tensors by walking shard headers.
 
     ``safe_open(...).keys()`` reads just the JSON header, so rejected names
     never reach ``get_tensor``: reads stay limited to the wanted experts.
-
-    ``suffix_map`` renames checkpoint suffixes into the reloaders' bucket
-    names (drafters use ``w1/w3/w2``); unknown suffixes pass through.
     """
     for st_file in shards:
         with safe_open(st_file, framework="pt") as f:
@@ -261,9 +257,6 @@ def _collect_matching_weights(
                 if found is None:
                     continue
                 key, suffix = found
-                if suffix_map is not None:
-                    # Translate raw ("w1.weight"); already-mapped names pass through.
-                    suffix = suffix_map.get(suffix, suffix)
                 if suffix in wanted_suffixes:
                     # Only a collected tensor counts as matched.
                     matched.add(key)
@@ -274,7 +267,6 @@ def reload_experts_from_disk(
     model: torch.nn.Module,
     model_path: str,
     reassignments: set[tuple[int, int]],
-    suffix_map: dict[str, str] | None = None,
 ) -> int:
     """Reload reassigned (moe_layer_idx, logical_expert_id) weights from disk.
 
@@ -286,9 +278,8 @@ def reload_experts_from_disk(
 
     ``model_path`` is the checkpoint directory ``model`` was loaded from, which
     for a drafter can differ from the target's (a separate draft checkpoint).
-    ``suffix_map`` renames checkpoint projection suffixes onto the reloaders'
-    bucket names; pass ``DRAFTER_SUFFIX_MAP`` for drafter reloads. All other
-    inputs (layer names, placement maps, shards, name mapper) come from ``model``.
+    Layer names, placement maps, shards, and checkpoint name normalization
+    come from ``model``.
     """
     if not reassignments:
         return 0
@@ -329,7 +320,7 @@ def reload_experts_from_disk(
     shards = _collect_safetensors_shards(model_path, model)
     if not shards:
         raise RuntimeError(f"[FT] scale_down expert reload requires a safetensors checkpoint; {model_path} has none.")
-    _collect_matching_weights(shards, name_mapper, wanted, _WANTED_SUFFIXES, expert_weights, matched, suffix_map)
+    _collect_matching_weights(shards, name_mapper, wanted, _WANTED_SUFFIXES, expert_weights, matched)
     # A pair with no checkpoint weight would silently keep its slot's previous occupant, so fail.
     unmatched = [layer_expert for layer_expert in local_slots if layer_expert not in matched]
     if unmatched:

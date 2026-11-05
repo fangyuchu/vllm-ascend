@@ -149,7 +149,7 @@ class DeepseekV4DSparkModel(nn.Module):
 
         first_layer = self.layers[str(self.mtp_start_layer_idx)]
         self.use_sequence_parallel_moe = first_layer.use_sequence_parallel_moe
-        # Cover the redundant slots the draft MoE allocates (upstream #57549).
+        # Include redundant physical slots so every routed slot loads its weights.
         self.num_redundant_experts = first_layer.mlp.n_redundant_experts
 
         # Stack the WKV projections from all DSpark layers into one linear.
@@ -406,8 +406,8 @@ class DeepseekV4DSparkModel(nn.Module):
 @support_torch_compile
 class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV2MixtureOfExperts, SupportsEagle3):
     draft_id_to_target_id = None
-    # Shares the target's mapper: quant description and FT reload both key on
-    # the mapped namespace. Reuse the instance so the two cannot drift.
+    # Quantization lookup and FT reload use the same checkpoint-name mapping,
+    # e.g. mtp.0.ffn.experts.7.w1.weight -> model.mtp.0.mlp.experts.7.gate_proj.weight.
     hf_to_vllm_mapper = AscendDeepseekV4ForCausalLM.hf_to_vllm_mapper
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
