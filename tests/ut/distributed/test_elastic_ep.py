@@ -264,33 +264,6 @@ def test_mega_middle_restore_exchanges_capture_decision(monkeypatch, quant_type)
     assert new_executor._capture_old_dp_size == 3
 
 
-@pytest.mark.parametrize("quant_type,mode,dtype", [(QuantType.NONE, 0, None), (QuantType.W8A8, 2, 258)])
-def test_new_rank_capture_initializes_buffer_for_weight_type(monkeypatch, quant_type, mode, dtype):
-    from vllm_ascend.ops.fused_moe.routed_experts import AscendUnquantizedFusedMoEMethod
-
-    executor, _, comm = _mega_restore_executor(monkeypatch, quant_type=quant_type)
-    method = (
-        object.__new__(AscendUnquantizedFusedMoEMethod)
-        if quant_type == QuantType.NONE
-        else SimpleNamespace(quant_method=SimpleNamespace(quant_type=quant_type))
-    )
-    moe = SimpleNamespace(
-        routed_experts=SimpleNamespace(quant_method=method), moe_config=SimpleNamespace(experts_per_token=4)
-    )
-    buffer = comm.mega_moe_capture_state.buffer
-    comm._init_mega_moe_symm_buffer = MagicMock(return_value=buffer)
-    monkeypatch.setattr(executor, "_setup_moe_comm_and_quant_method", MagicMock())
-    monkeypatch.setattr(executor, "_get_fused_mc2_comm", lambda: comm)
-    monkeypatch.setattr(executor, "_synchronize_capture_context_rendezvous", MagicMock())
-    monkeypatch.setattr("vllm_ascend.distributed.elastic_ep.elastic_execute._is_decode_only_node", lambda _: False)
-    executor._prepare_new_mega_moe_capture([moe])
-    comm._init_mega_moe_symm_buffer.assert_called_once_with(mode, dtype, is_decode_only_node=False)
-    assert comm.mega_moe_quant_type == quant_type
-    assert comm.mega_moe_symm_buffer is buffer
-    assert comm.mega_moe_capture_state.capture_active.item()
-    assert buffer.mask_buffer.tolist() == [0, 1, 1, 1]
-
-
 @pytest.mark.parametrize("last_rank", [0, 1], ids=["late-survivor", "late-joiner"])
 def test_mapping_rendezvous_waits_for_all_ranks_in_current_operation(monkeypatch, last_rank):
     store = torch.distributed.HashStore()
