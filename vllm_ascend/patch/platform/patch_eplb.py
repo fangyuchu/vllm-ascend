@@ -12,6 +12,7 @@ from typing import Any, Literal, get_args
 
 import numpy as np
 import torch
+import vllm.distributed.nixl_utils as _nixl_utils
 from pydantic.dataclasses import rebuild_dataclass
 from vllm.config import get_current_vllm_config
 from vllm.config import parallel as _parallel_config
@@ -53,6 +54,13 @@ class _AscendAsyncLayerResult:
     transfer_metadata: Any
     consumed_event: Any
     is_last_result: bool
+
+
+# Ascend does not use NIXL; EPLB is routed to torch_gloo (the stateless gloo
+# cpu_group is registered into torch's global _world). Pretend NIXL is
+# available so vLLM's "elastic EP + async EPLB requires NIXL" check passes;
+# the communicator is normalized back to torch_gloo in _validate_eplb_config.
+_nixl_utils.is_nixl_available = lambda: True
 
 
 class _DeferredConsumedEvent:

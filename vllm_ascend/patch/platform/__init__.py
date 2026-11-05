@@ -42,6 +42,7 @@ if os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1") or os.getenv("EXP
 import vllm_ascend.patch.platform.patch_swa_bounded_replay  # noqa
 import vllm_ascend.patch.platform.patch_balance_schedule  # noqa
 import vllm_ascend.patch.platform.patch_engine_core  # noqa
+import vllm_ascend.patch.platform.patch_elastic_ep  # noqa
 
 import vllm_ascend.patch.platform.patch_kv_cache_coordinator  # noqa
 import vllm_ascend.patch.platform.patch_speculative_config  # noqa
@@ -77,6 +78,8 @@ import vllm_ascend.patch.platform.patch_example_connector  # noqa
 #       Remove this patch when upstream's `is_cuda_alike()` covers Ascend NPU
 #       or when the device-index qualification is applied unconditionally.
 #
+import vllm_ascend.patch.platform.patch_stateless_coordinator  # noqa
+
 # ** File: platform/patch_kv_cache_utils.py **
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.v1.core.kv_cache_utils` (v0.32.0) /

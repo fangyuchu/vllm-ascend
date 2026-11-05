@@ -1752,6 +1752,13 @@ class TestTopLevelSwitchTypeValidation(TestBase):
         self.assertFalse(is_mega_moe_supported())
 
     @_clean_up
+    def test_mega_moe_opt_in_keeps_normalized_fused_mode(self):
+        with patch("vllm_ascend.ascend_config.importlib.util.find_spec", return_value=True):
+            config = AscendConfig(enable_fused_mc2=2, sparse_kv_offload_config=SimpleNamespace(enabled=False))
+        self.assertEqual(config.enable_fused_mc2, 1)
+        self.assertTrue(is_mega_moe_supported())
+
+    @_clean_up
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
     def test_minimax_m3_rejects_fused_mc2_dispatch_ffn_combine(self, mock_fix):
         vc = VllmConfig()
