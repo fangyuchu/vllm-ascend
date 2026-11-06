@@ -386,13 +386,14 @@ class DeepseekV4DSparkModel(nn.Module):
         return logits_processor(lm_head, self.norm(hidden_states))
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        first_layer = self.layers[str(self.mtp_start_layer_idx)]
         return fused_moe_make_expert_params_mapping(
             self,
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts,
-            num_redundant_experts=0,
+            num_redundant_experts=first_layer.mlp.n_redundant_experts,
         )
 
 
@@ -439,6 +440,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV2MixtureOfExperts, Support
                 self.moe_mlp_layers.append(layer.mlp)
                 self.moe_layers.append(layer.mlp.experts)
 
+        self.num_moe_layers = len(self.moe_layers)
         self.extract_moe_parameters(example_moe)
 
     def forward(
