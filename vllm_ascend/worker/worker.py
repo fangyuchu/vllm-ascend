@@ -518,12 +518,6 @@ class NPUWorker(WorkerBase):
         # shift self.local_rank by dp_local_rank * tp_pp_world_size so
         # that each DP group binds to a distinct set of NPUs.
         parallel_config = self.parallel_config
-        logger.info(
-            "[FT_DIAG] NPU worker initializing: worker_rank=%s, dp_rank=%s, enable_fault_tolerance=%s",
-            self.rank,
-            parallel_config.data_parallel_rank,
-            parallel_config.enable_fault_tolerance,
-        )
         if self.parallel_config.enable_fault_tolerance:
             if self.use_v2_model_runner:
                 # Model Runner V2 + fault tolerance task queue
@@ -664,11 +658,6 @@ class NPUWorker(WorkerBase):
         self._init_worker_distributed_environment()
         if self.parallel_config.enable_fault_tolerance:
             self.worker_sentinel = WorkerSentinel(worker=self, device=device)
-            logger.info(
-                "[FT_DIAG] NPU WorkerSentinel created: worker_rank=%s, dp_rank=%s",
-                self.rank,
-                self.parallel_config.data_parallel_rank,
-            )
         # Set random seed.
         set_random_seed(self.model_config.seed)
         # Initialize device properties used by triton kernels.
@@ -1076,10 +1065,7 @@ class NPUWorker(WorkerBase):
             empty_cache_context = nullcontext()
 
         with context, empty_cache_context, set_current_vllm_config(self.vllm_config):
-            if load_dummy_weights:
-                self.model_runner.load_model(True)
-            else:
-                self.model_runner.load_model()
+            self.model_runner.load_model(load_dummy_weights)
 
         if getattr(self, "use_v2_model_runner", False) and has_ec_transfer():
             get_ec_transfer().start_worker_services()

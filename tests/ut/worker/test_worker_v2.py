@@ -126,7 +126,7 @@ class TestNPUWorkerV2(TestBase):
         connector = mock_get_ec_transfer.return_value
         connector.start_worker_services.side_effect = lambda: events.append("ec")
         worker = self._make_worker_for_lifecycle_test()
-        worker.model_runner.load_model.side_effect = lambda: events.append("model")
+        worker.model_runner.load_model.side_effect = lambda load_dummy_weights: events.append("model")
 
         worker.load_model()
 
@@ -197,14 +197,12 @@ class TestNPUWorkerV2(TestBase):
                 worker.worker_sentinel = WorkerSentinel(worker, device=MagicMock())
 
                 worker.load_model(load_dummy_weights=load_dummy_weights)
+                worker.model_runner.load_model.assert_called_once_with(load_dummy_weights)
 
                 if load_dummy_weights:
-                    worker.model_runner.load_model.assert_called_once_with(True)
                     mock_get_manager.assert_not_called()
                     model_states["model"] = model_state
                     worker.worker_sentinel.init_num_local_experts()
-                else:
-                    worker.model_runner.load_model.assert_called_once_with()
                 mock_get_manager.return_value.set_num_local_physical_experts.assert_called_once_with(64)
 
     @patch("vllm_ascend.worker.worker.get_ascend_config")
