@@ -53,9 +53,10 @@ class AscendPrepareDrain:
 
     def _new_workers_dist_init_ready(self) -> bool:
         state = self.state
+        existing_ranks = state.reconfig_request.existing_dp_ranks
         ready_keys = new_worker_dist_init_ready_keys(
             state.new_parallel_config,
-            state.old_dp_group.size(),
+            existing_ranks if existing_ranks is not None else list(range(state.old_dp_group.size())),
             state.new_parallel_config.data_parallel_size,
             state.new_parallel_config.world_size,
         )

@@ -5,7 +5,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from threading import Event
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
@@ -97,12 +97,11 @@ def test_prepare_waits_for_worker_startup_without_rechecking_a_busy_store(monkey
         _prepare_workers=MagicMock(side_effect=[False, True]),
         _prepare_future=None,
         _collective_rpc=MagicMock(return_value=[False]),
-        reconfig_request=SimpleNamespace(operation_id="restore"),
+        reconfig_request=SimpleNamespace(operation_id="restore", existing_dp_ranks=[1, 2, 3]),
         old_dp_group=SimpleNamespace(size=lambda: 3),
         new_parallel_config=SimpleNamespace(
             data_parallel_size=4,
             world_size=2,
-            _eep_existing_dp_ranks=[1, 2, 3],
             data_parallel_master_ip="127.0.0.1",
             _coord_store_port=1234,
         ),
@@ -119,6 +118,10 @@ def test_prepare_waits_for_worker_startup_without_rechecking_a_busy_store(monkey
     assert not state._prepare_workers()
     drain._prepare_workers.assert_not_called()
     store.check.assert_called_once()
+    assert store.check.call_args.args[0] == [
+        "eep_new_worker_dist_init_ready/1234/0",
+        "eep_new_worker_dist_init_ready/1234/1",
+    ]
     store.check.return_value = True
     assert not state._prepare_workers()
     state._collective_rpc.assert_not_called()
@@ -130,7 +133,8 @@ def test_prepare_waits_for_worker_startup_without_rechecking_a_busy_store(monkey
 
 
 @pytest.mark.parametrize("rank", [0, 3])
-def test_local_capture_preserves_dp_shape_without_collectives_or_serving_epochs(rank):
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_local_capture_skips_dp_sync_but_preserves_required_tp_barrier(rank, tp_size):
     descriptor = BatchExecutionDescriptor(cg_mode=CUDAGraphMode.PIECEWISE, num_tokens=8, num_reqs=2)
     manager = MagicMock()
     manager.dispatch.return_value = descriptor
@@ -139,6 +143,7 @@ def test_local_capture_preserves_dp_shape_without_collectives_or_serving_epochs(
     runner = SimpleNamespace(_elastic_ep_dp_state=progress)
     run = track_dp_collectives(lambda self, **kwargs: sync_cudagraph_and_dp_padding(**kwargs))
     install_dp_collective_tracking()
+    tp_group = object()
     with (
         skip_dp_coordination(),
         patch(
@@ -147,8 +152,9 @@ def test_local_capture_preserves_dp_shape_without_collectives_or_serving_epochs(
         ),
         patch(
             "vllm.v1.worker.gpu.dp_utils.get_tp_group",
-            side_effect=AssertionError("TP group accessed"),
+            return_value=SimpleNamespace(cpu_group=tp_group),
         ),
+        patch("vllm.v1.worker.gpu.dp_utils.dist.barrier") as tp_barrier,
         patch(
             "vllm.v1.worker.gpu.dp_utils.dist.all_reduce",
             side_effect=AssertionError("DP all-reduce called"),
@@ -163,10 +169,11 @@ def test_local_capture_preserves_dp_shape_without_collectives_or_serving_epochs(
             uniform_token_count=None,
             dp_size=4,
             dp_rank=rank,
-            parallel_config=SimpleNamespace(enable_fault_tolerance=True, tensor_parallel_size=2),
+            parallel_config=SimpleNamespace(enable_fault_tolerance=True, tensor_parallel_size=tp_size),
         )
         assert sync.num_tokens_across_dp.tolist() == [8, 8, 8, 8]
         assert progress.tensor.tolist() == [17, 17]
+        assert tp_barrier.call_args_list == ([call(group=tp_group)] if tp_size > 1 else [])
 
 
 def test_worker_progress_storage_is_shared_without_executor_tensor_serialization():

@@ -130,7 +130,7 @@ class WorkerSentinel(GPUWorkerSentinel):
         and a dummy-batch runnability check on top.
         """
         self._validate_scale_down_preconditions()
-        super().scale_down(ft_request)
+        num_redundant_experts = super().scale_down(ft_request)
 
         # Verify the redistributed model is runnable before reporting healthy.
         parallel_config = self.worker.parallel_config
@@ -143,6 +143,7 @@ class WorkerSentinel(GPUWorkerSentinel):
         self.activate_cpu_group_timeouts(ft_request)
         torch.npu.synchronize()
         logger.info("[FT] Ascend scale_down validation complete; worker is ready for the engine recovery vote.")
+        return num_redundant_experts
 
     def _validate_scale_down_preconditions(self) -> None:
         if not self.worker.use_v2_model_runner:
@@ -172,7 +173,7 @@ class WorkerSentinel(GPUWorkerSentinel):
                 "(aclnn V3+); please upgrade the CANN/torch_npu version."
             )
 
-    def _redistribute_experts(self, dead_ep_ranks: set[int]) -> None:
+    def _redistribute_experts(self, dead_ep_ranks: set[int]) -> int:
         """Redistribute experts onto the surviving slots after scale-down.
 
         Overrides the upstream flow so reassigned weights reload through the
@@ -214,6 +215,7 @@ class WorkerSentinel(GPUWorkerSentinel):
         refresh_model_routing_tables(eplb_model_state)
         if not get_ep_all2all_manager().uses_mega_moe:
             self._densify_routing_tables(eplb_model_state)
+        return int((p2l[0] >= 0).sum().item()) - num_logical
 
     def _densify_routing_tables(self, eplb_model_state) -> None:
         """Renumber the kernel-facing routing tables into the densified id space.

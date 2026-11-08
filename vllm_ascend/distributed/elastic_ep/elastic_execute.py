@@ -748,7 +748,6 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         parallel_config._data_parallel_master_port_list = request.new_data_parallel_master_port_list
         parallel_config._coord_store_port = request.coord_store_port
         parallel_config._data_parallel_master_rank = request.data_parallel_master_rank
-        parallel_config._eep_existing_dp_ranks = request.existing_dp_ranks
 
     def receive_expert_mapping(self) -> torch.Tensor:
         mapping = super().receive_expert_mapping()
