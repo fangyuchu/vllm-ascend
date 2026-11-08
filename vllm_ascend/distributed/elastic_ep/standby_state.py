@@ -8,6 +8,8 @@ from vllm.distributed.parallel_state import (
 from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
 from vllm.distributed.utils import get_cached_tcp_store_client
 
+from vllm_ascend.distributed.stateless_coordinator import register_stateless_coordinator_pgs
+
 _STANDBY_MC2: StatelessGroupCoordinator | None = None
 
 
@@ -47,6 +49,7 @@ def create_ascend_standby_groups(
         backend,
         coord_store=coord_store,
     )
+    register_stateless_coordinator_pgs(_STANDBY_MC2)
 
 
 def pop_ascend_standby_groups() -> dict:

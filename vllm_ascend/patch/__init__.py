@@ -1728,18 +1728,7 @@
 
 # ** 35. File: platform/patch_stateless_coordinator.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#   1. `vllm.distributed.utils.stateless_init_torch_distributed_process_group`
-#      `vllm.distributed.utils.stateless_destroy_torch_distributed_process_group`
-#    Why:
-#       Stateless PG helpers do not register the group into torch's global
-#       ``_world``, so HCCL groups are unusable with torch.distributed APIs.
-#    How:
-#       Register HCCL groups into ``_world`` on init; remove on destroy.
-#    Related PR (if no, explain why):
-#       No, NPU-specific HCCL stateless process-group registration.
-#    Future Plan:
-#       Remove if upstream registers stateless HCCL groups into ``_world``.
-#   2. `vllm.distributed.stateless_coordinator.CudaCommunicator`
+#   1. `vllm.distributed.stateless_coordinator.CudaCommunicator`
 #    Why:
 #       Upstream hardcodes ``CudaCommunicator``; Ascend needs an HCCL-aware
 #       device communicator.
@@ -1748,6 +1737,6 @@
 #    Related PR (if no, explain why):
 #       No, NPU-specific HCCL communicator selection requirement.
 #    Future Plan:
-#       Remove if upstream ``StatelessGroupCoordinator`` gains a platform
-#       hook for communicator selection.
+#       Remove when upstream ``StatelessGroupCoordinator`` constructs the
+#       device communicator using the platform-selected class.
 #

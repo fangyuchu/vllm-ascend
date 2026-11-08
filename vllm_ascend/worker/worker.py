@@ -36,8 +36,11 @@ from vllm import envs
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.distributed import (
     ensure_model_parallel_initialized,
+    get_dp_group,
+    get_ep_group,
     get_eplb_group,
     get_pcp_group,
+    get_world_group,
     init_distributed_environment,
 )
 from vllm.distributed.ec_transfer import (
@@ -54,7 +57,6 @@ from vllm.distributed.kv_transfer import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorHandshakeMetadata
 from vllm.distributed.parallel_state import Handle, get_pp_group, get_tp_group
-from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
 from vllm.logger import logger
 from vllm.lora.request import LoRARequest
 from vllm.platforms import current_platform
@@ -110,7 +112,10 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     plan_sparse_kv_offload_memory,
 )
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
-from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
+from vllm_ascend.distributed.parallel_state import (
+    get_mc2_group,
+    init_ascend_model_parallel,
+)
 from vllm_ascend.distributed.stateless_coordinator import register_stateless_coordinator_pgs
 from vllm_ascend.observability.runtime_guard.hooks import runtime_guard_idle_step
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
@@ -1570,9 +1575,14 @@ class NPUWorker(WorkerBase):
         init_ascend_model_parallel(self.parallel_config, self.vllm_config.engram_config)
         ensure_ec_transfer_initialized(self.vllm_config)
         if self.parallel_config.enable_elastic_ep:
-            eplb_group = get_eplb_group()
-            if isinstance(eplb_group, StatelessGroupCoordinator):
-                register_stateless_coordinator_pgs(eplb_group)
+            for group in (
+                get_world_group(),
+                get_dp_group(),
+                get_ep_group(),
+                get_eplb_group() if self.parallel_config.enable_eplb else None,
+                None if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH else get_mc2_group(),
+            ):
+                register_stateless_coordinator_pgs(group)
 
     def get_supported_pooling_tasks(self):
         return self.model_runner.get_supported_pooling_tasks()

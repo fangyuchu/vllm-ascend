@@ -143,6 +143,31 @@ def test_get_global_rank_defaults_to_current_config():
         assert get_global_rank() == 7
 
 
+def test_stateless_registration_preserves_rank_space_and_recovery_visibility(monkeypatch):
+    from torch.distributed.distributed_c10d import _world
+    from vllm.distributed.device_communicators.base_device_communicator import DeviceCommunicatorBase
+    from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
+
+    from vllm_ascend.distributed.stateless_coordinator import (
+        register_stateless_coordinator_pgs,
+        unregister_stateless_coordinator_pgs,
+    )
+
+    cpu = MagicMock(group_name="test_stateless_cpu")
+    device = MagicMock(group_name="test_stateless_device")
+    cpu.rank.return_value = 1
+    cpu.size.return_value = device.size.return_value = 3
+    coordinator = object.__new__(StatelessGroupCoordinator)
+    coordinator.backend = "hccl"
+    monkeypatch.setattr("vllm.config.get_current_vllm_config_or_none", lambda: None)
+    DeviceCommunicatorBase.__init__(coordinator, cpu, device_group=device, global_ranks=[0, 2, 3], global_world_size=4)
+    register_stateless_coordinator_pgs(coordinator)
+    assert (coordinator.rank, coordinator.global_rank, coordinator.ranks) == (1, 2, [0, 2, 3])
+    assert (_world.pg_map[device][0], _world.pg_map[cpu][0]) == ("hccl", "gloo")
+    unregister_stateless_coordinator_pgs(coordinator)
+    assert cpu not in _world.pg_map and device not in _world.pg_map
+
+
 @pytest.mark.parametrize("size", [1, 4])
 @pytest.mark.parametrize("pcp_size", [1, 2])
 def test_kvpp_group_stays_inside_pipeline_stage(monkeypatch, size, pcp_size):

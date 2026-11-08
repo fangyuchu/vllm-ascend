@@ -1,13 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
-"""Register the stateless EPLB group's CPU (gloo) process group in ``_world``.
+"""Register stateless groups after their device communicator is constructed.
 
-Upstream stateless PGs are deliberately absent from ``_world``, so the
-module-level ``torch.distributed`` APIs used by the HIXL EPLB session and the
-dynamic-EPLB P2P transfer cannot resolve them. Register *after* the coordinator
-(and its device communicator) is built, or ``DeviceCommunicatorBase`` would
-misclassify the group as stateful. Only the gloo group needs it; unregistration
-is paired in ``AscendElasticEPScalingExecutor._destroy_retired_groups``.
+Gloo registration supports EPLB's torch APIs; HCCL registration additionally
+allows torch_npu fault recovery to find the device groups. Unregistration is
+paired with group retirement.
 """
 
 from torch.distributed import ProcessGroup
@@ -31,17 +28,21 @@ def _unregister_pg(pg: ProcessGroup) -> None:
     _world.pg_backend_config.pop(pg, None)
 
 
-def register_stateless_coordinator_pgs(
-    coordinator: StatelessGroupCoordinator,
-) -> None:
-    """Register the coordinator's gloo CPU group into ``_world``; pair with the unregister below."""
+def register_stateless_coordinator_pgs(coordinator: StatelessGroupCoordinator | None) -> None:
+    """Register CPU and device groups after coordinator construction."""
+    if not isinstance(coordinator, StatelessGroupCoordinator):
+        return
     if coordinator.cpu_group is not None:
         _register_pg(coordinator.cpu_group, "gloo")
+    if coordinator.device_group is not None:
+        _register_pg(coordinator.device_group, coordinator.backend)
 
 
-def unregister_stateless_coordinator_pgs(
-    coordinator: StatelessGroupCoordinator,
-) -> None:
+def unregister_stateless_coordinator_pgs(coordinator: StatelessGroupCoordinator | None) -> None:
     """Mirror ``register_stateless_coordinator_pgs`` on destruction."""
+    if not isinstance(coordinator, StatelessGroupCoordinator):
+        return
     if coordinator.cpu_group is not None:
         _unregister_pg(coordinator.cpu_group)
+    if coordinator.device_group is not None:
+        _unregister_pg(coordinator.device_group)

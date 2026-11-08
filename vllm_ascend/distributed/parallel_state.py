@@ -16,6 +16,7 @@ from vllm.distributed.parallel_state import (
 from vllm.distributed.utils import get_cached_tcp_store_client
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.distributed.stateless_coordinator import unregister_stateless_coordinator_pgs
 
 if TYPE_CHECKING:
     from vllm.config import EngramConfig
@@ -88,6 +89,7 @@ def register_stateless_group_rank(device_group, rank: int, world_size: int):
         _world.pg_group_ranks[device_group] = group_ranks
         yield
     finally:
+        # Restore only PyTorch's rank lookup; the CANN group update remains effective.
         if had_mapping:
             _world.pg_group_ranks[device_group] = previous_mapping
         else:
@@ -358,6 +360,7 @@ def destroy_ascend_model_parallel():
 
     global _ASCEND_MODEL_PARALLEL_INITIALIZED, _MC2
     if _MC2:
+        unregister_stateless_coordinator_pgs(_MC2)
         _MC2.destroy()
     _MC2 = None
 

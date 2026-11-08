@@ -17,6 +17,8 @@ from vllm.distributed import get_dp_group, get_ep_group, get_tp_group
 from vllm.distributed.elastic_ep.elastic_execute import ElasticEPScalingExecutor
 from vllm.distributed.elastic_ep.standby_state import (
     get_standby_dp_group,
+    get_standby_ep_group,
+    get_standby_world_group,
     pop_standby_groups,
 )
 from vllm.distributed.parallel_state import _replace_active_groups
@@ -494,6 +496,19 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
             coord_store_port=reconfig_request.coord_store_port,
         )
 
+    def _prepare_eplb_communicator(self, eplb_group) -> None:
+        # Current upstream has no _create_backend_standby_groups hook.
+        for group in (get_standby_world_group(), get_standby_dp_group(), get_standby_ep_group(), eplb_group):
+            register_stateless_coordinator_pgs(group)
+        super()._prepare_eplb_communicator(eplb_group)
+
+    def _destroy_retired_groups(self, groups) -> None:
+        try:
+            for group in groups:
+                unregister_stateless_coordinator_pgs(group)
+        finally:
+            super()._destroy_retired_groups(groups)
+
     def stage_standby_moe_quant_methods(self, all2all_manager) -> None:
         # MegaMoe keeps the quant methods referenced by the existing graphs.
         if not self._mega_moe_precommit_capture:
@@ -541,20 +556,6 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
                 new_dp_size=new_dp_size,
             )
 
-    def _prepare_eplb_communicator(self, eplb_group) -> None:
-        # Adapt PR #144's standby registration to the current upstream hook.
-        if eplb_group is not None:
-            register_stateless_coordinator_pgs(eplb_group)
-        super()._prepare_eplb_communicator(eplb_group)
-
-    def _destroy_retired_groups(self, groups) -> None:
-        try:
-            for group in groups:
-                if isinstance(group, StatelessGroupCoordinator):
-                    unregister_stateless_coordinator_pgs(group)
-        finally:
-            super()._destroy_retired_groups(groups)
-
     def _release_cuda_graphs(self) -> None:
         if isinstance(self.worker.model_runner.model, UBatchWrapper):
             raise RuntimeError("DBO is not yet supported in elastic EP")
@@ -589,6 +590,7 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         super().switch_and_remove()
         retired_mc2 = _replace_ascend_active_groups(mc2=None)
         if retired_mc2 is not None:
+            unregister_stateless_coordinator_pgs(retired_mc2)
             retired_mc2.destroy()
 
     def _activate_ascend_standby_groups(self):

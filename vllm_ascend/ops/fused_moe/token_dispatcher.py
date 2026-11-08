@@ -162,14 +162,6 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         backend = device_group._get_backend(torch.device("npu"))
         self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
 
-    @staticmethod
-    def _get_moe_expert_num(
-        token_dispatch_input: MoETokenDispatchInput,
-    ) -> int:
-        expert_map = token_dispatch_input.routing.expert_map
-        assert expert_map is not None, "expert_map is required for MC2 token dispatch."
-        return len(expert_map) + (token_dispatch_input.routing.global_redundant_expert_num)
-
     def _get_dispatch_quant_mode(
         self,
         token_dispatch_input: MoETokenDispatchInput,
