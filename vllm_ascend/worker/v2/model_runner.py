@@ -74,6 +74,11 @@ from vllm_ascend.core.profiling_chunk_predictor import (
     _finish_profiling_chunk_timing,
     _start_profiling_chunk_timing,
 )
+from vllm_ascend.distributed.elastic_ep.dp_collective import (
+    WorkerDPCollectiveState,
+    needs_worker_progress,
+    track_dp_collectives,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import (
     bind_dspark_context_receiver,
     configure_dspark_kv_transfer,
@@ -159,6 +164,7 @@ class NPUModelRunner(GPUModelRunner):
         # capacity while setting up MC2 communication.
         set_potential_max_tokens(vllm_config)
         parallel_config = vllm_config.parallel_config
+        self._elastic_ep_dp_state = WorkerDPCollectiveState() if needs_worker_progress(vllm_config) else None
 
         spec_pp_support = resolve_spec_pp_support(vllm_config)
         with torch_cuda_wrapper():
@@ -642,6 +648,7 @@ class NPUModelRunner(GPUModelRunner):
     # wave sync keeps running inside the inference-mode context.
     @torch.inference_mode()
     @runtime_guard_step
+    @track_dp_collectives
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,

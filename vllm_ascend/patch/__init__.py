@@ -28,6 +28,14 @@
 
 # What's Patched and how it works:
 # --------------------------------
+# * platform/patch_elastic_ep.py:
+#   Target: ElasticEPScalingState.__init__, DPAsyncMPClient._eep_commit_pause_mode.
+#   Why: MegaMoe restore needs a common Worker boundary and preserves serving graphs.
+#   How: Attach the Ascend prepare controller and select keep for local capture;
+#        retain upstream pause selection for other operations.
+#   Related PR: No upstream hooks for prepare controllers or commit pause selection.
+#   Future plan: Use upstream preparation and pause hooks when available.
+# --------------------------------
 # * worker/patch_kda_recoverssm.py:
 #   Target: Kimi KDA's KDARecoverSSMCommitContext module binding.
 #   Why: The upstream metadata builder imports its CUDA context directly.
@@ -846,6 +854,15 @@
 #    Related PR: https://github.com/vllm-project/vllm/pull/54523
 #    Future Plan:
 #       Re-add only if a supported pin rejects PCP+DP.
+
+#   2. `vllm.config.vllm.VllmConfig._get_v2_model_runner_unsupported_features`
+#    Why:
+#       Ascend V2 runner supports elastic EP, which upstream lists as
+#       unsupported (vllm/config/vllm.py). Drop it from the returned list.
+#    Related PR (if no, explain why):
+#       No, NPU V2 model runner supports elastic EP.
+#    Future Plan:
+#       Remove when upstream V2 runner supports elastic EP on non-CUDA backends.
 #
 #   3. `vllm.config.vllm.VllmConfig._get_v1_model_runner_unsupported_features`
 #    Why:
@@ -1708,4 +1725,18 @@
 #    Future Plan:
 #       Remove this patch when upstream provides a backend capability hook for
 #       enabling MoE sequence parallelism with DP=1.
+
+# ** 35. File: platform/patch_stateless_coordinator.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.distributed.stateless_coordinator.CudaCommunicator`
+#    Why:
+#       Upstream hardcodes ``CudaCommunicator``; Ascend needs an HCCL-aware
+#       device communicator.
+#    How:
+#       Replace ``CudaCommunicator`` with ``NPUCommunicator`` in the module.
+#    Related PR (if no, explain why):
+#       No, NPU-specific HCCL communicator selection requirement.
+#    Future Plan:
+#       Remove when upstream ``StatelessGroupCoordinator`` constructs the
+#       device communicator using the platform-selected class.
 #

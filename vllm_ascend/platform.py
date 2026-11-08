@@ -19,12 +19,14 @@ from __future__ import annotations
 
 import math
 import os
+from datetime import timedelta
 from importlib import import_module, util
 from typing import TYPE_CHECKING, Any, get_args
 from uuid import uuid4
 
 import torch
 import vllm.envs as envs_vllm
+from torch.distributed.distributed_c10d import Backend, PrefixStore, ProcessGroup
 from vllm.logger import logger
 from vllm.platforms import Platform, PlatformEnum
 
@@ -764,6 +766,55 @@ class NPUPlatform(Platform):
             "dynamic_mx_quant_scale_alg": dynamic_mx_quant_scale_alg,
         }
 
+    @classmethod
+    def stateless_init_device_torch_dist_pg(
+        cls,
+        backend: str,
+        prefix_store: PrefixStore,
+        group_rank: int,
+        group_size: int,
+        timeout: timedelta,
+    ) -> ProcessGroup:
+        """Create a stateless HCCL ProcessGroup"""
+        from torch_npu._C._distributed_c10d import ProcessGroupHCCL
+
+        pg = ProcessGroup(prefix_store, group_rank, group_size)
+
+        # Agree on one unique comm label for this group via the group store:
+        # identical on every rank and fresh per group creation, so repeated
+        # elastic scaling rounds never reuse a label.
+        if group_rank == 0:
+            hccl_comm_name = uuid4().hex
+            pg.get_group_store().set("hccl_comm_name", hccl_comm_name)
+        else:
+            hccl_comm_name = pg.get_group_store().get("hccl_comm_name").decode("utf-8")
+
+        backend_options = ProcessGroupHCCL.Options()
+
+        backend_options.group_id = hccl_comm_name
+        backend_options._timeout = timeout
+
+        # Create Backend object
+        backend = Backend("hccl")
+
+        # Set default backend for ProcessGroup
+        pg._set_default_backend(Backend.backend_type_map[backend])
+
+        device = torch.device("npu")
+        if hasattr(backend_options, "_device"):
+            # Bind background preparation to the worker's selected NPU.
+            backend_options._device = torch.device(f"npu:{torch.npu.current_device()}")
+
+        backend_class = ProcessGroupHCCL(prefix_store, group_rank, group_size, backend_options)
+
+        backend_class._set_sequence_number_for_group()
+        backend_type = ProcessGroup.BackendType.CUSTOM
+        pg._register_backend(device, backend_type, backend_class)
+        backend_class._set_hccl_comm_name(hccl_comm_name)
+
+        pg._set_group_desc("undefined")
+        return pg
+
 
 def _configure_minimax_m3_a5_mixed_kv_cache(vllm_config: VllmConfig) -> None:
     """Keep MiniMax-M3 GQA KV cache in BF16 on the A5 FP8 path."""
@@ -1103,6 +1154,11 @@ def _validate_eplb_config(vllm_config: VllmConfig) -> None:
             raise ValueError("additional_config.eplb_config.load_collection_phase requires --enable-eplb.")
         if vllm_config.parallel_config.enable_eplb:
             upstream_eplb_config = vllm_config.parallel_config.eplb_config
+            if vllm_config.parallel_config.enable_elastic_ep and upstream_eplb_config.communicator in (
+                "pynccl",
+                "nixl",
+            ):
+                upstream_eplb_config.communicator = "torch_gloo"
             if upstream_eplb_config.communicator not in (None, "torch_gloo", "hixl"):
                 raise ValueError(
                     "Async EPLB on Ascend requires the torch_gloo or hixl communicator "
@@ -1117,7 +1173,10 @@ def _validate_eplb_config(vllm_config: VllmConfig) -> None:
                 )
                 upstream_eplb_config.use_async = True
             if vllm_config.parallel_config.enable_elastic_ep:
-                raise ValueError("Async EPLB is not supported with elastic EP on Ascend.")
+                from vllm_ascend.patch.platform.patch_eplb import _clear_auto_selected
+
+                upstream_eplb_config.communicator = "torch_gloo"
+                _clear_auto_selected(upstream_eplb_config)
     elif {"load_collection_phase", "stair_config"} & eplb_config.keys():
         raise ValueError(
             "stair_config and load_collection_phase are only supported by Model Runner V2; "
