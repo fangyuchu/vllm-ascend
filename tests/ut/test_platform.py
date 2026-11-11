@@ -564,18 +564,37 @@ class TestNPUPlatform(TestBase):
             vllm_config.parallel_config.eplb_config.communicator,
         )
 
-    def test_validate_eplb_config_async_rejects_elastic_ep(self):
+    def test_validate_eplb_config_async_allows_elastic_ep(self):
+        from vllm_ascend.patch.platform import patch_eplb
+
         vllm_config = self.mock_vllm_config()
         vllm_config.use_v2_model_runner = True
         vllm_config.parallel_config.enable_eplb = True
         vllm_config.parallel_config.enable_elastic_ep = True
-        vllm_config.parallel_config.eplb_config = MagicMock(
+        vllm_config.parallel_config.eplb_config = SimpleNamespace(
             use_async=True,
             communicator=None,
         )
+        ascend_eplb_config = SimpleNamespace(stair_config=object())
 
-        with patch.dict("os.environ", {}, clear=True), self.assertRaisesRegex(ValueError, "elastic EP"):
-            _validate_eplb_config(vllm_config)
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch.object(
+                patch_eplb,
+                "_group_hixl_binding_consensus",
+                side_effect=AssertionError("Joining ranks cannot run EPLB selection collectives alone"),
+            ),
+        ):
+            for communicator in (None, "hixl", "torch_gloo", "pynccl", "nixl"):
+                with self.subTest(communicator=communicator):
+                    vllm_config.parallel_config.eplb_config.communicator = communicator
+                    patch_eplb._mark_auto_selected(vllm_config.parallel_config.eplb_config)
+                    _validate_eplb_config(vllm_config)
+                    self.assertIs(
+                        patch_eplb.resolve_ascend_eplb_communicator(vllm_config.parallel_config, ascend_eplb_config),
+                        ascend_eplb_config.stair_config,
+                    )
+                    self.assertEqual(vllm_config.parallel_config.eplb_config.communicator, "torch_gloo")
 
     def test_validate_eplb_config_async_rejects_nccl_communicator(self):
         vllm_config = self.mock_vllm_config()
@@ -1148,6 +1167,8 @@ class TestNPUPlatform(TestBase):
             )
 
         self.assertFalse(kwargs["in_profile_run"])
+        self.assertIs(kwargs["use_mega_moe"], True)
+        self.assertIs(kwargs["is_decode_only_node"], False)
         self.assertEqual(kwargs["padded_num_tokens"], 8)
         self.assertEqual(kwargs["max_tokens_across_pcp"], 5)
         self.assertIs(kwargs["moe_comm_method"], dummy_comm_method)
@@ -1234,6 +1255,8 @@ class TestNPUPlatform(TestBase):
             )
 
         self.assertTrue(kwargs["in_profile_run"])
+        self.assertIs(kwargs["use_mega_moe"], False)
+        self.assertIs(kwargs["is_decode_only_node"], False)
 
     @patch("vllm_ascend.quantization.utils.maybe_auto_detect_quantization")
     @patch("vllm_ascend.ascend_config.init_ascend_config")

@@ -682,6 +682,8 @@ class AscendConfig:
             _MEGA_MOE_SUPPORTED = False
         elif self.enable_fused_mc2 == 2:
             _MEGA_MOE_SUPPORTED = importlib.util.find_spec("cann_ops_transformer") is not None
+            if not _MEGA_MOE_SUPPORTED:
+                raise ValueError("enable_fused_mc2=2 requires cann_ops_transformer.")
             self.enable_fused_mc2 = 1
         return self
 
@@ -863,9 +865,10 @@ class AscendConfig:
                 "cannot be enabled at the same time. Setting multistream_overlap_shared_expert to False."
             )
         if self.enable_fused_mc2 == 1 and is_mega_moe_supported() and not self._is_megamoe_supported_by_config(vc):
-            self.enable_fused_mc2 = 0
+            # Temporarily force MegaMoe for debugging unsupported model configs.
+            # self.enable_fused_mc2 = 0
             logger.warning_once(
-                "MegaMoe is not supported for this model config; additional_config.enable_fused_mc2 will be set to 0."
+                "Forcing MegaMoe for an unsupported model config; compatibility fallback is disabled for debugging."
             )
 
         # mlapo_keep_prefill_weights preconditions: the prefill weights are only

@@ -33,7 +33,9 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import get_mc2_tokens_capacity
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
-from vllm_ascend.distributed.parallel_state import get_mc2_group
+from vllm_ascend.distributed.parallel_state import (
+    get_mc2_group,
+)
 from vllm_ascend.lora.fused_moe import (
     all2all_lora_indices,
     has_lora,
@@ -149,6 +151,9 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         # as an explicit elastic_info tensor on every call; dead ranks are
         # excluded purely via elastic_info.
         self._ft_enabled = vllm_config.parallel_config.enable_fault_tolerance
+        self._elastic_ep_enabled = vllm_config.parallel_config.enable_elastic_ep
+        if self._ft_enabled and self.mc2_comm_alg == "hierarchy":
+            raise RuntimeError("MC2 fault tolerance (elastic_info) is mutually exclusive with comm_alg='hierarchy'.")
 
     def refresh_hccl_group(self) -> None:
         """Refresh MC2 communicator metadata after HCCL groups are recreated."""
@@ -156,6 +161,19 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         local_rank = get_mc2_group().rank_in_group
         backend = device_group._get_backend(torch.device("npu"))
         self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
+
+    def _get_dispatch_quant_mode(
+        self,
+        token_dispatch_input: MoETokenDispatchInput,
+    ) -> int:
+        comm_quant_mode = token_dispatch_input.quant.comm_quant_mode
+        if comm_quant_mode is not None:
+            return comm_quant_mode
+        if token_dispatch_input.quant.dispatch_with_quant:
+            if self.need_shared_expert_args and token_dispatch_input.quant.is_mxfp:
+                return 4
+            return 2
+        return 0
 
     def get_dispatch_mc2_kwargs(
         self,
@@ -166,18 +184,12 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         topk_ids = token_dispatch_input.topk_ids
         expert_map = token_dispatch_input.routing.expert_map
         global_redundant_expert_num = token_dispatch_input.routing.global_redundant_expert_num
-        comm_quant_mode = token_dispatch_input.quant.comm_quant_mode
 
         assert expert_map is not None, "expert_map is required for MC2 token dispatch."
         # NOTE: quant_mode differs by quant feature:
         # - Legacy int communication quantization uses quant_mode=2.
         # - A5 MXFP communication uses quant_mode=4.
-        if comm_quant_mode is not None:
-            quant_mode = comm_quant_mode
-        elif token_dispatch_input.quant.dispatch_with_quant:
-            quant_mode = 4 if self.need_shared_expert_args and token_dispatch_input.quant.is_mxfp else 2
-        else:
-            quant_mode = 0
+        quant_mode = self._get_dispatch_quant_mode(token_dispatch_input)
         self.moe_expert_num = len(expert_map) + global_redundant_expert_num
         expert_token_nums_type = _get_expert_token_nums_type(token_dispatch_input)
         kwargs_mc2 = {

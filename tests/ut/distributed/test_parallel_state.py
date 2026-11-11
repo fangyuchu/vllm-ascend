@@ -5,10 +5,6 @@ import pytest
 from vllm.config import ParallelConfig
 
 from vllm_ascend.distributed.parallel_state import (
-    _LMTP,
-    _MC2,
-    _OTP,
-    _P_TP,
     destroy_ascend_model_parallel,
     get_global_rank,
     get_lmhead_tp_group,
@@ -77,10 +73,9 @@ def test_init_ascend_model_parallel(mock_distributed, parallel_config, otp_size)
         assert p_tp_group is not None
 
         destroy_ascend_model_parallel()
-        assert _MC2 is None
-        assert _LMTP is None
-        assert _OTP is None
-        assert _P_TP is None
+        for get_group in (get_mc2_group, get_lmhead_tp_group, get_otp_group, get_p_tp_group):
+            with pytest.raises(AssertionError, match="not initialized"):
+                get_group()
 
 
 def _build_parallel_config(
@@ -148,6 +143,31 @@ def test_get_global_rank_defaults_to_current_config():
         assert get_global_rank() == 7
 
 
+def test_stateless_registration_preserves_rank_space_and_recovery_visibility(monkeypatch):
+    from torch.distributed.distributed_c10d import _world
+    from vllm.distributed.device_communicators.base_device_communicator import DeviceCommunicatorBase
+    from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
+
+    from vllm_ascend.distributed.stateless_coordinator import (
+        register_stateless_coordinator_pgs,
+        unregister_stateless_coordinator_pgs,
+    )
+
+    cpu = MagicMock(group_name="test_stateless_cpu")
+    device = MagicMock(group_name="test_stateless_device")
+    cpu.rank.return_value = 1
+    cpu.size.return_value = device.size.return_value = 3
+    coordinator = object.__new__(StatelessGroupCoordinator)
+    coordinator.backend = "hccl"
+    monkeypatch.setattr("vllm.config.get_current_vllm_config_or_none", lambda: None)
+    DeviceCommunicatorBase.__init__(coordinator, cpu, device_group=device, global_ranks=[0, 2, 3], global_world_size=4)
+    register_stateless_coordinator_pgs(coordinator)
+    assert (coordinator.rank, coordinator.global_rank, coordinator.ranks) == (1, 2, [0, 2, 3])
+    assert (_world.pg_map[device][0], _world.pg_map[cpu][0]) == ("hccl", "gloo")
+    unregister_stateless_coordinator_pgs(coordinator)
+    assert cpu not in _world.pg_map and device not in _world.pg_map
+
+
 @pytest.mark.parametrize("size", [1, 4])
 @pytest.mark.parametrize("pcp_size", [1, 2])
 def test_kvpp_group_stays_inside_pipeline_stage(monkeypatch, size, pcp_size):
@@ -182,6 +202,7 @@ def test_kvpp_group_stays_inside_pipeline_stage(monkeypatch, size, pcp_size):
     monkeypatch.setattr(parallel_state, "init_model_parallel_group", init_group)
     parallel_state.init_ascend_model_parallel(
         SimpleNamespace(
+            enable_elastic_ep=False,
             tensor_parallel_size=4 // pcp_size,
             pipeline_parallel_size=2,
             data_parallel_size=1,
@@ -233,6 +254,7 @@ def test_engram_dp_pcp_group_reuses_upstream_node_partition(monkeypatch, shared,
     monkeypatch.setattr(parallel_state, "get_ascend_config", lambda: config)
     monkeypatch.setattr(parallel_state, "init_model_parallel_group", init_group)
     topology = SimpleNamespace(
+        enable_elastic_ep=False,
         tensor_parallel_size=2,
         pipeline_parallel_size=1,
         data_parallel_size=2,

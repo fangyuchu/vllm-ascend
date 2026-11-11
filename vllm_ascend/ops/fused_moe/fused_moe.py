@@ -121,7 +121,11 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         self.moe_config.dp_group = get_dp_group()
         if self.moe_config.ep_size > 1:
             self.moe_config.ep_group = get_ep_group()
-            self.moe_config.mc2_group = get_mc2_group()
+            # Scale-up workers load the dummy model before MC2 exists. Bind it
+            # when the standby group is activated: during prepare for MegaMoe
+            # fast restore, or commit for ordinary scale-up.
+            if not envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
+                self.moe_config.mc2_group = get_mc2_group()
 
         self.ascend_shared_experts = None
         if shared_experts is not None:
