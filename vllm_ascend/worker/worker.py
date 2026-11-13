@@ -20,6 +20,7 @@
 import copy
 import gc
 import logging
+import os
 from contextlib import AbstractContextManager, nullcontext
 from fnmatch import filter as fnmatch_filter
 from types import NoneType
@@ -50,6 +51,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorHandsha
 from vllm.distributed.parallel_state import Handle, get_pp_group, get_tp_group
 from vllm.logger import logger
 from vllm.lora.request import LoRARequest
+from vllm.model_executor.model_loader.weight_checksum import compute_tensor_digests, zero_weights
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
@@ -70,6 +72,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.utils import report_usage_stats
+from vllm.v1.worker.gpu.async_utils import AsyncOutput
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
 from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
@@ -108,6 +111,7 @@ from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import g
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
 from vllm_ascend.observability.runtime_guard.hooks import runtime_guard_idle_step
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
+from vllm_ascend.patch.worker.patch_async_output import AscendAsyncOutput
 from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
 from vllm_ascend.utils import (
     check_ascend_device_type,
@@ -118,6 +122,7 @@ from vllm_ascend.utils import (
     register_device_print,
     setup_ascend_local_comm_res,
 )
+from vllm_ascend.worker.sentinel.npu_worker_sentinel import WorkerSentinel, fault_barrier_wrapper
 
 
 def get_kv_cache_groups(
@@ -223,6 +228,8 @@ class NPUWorker(WorkerBase):
         if "UnquantizedLinearMethod" in WEIGHT_LOADER_V2_SUPPORTED:
             WEIGHT_LOADER_V2_SUPPORTED.remove("UnquantizedLinearMethod")
 
+        self.worker_sentinel: WorkerSentinel | None = None
+
         self.use_v2_model_runner = self.vllm_config.use_v2_model_runner
         self._kvpp_cache_allocation_plan: KVPPPhysicalCachePlan | None = None
         self._pp_send_work: list[Handle] = []
@@ -244,6 +251,10 @@ class NPUWorker(WorkerBase):
 
             signal.signal(signal.SIGTERM, signal_handler)
             signal.signal(signal.SIGINT, signal_handler)
+
+    def handle_ft_command(self, ft_request):
+        assert self.worker_sentinel is not None
+        return self.worker_sentinel.handle_command(ft_request)
 
     def uninstall_static_kernel(self):
         import fcntl
@@ -462,6 +473,50 @@ class NPUWorker(WorkerBase):
         # shift self.local_rank by dp_local_rank * tp_pp_world_size so
         # that each DP group binds to a distinct set of NPUs.
         parallel_config = self.parallel_config
+        if self.parallel_config.enable_fault_tolerance:
+            if self.use_v2_model_runner:
+                # Model Runner V2 + fault tolerance task queue
+                # (TASK_QUEUE_ENABLE) hangs abnormally; force it off.
+                os.environ["TASK_QUEUE_ENABLE"] = "0"
+                logger.warning(
+                    "Fault tolerance with Model Runner V2 does not support the "
+                    "task queue (TASK_QUEUE_ENABLE); forcing TASK_QUEUE_ENABLE=0."
+                )
+
+            if parallel_config.tensor_parallel_size > 1:
+                # TP>1 relies on collective HCCL comms; disable HCCL's async
+                # error handling so it cannot abort the process out-of-band
+                # during fault-tolerance recovery.
+                os.environ["HCCL_ASYNC_ERROR_HANDLING"] = "0"
+
+            abort_timeout = get_ascend_config().ft_communication_abort_timeout
+            if abort_timeout > 0:
+                # User-provided HCCL timeouts win; otherwise derive them
+                # from the config value. HCCL_EVENT_TIMEOUT must be
+                # greater than HCCL_EXEC_TIMEOUT, hence EXEC defaults to
+                # abort_timeout - 1.
+                os.environ.setdefault("HCCL_EVENT_TIMEOUT", str(abort_timeout))
+                os.environ.setdefault("HCCL_EXEC_TIMEOUT", str(abort_timeout - 1))
+                if int(os.environ["HCCL_EVENT_TIMEOUT"]) <= int(os.environ["HCCL_EXEC_TIMEOUT"]):
+                    raise ValueError(
+                        f"HCCL_EVENT_TIMEOUT ({os.environ['HCCL_EVENT_TIMEOUT']}) "
+                        "must be greater than HCCL_EXEC_TIMEOUT "
+                        f"({os.environ['HCCL_EXEC_TIMEOUT']})"
+                    )
+                if (
+                    int(os.environ["HCCL_EVENT_TIMEOUT"]) != abort_timeout
+                    or int(os.environ["HCCL_EXEC_TIMEOUT"]) != abort_timeout - 1
+                ):
+                    logger.warning(
+                        "Fault tolerance: HCCL communication timeouts are taken from the "
+                        "HCCL_EVENT_TIMEOUT (%s s) / HCCL_EXEC_TIMEOUT (%s s) environment "
+                        "variables instead of the NPU operator timeout "
+                        "(ft_communication_abort_timeout=%s s).",
+                        os.environ["HCCL_EVENT_TIMEOUT"],
+                        os.environ["HCCL_EXEC_TIMEOUT"],
+                        abort_timeout,
+                    )
+                torch.npu.set_op_timeout_ms(abort_timeout * 1000)
         if (
             parallel_config.distributed_executor_backend not in ("ray", "external_launcher")
             and parallel_config.data_parallel_backend != "ray"
@@ -556,6 +611,8 @@ class NPUWorker(WorkerBase):
 
         # Initialize the distributed environment.
         self._init_worker_distributed_environment()
+        if self.parallel_config.enable_fault_tolerance:
+            self.worker_sentinel = WorkerSentinel(worker=self, device=device)
         # Set random seed.
         set_random_seed(self.model_config.seed)
         # Initialize device properties used by triton kernels.
@@ -855,6 +912,7 @@ class NPUWorker(WorkerBase):
             self.torch_allocated / GiB_bytes,
         )
 
+    @fault_barrier_wrapper
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -926,6 +984,7 @@ class NPUWorker(WorkerBase):
         return output
 
     @torch.inference_mode()
+    @fault_barrier_wrapper
     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
         output = self.model_runner.sample_tokens(grammar_output)
         _attach_profiling_chunk_execution_time(
@@ -933,6 +992,11 @@ class NPUWorker(WorkerBase):
             self.model_runner,
             output,
         )
+        # Only the async (MRV2) path returns an AsyncOutput; re-class it so
+        # get_output is guarded by the fault barrier. A quarantined step drains
+        # as a plain ModelRunnerOutput and passes through untouched.
+        if self.parallel_config.enable_fault_tolerance and isinstance(output, AsyncOutput):
+            output.__class__ = AscendAsyncOutput
         return output
 
     def load_model(self) -> None:
@@ -959,6 +1023,9 @@ class NPUWorker(WorkerBase):
 
         if getattr(self, "use_v2_model_runner", False) and has_ec_transfer():
             get_ec_transfer().start_worker_services()
+
+        if self.worker_sentinel is not None and self.use_v2_model_runner:
+            self.worker_sentinel.init_num_local_experts()
 
         if self.vllm_config.weight_transfer_config is not None:
             from vllm.distributed.weight_transfer.factory import (
@@ -1088,6 +1155,38 @@ class NPUWorker(WorkerBase):
 
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
+
+    def _weight_checksum_model(self) -> nn.Module:
+        # The v1 model runner exposes get_model(); the v2 runner (still under
+        # development) only exposes the model attribute.
+        get_model = getattr(self.model_runner, "get_model", None)
+        if callable(get_model):
+            return get_model()
+        return self.model_runner.model
+
+    def _weight_checksum_prefix(self) -> str:
+        # Aligned with upstream gpu_worker: data_parallel_rank is reset to 0
+        # in dense workers; only data_parallel_index keeps DP keys unique.
+        # (locals renamed from upstream's dp/pp/pcp/tp: dp is this module's
+        # dynamic_profile alias)
+        dp_rank = self.parallel_config.data_parallel_index
+        pp_rank = get_pp_group().rank_in_group
+        pcp_rank = get_pcp_group().rank_in_group
+        tp_rank = get_tp_group().rank_in_group
+        return f"dp{dp_rank}:pp{pp_rank}:pcp{pcp_rank}:tp{tp_rank}:"
+
+    def compute_weight_checksums(self) -> dict[str, str]:
+        prefix = self._weight_checksum_prefix()
+        digests = compute_tensor_digests(self._weight_checksum_model())
+        return {prefix + name: digest for name, digest in digests.items()}
+
+    def reset_weights(self) -> None:
+        if get_ascend_config().weight_nz_mode:
+            logger.warning(
+                "weight_nz_mode is enabled: weight transfer update is unavailable, "
+                "reset weights can only be restored via checkpoint reload (reload_weights)."
+            )
+        zero_weights(self._weight_checksum_model())
 
     @torch.inference_mode()
     def profile_prefill_latency(self, num_tokens: int) -> float:

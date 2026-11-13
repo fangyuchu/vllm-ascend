@@ -18,23 +18,92 @@
 import torch
 import torch.distributed as dist
 from vllm.distributed.device_communicators.base_device_communicator import DeviceCommunicatorBase
+from vllm.logger import logger
+
+from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.distributed.device_communicators.quantized_all_reduce import (
+    QuantizedAllReduce,
+)
 
 
 class _NpuAll2AllManager:
-    """No-op all2all_manager for NPU. Used by vLLM main's fault-tolerance
-    check (data_parallel_size > 1 and is_moe); NPU does not register a real
-    one because it uses mc2 / all_gather for MoE communication.
+    """All2All-manager adapter for MC2 fault tolerance.
+
+    Owns the dead-rank mask, encoded into the ``elastic_info`` tensor consumed
+    by the MC2 dispatch/combine operators. The public interface mirrors the
+    upstream All2AllManagerBase mask API.
     """
 
-    @property
-    def support_fault_tolerance(self) -> bool:
-        return False
+    # MC2 kernels do not detect faults themselves; the mask is written
+    # host-side by FT recovery, so a per-step query can never observe one.
+    support_fault_tolerance = False
 
-    def query_fault(self) -> torch.Tensor:
-        return torch.zeros(1, dtype=torch.bool, device="cpu")
+    def __init__(self, ep_world_size: int, device: torch.device | None = None) -> None:
+        self._ep_world_size = ep_world_size
+        self._device = device
+        self._dead: set[int] = set()
+        self._num_local_experts: int = 0
+
+        # elastic_info layout: [is_scaling_down, dense ep world size,
+        #  shared_expert_rank_num, num_physical_experts] + table1(orig->dense)
+        #  + table2(dense->orig). num_physical_experts is derived from the
+        #  dead set and num_local_experts on every rebuild.
+        size = 4 + 2 * ep_world_size
+        self._elastic_info_host = torch.zeros(size, dtype=torch.int32)
+        if device is None:
+            device = torch.device("npu", torch.npu.current_device())
+        self._elastic_info = torch.zeros(size, dtype=torch.int32, device=device)
+
+    def update_mask(self, rank: int, masked: bool = True) -> None:
+        """Mark an EP rank dead/alive and rebuild elastic_info in place."""
+        if masked:
+            self._dead.add(rank)
+        else:
+            self._dead.discard(rank)
+        self._rebuild_elastic_info()
 
     def query_active_mask(self) -> torch.Tensor:
-        return torch.zeros(1, dtype=torch.bool, device="cpu")
+        """Per-EP-rank mask (1=dead, 0=live) as a CPU tensor, matching the
+        upstream mask-buffer convention.
+
+        Built on CPU on purpose: this is called while a fault is being
+        probed, when the NPU may be hung — any device op would fail.
+        """
+        mask = torch.zeros(self._ep_world_size, dtype=torch.int32)
+        for rank in self._dead:
+            mask[rank] = 1
+        return mask
+
+    def query_fault(self) -> torch.Tensor:
+        # MC2 has no in-kernel fault detection; faults surface as aborted ops.
+        return torch.tensor(False)
+
+    def clean_buffers(self) -> None:
+        """No-op, kept for the upstream retry flow which calls it unconditionally."""
+
+    def get_elastic_info(self) -> torch.Tensor:
+        """The device elastic_info tensor for the next MC2 dispatch/combine."""
+        return self._elastic_info
+
+    def set_num_local_physical_experts(self, num_local_experts: int) -> None:
+        """Record the physical expert slots per EP rank."""
+        self._num_local_experts = num_local_experts
+
+    def _rebuild_elastic_info(self) -> None:
+        """Rebuild elastic_info from the dead set into the existing device
+        tensor (never reallocates, so captured graphs stay valid)."""
+
+        world_size = self._ep_world_size
+        alive = sorted(set(range(world_size)) - self._dead)
+        num_physical_experts = len(alive) * self._num_local_experts
+        table1 = torch.full((world_size,), -1, dtype=torch.int32)
+        table1[alive] = torch.arange(len(alive), dtype=torch.int32)
+        table2 = torch.full((world_size,), -1, dtype=torch.int32)
+        table2[: len(alive)] = torch.tensor(alive, dtype=torch.int32)
+        self._elastic_info_host.copy_(
+            torch.cat([torch.tensor([1, len(alive), 0, num_physical_experts], dtype=torch.int32), table1, table2])
+        )
+        self._elastic_info.copy_(self._elastic_info_host, non_blocking=True)
 
 
 class NPUCommunicator(DeviceCommunicatorBase):
@@ -59,4 +128,28 @@ class NPUCommunicator(DeviceCommunicatorBase):
         # Keep the shared coordinator protocol available without enabling the
         # FlashInfer PCIe IPC backend on NPU.
         self.fi_pcie_ipc_ar_comm = None
-        self.all2all_manager = _NpuAll2AllManager()
+        # Only the EP group's instance is ever looked up (via the upstream
+        # get_ep_all2all_manager()); the rest stay dormant.
+        self.all2all_manager = _NpuAll2AllManager(dist.get_world_size(cpu_group), device)
+        # Optional int8 quantized all-reduce for large bf16 TP collectives,
+        # configured through --additional-config (ascend_config). This
+        # communicator is also built for dp/ep/mc2/... groups: the wrapper is
+        # created for all of them, but only TP-sized groups take the int8 path
+        # (oversized groups keep bf16 instead of failing at start-up).
+        quantized_cfg = get_ascend_config().quantized_all_reduce_config
+        self.quantized_ar: QuantizedAllReduce | None = None
+        if quantized_cfg.enable:
+            self.quantized_ar = QuantizedAllReduce(self.device_group, min_numel=quantized_cfg.min_numel)
+            if self.quantized_ar.supported:
+                # Once per worker process: every group constructs a wrapper, but
+                # only the TP-sized ones actually enable the int8 path.
+                logger.info_once(
+                    "Quantized all-reduce enabled (min_numel=%d, max_q=%d).",
+                    self.quantized_ar.min_numel,
+                    self.quantized_ar.max_q,
+                )
+
+    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        if self.quantized_ar is not None and self.world_size > 1:
+            return self.quantized_ar.all_reduce(input_)
+        return super().all_reduce(input_)
