@@ -404,7 +404,7 @@ def _should_trans_nz(weight: torch.Tensor) -> bool:
     return True
 
 
-def transpose_expert_dims(weight: torch.Tensor) -> torch.Tensor:
+def transpose_expert_weight_last_two_dims(weight: torch.Tensor) -> torch.Tensor:
     """Swap the last two dims into the NPU runtime layout."""
     return weight.transpose(-2, -1).contiguous()
 
