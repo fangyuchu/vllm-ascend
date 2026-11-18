@@ -34,11 +34,12 @@ from vllm.utils.math_utils import cdiv
 from vllm_ascend.config_utils import config
 from vllm_ascend.device.device_config import is_950
 from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily, HardwareCapability, get_current_hardware_profile
+from vllm_ascend.kv_trace.kv_trace_config import KVTraceConfig
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
-_KVPP_SUPPORTED_CONNECTORS = ("MooncakeConnectorV2", "AscendStoreConnector")
+_KVPP_SUPPORTED_CONNECTORS = ("MooncakeConnectorV2", "MooncakePushConnector", "AscendStoreConnector")
 _MEGA_MOE_SUPPORTED = None
 
 
@@ -99,7 +100,10 @@ class KVPPConfig:
                 name = connector.get("kv_connector")
                 if name not in _KVPP_SUPPORTED_CONNECTORS:
                     raise ValueError(f"KVPP does not support kv connector {name!r}.")
-                if name == "MooncakeConnectorV2" and connector.get("kv_role") == "kv_consumer":
+                if (
+                    name in ("MooncakeConnectorV2", "MooncakePushConnector")
+                    and connector.get("kv_role") == "kv_consumer"
+                ):
                     raise ValueError("KVPP must be disabled on the decode-only node.")
 
         model_config = vllm_config.model_config
@@ -519,6 +523,7 @@ class AscendConfig:
             "enable_prefill_mc2": false,
             "multistream_overlap_shared_expert": false,
             "enable_kv_nz": false,
+            "kv_trace": {"enabled": false, "action": "log"},
             "kv_pool_range_debug": false,
             "enable_mc2_hierarchy_comm": false,
             "sfa_dcp_force_tmajor_restore": false,
@@ -661,6 +666,7 @@ class AscendConfig:
     enable_prefill_mc2: bool = False
     multistream_overlap_shared_expert: bool = False
     enable_kv_nz: bool = False
+    kv_trace: KVTraceConfig = dataclasses.field(default_factory=KVTraceConfig)
     kv_pool_range_debug: bool = False
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
     sfa_dcp_force_tmajor_restore: bool = False
@@ -710,6 +716,10 @@ class AscendConfig:
     msmonitor_use_daemon: bool = False
     enable_transpose_kv_cache_by_block: bool = True
     weight_nz_mode: int = 1
+    # ---- fault-tolerance: comm op abort timeout (s); 0 = disable ----
+    # Drives HCCL_EVENT_TIMEOUT / HCCL_EXEC_TIMEOUT (= timeout - 1) and
+    # set_op_timeout_ms(timeout * 1000). Validated to be 0 or >= 2.
+    ft_communication_abort_timeout: int = 0
 
     # ---- sub-configs (no vllm_config dep): pydantic dict→dataclass coercion ----
     ascend_compilation_config: AscendCompilationConfig = dataclasses.field(default_factory=AscendCompilationConfig)
@@ -1050,6 +1060,17 @@ class AscendConfig:
 
         # sparse KV offload vs packed SFA main cache mutex
         self._validate_sparse_packed_kv_offload_compatibility()
+
+        # ft_communication_abort_timeout only takes effect when fault tolerance
+        # is enabled, so validate it only then: a stray value in additional_config
+        # must not fail startup for non-FT runs.
+        if vc.parallel_config.enable_fault_tolerance and (
+            self.ft_communication_abort_timeout != 0 and self.ft_communication_abort_timeout < 2
+        ):
+            raise ValueError(
+                f"ft_communication_abort_timeout must be 0 (disabled) or an integer of at least "
+                f"2 seconds, got {self.ft_communication_abort_timeout}"
+            )
         return self
 
     @property
