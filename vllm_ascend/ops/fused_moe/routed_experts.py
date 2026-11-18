@@ -47,7 +47,7 @@ from vllm_ascend.ops.fused_moe.moe_utils import get_moe_num_logical_experts
 from vllm_ascend.ops.fused_moe.prepare_finalize import PrepareAndFinalizeWithAllGather
 from vllm_ascend.quantization.nz import NzCastSpec
 from vllm_ascend.quantization.quant_type import QuantType
-from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, maybe_trans_nz, transpose_expert_dims
+from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, maybe_trans_nz, transpose_expert_weight_last_two_dims
 
 
 class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
@@ -106,7 +106,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         enable_fused_mc2 = get_ascend_config().enable_fused_mc2
         for name in ("w13_weight", "w2_weight"):
             weight = getattr(layer, name)
-            transposed = transpose_expert_dims(self._maybe_pad_weight(weight.data))
+            transposed = transpose_expert_weight_last_two_dims(self._maybe_pad_weight(weight.data))
             if not enable_fused_mc2 or weight.shape == transposed.shape:
                 # ND weights are read in place by captured graphs, so keep the
                 # parameter's storage across direct reloads.
