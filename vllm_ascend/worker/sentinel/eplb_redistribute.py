@@ -8,9 +8,9 @@ densified rank space and reloads the reassigned experts' weights from the
 checkpoint into each rank's local slots.
 """
 
-from collections.abc import Callable, Set
+import os
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from copy import copy
 from functools import partial
 
 import torch
@@ -38,10 +38,6 @@ _RELOAD_CHUNK_SIZE = 32
 
 # Threads assembling one chunk; bounded because worker processes share host memory bandwidth.
 _GATHER_MAX_WORKERS = 8
-
-# Only source resolution changes here: Ascend loads from auto/safetensors, other
-# formats fall back to "auto"; the reload itself still requires safetensors.
-_DISK_LOAD_FORMATS = frozenset({"auto", "safetensors"})
 
 
 def densify_routing_table_physical_ids(
@@ -201,23 +197,13 @@ def _resolve_expert_tensor(
     return (key, suffix) if key is not None else None
 
 
-def _disk_prepare_load_config(load_config: LoadConfig) -> LoadConfig:
-    """LoadConfig for resolving where the checkpoint lives; the reload stays safetensors-only."""
-    if load_config.load_format in _DISK_LOAD_FORMATS:
-        return load_config
-    fallback = copy(load_config)
-    fallback.load_format = "auto"
-    fallback.model_loader_extra_config = {}
-    return fallback
-
-
 def _collect_safetensors_shards(
     model_config: ModelConfig,
     load_config: LoadConfig,
     model: torch.nn.Module,
 ) -> list[str]:
     """Safetensors shards the normal loader would find (repo IDs via cache/download)."""
-    loader = DefaultModelLoader(_disk_prepare_load_config(load_config))
+    loader = DefaultModelLoader(load_config)
     _, shards, use_safetensors, _ = loader._prepare_weights(
         model_name_or_path=model_config.model,
         subfolder=None,
@@ -226,9 +212,10 @@ def _collect_safetensors_shards(
         allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
     )
     if not use_safetensors:
+        found = ", ".join(os.path.basename(shard) for shard in shards[:3]) or "no weight files"
         raise RuntimeError(
             f"[FT] scale_down expert reload requires a safetensors checkpoint, but "
-            f"'{model_config.model}' does not resolve to one."
+            f"'{model_config.model}' resolved to non-safetensors files ({found})."
         )
     return sorted(shard for shard in shards if shard.endswith(".safetensors"))
 
@@ -237,15 +224,13 @@ def _collect_matching_weights(
     shards: list[str],
     name_mapper: Callable[[str], str],
     wanted: dict[str, dict[int, tuple[int, int]]],
-    wanted_suffixes: Set[str],
-    expert_weights: dict[tuple[int, int], dict[str, torch.Tensor]],
-    matched: set[tuple[int, int]],
-) -> None:
+) -> dict[tuple[int, int], dict[str, torch.Tensor]]:
     """Read only the wanted experts' tensors by walking shard headers.
 
     ``safe_open(...).keys()`` reads just the JSON header, so rejected names
     never reach ``get_tensor``: reads stay limited to the wanted experts.
     """
+    expert_weights: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
     for st_file in shards:
         with safe_open(st_file, framework="pt") as f:
             for raw_name in f.keys():  # noqa: SIM118
@@ -253,10 +238,38 @@ def _collect_matching_weights(
                 if found is None:
                     continue
                 key, suffix = found
-                if suffix in wanted_suffixes:
-                    # Only a collected tensor counts as matched.
-                    matched.add(key)
+                if suffix in _WANTED_SUFFIXES:
                     expert_weights.setdefault(key, {})[suffix] = f.get_tensor(raw_name)
+    return expert_weights
+
+
+def _resolve_local_slots(
+    routed_layers: list,
+    moe_layers: list,
+    reassignments: set[tuple[int, int]],
+    ep_rank: int,
+) -> dict[tuple[int, int], int]:
+    """Return the local weight slot of each reassigned expert on this rank.
+
+    An expert can have replicas on several ranks. Keep the replica hosted by
+    this rank, then subtract this rank's first physical expert id to get the
+    slot index used by the local weight tensors.
+    """
+    local_slots: dict[tuple[int, int], int] = {}
+    for layer_idx, logical_id in reassignments:
+        layer_state = getattr(moe_layers[layer_idx], "eplb_state", None)
+        l2p = getattr(layer_state, "logical_to_physical_map", None)
+        if l2p is None:
+            raise RuntimeError(
+                f"[FT] MoE layer {layer_idx} has no EPLB placement map; the reassigned expert has nowhere to land."
+            )
+        num_local = routed_layers[layer_idx].moe_config.num_local_experts
+        start = ep_rank * num_local
+        for physical_id in l2p[logical_id].tolist():
+            if start <= physical_id < start + num_local:
+                local_slots[(layer_idx, logical_id)] = physical_id - start
+                break
+    return local_slots
 
 
 def reload_experts_from_disk(
@@ -281,23 +294,7 @@ def reload_experts_from_disk(
 
     moe_layers = list(model.moe_layers)
     routed_layers = [getattr(layer, "routed_experts", layer) for layer in moe_layers]
-    ep_rank = get_ep_group().rank_in_group
-
-    local_slots: dict[tuple[int, int], int] = {}
-    for layer_idx, logical_id in reassignments:
-        layer_state = getattr(moe_layers[layer_idx], "eplb_state", None)
-        l2p = getattr(layer_state, "logical_to_physical_map", None)
-        if l2p is None:
-            raise RuntimeError(
-                f"[FT] MoE layer {layer_idx} has no EPLB placement map; the reassigned expert has nowhere to land."
-            )
-        num_local = routed_layers[layer_idx].moe_config.num_local_experts
-        start = ep_rank * num_local
-        for physical_id in l2p[logical_id].tolist():
-            if start <= physical_id < start + num_local:
-                local_slots[(layer_idx, logical_id)] = physical_id - start
-                break
-
+    local_slots = _resolve_local_slots(routed_layers, moe_layers, reassignments, get_ep_group().rank_in_group)
     if not local_slots:
         return 0
 
@@ -308,18 +305,11 @@ def reload_experts_from_disk(
     for layer_idx, logical_id in local_slots:
         wanted.setdefault(routed_layers[layer_idx].layer_name, {})[logical_id] = (layer_idx, logical_id)
 
-    expert_weights: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
-    matched: set[tuple[int, int]] = set()
-
     logger.info("[FT] Reloading %d reassigned (layer, expert) pair(s) on this rank from disk.", len(local_slots))
     shards = _collect_safetensors_shards(model_config, load_config, model)
-    if not shards:
-        raise RuntimeError(
-            f"[FT] scale_down expert reload requires a safetensors checkpoint; '{model_config.model}' has none."
-        )
-    _collect_matching_weights(shards, name_mapper, wanted, _WANTED_SUFFIXES, expert_weights, matched)
+    expert_weights = _collect_matching_weights(shards, name_mapper, wanted)
     # A pair with no checkpoint weight would silently keep its slot's previous occupant, so fail.
-    unmatched = [layer_expert for layer_expert in local_slots if layer_expert not in matched]
+    unmatched = [layer_expert for layer_expert in local_slots if layer_expert not in expert_weights]
     if unmatched:
         raise RuntimeError(
             f"[FT] {len(unmatched)} (layer, expert) pair(s) had no matching "

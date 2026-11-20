@@ -47,6 +47,11 @@ if TYPE_CHECKING:
 _sentinel: "WorkerSentinel | None" = None
 
 
+def _num_local_experts(model_state: EplbModelState) -> int:
+    """Physical expert slots per original EP rank (dead ranks keep their slots)."""
+    return model_state.physical_to_logical_map.shape[1] // get_ep_group().world_size
+
+
 def fault_barrier_wrapper(func: Callable):
     """Barrier between device faults and the async step loop.
 
@@ -66,23 +71,15 @@ def fault_barrier_wrapper(func: Callable):
             raise RuntimeError(f"[FT] worker is quarantined after fault: {sentinel.fault_info}")
         try:
             return func(self, *args, **kwargs)
-        except SystemExit:
-            raise
         except Exception as exc:
+            rank = getattr(self, "rank", "worker")
             sentinel.worker_faulted = True
             sentinel.fault_info = f"{type(exc).__name__}: {exc}"
-            logger.warning(
-                "[FT] Quarantining %s after fault: %s",
-                getattr(self, "rank", "worker"),
-                exc,
-            )
+            logger.warning("[FT] Quarantining %s after fault: %s", rank, exc)
             try:
                 sentinel.reset_device()
             except Exception:
-                logger.exception(
-                    "[FT] self device reset failed on %s.",
-                    getattr(self, "rank", "worker"),
-                )
+                logger.exception("[FT] self device reset failed on %s.", rank)
             # Drop the frames that pin device tensors of the broken stream.
             exc.__traceback__ = None
             raise RuntimeError(f"[FT] worker quarantined after fault: {sentinel.fault_info}")
@@ -137,9 +134,7 @@ class WorkerSentinel(GPUWorkerSentinel):
         """Record the per-rank physical expert slot count after model load."""
         if self.worker.model_runner.eplb_state is None:
             return
-        eplb_model_state = self._eplb_model_state()
-        num_local_experts = eplb_model_state.physical_to_logical_map.shape[1] // get_ep_group().world_size
-        get_ep_all2all_manager().set_num_local_physical_experts(num_local_experts)
+        get_ep_all2all_manager().set_num_local_physical_experts(_num_local_experts(self._eplb_model_state()))
         # The MC2 capacity exists only now; surface a config scale_down will reject.
         self._check_mc2_only_execution(raise_on_error=False)
 
@@ -166,8 +161,6 @@ class WorkerSentinel(GPUWorkerSentinel):
         torch.npu.synchronize()
 
     def _validate_scale_down_preconditions(self) -> None:
-        if not self.worker.use_v2_model_runner:
-            raise ValueError("[FT] scale_down on Ascend NPU requires the v2 model runner.")
         model_runner = self.worker.model_runner
         eplb_config = self.worker.parallel_config.eplb_config
         if model_runner.eplb_state is None or eplb_config.num_redundant_experts <= 0:
@@ -269,7 +262,7 @@ class WorkerSentinel(GPUWorkerSentinel):
         """Redistribute one model and reload through its own checkpoint config."""
         p2l = model_state.physical_to_logical_map
         num_logical = model_state.logical_replica_count.shape[1]
-        num_local_experts = p2l.shape[1] // get_ep_group().world_size
+        num_local_experts = _num_local_experts(model_state)
 
         mark_dead_expert_slots_inplace(p2l, dead_ep_ranks, num_local_experts)
         reassignments = redistribute_expert_placement(p2l, num_logical, num_local_experts)
@@ -289,29 +282,22 @@ class WorkerSentinel(GPUWorkerSentinel):
         self._densify_routing_tables(model_state)
 
     def _resolve_drafter(self) -> tuple[torch.nn.Module, EplbModelState, ModelConfig, LoadConfig] | None:
-        """Resolve a drafter's EPLB state and checkpoint, rejecting unregistered MoE."""
+        """Resolve the drafter's EPLB state and checkpoint, rejecting unregistered MoE."""
         model_runner = self.worker.model_runner
         drafter = getattr(getattr(model_runner, "speculator", None), "model", None)
         draft_moe = get_mixture_of_experts_model(drafter)
         if draft_moe is None and not getattr(drafter, "moe_layers", None):
             return None
-
-        for model_state in model_runner.eplb_state.model_states.values():
-            if model_state.model is draft_moe:
-                speculative_config = self.worker.vllm_config.speculative_config
-                if speculative_config is None or speculative_config.draft_model_config is None:
-                    raise ValueError("[FT] scale_down requires draft_model_config for an EPLB-registered drafter.")
-                return (
-                    drafter,
-                    model_state,
-                    speculative_config.draft_model_config,
-                    get_draft_load_config(self.worker.vllm_config),
-                )
-
-        raise ValueError(
-            "[FT] scale_down requires the MoE drafter to be registered with EPLB; "
-            "otherwise its expert placement would keep pointing at dead ranks."
-        )
+        state = next((s for s in model_runner.eplb_state.model_states.values() if s.model is draft_moe), None)
+        spec = self.worker.vllm_config.speculative_config
+        if state is None:
+            raise ValueError(
+                "[FT] scale_down requires the MoE drafter to be registered with EPLB; "
+                "otherwise its expert placement would keep pointing at dead ranks."
+            )
+        if spec is None or spec.draft_model_config is None:
+            raise ValueError("[FT] scale_down requires draft_model_config for an EPLB-registered drafter.")
+        return drafter, state, spec.draft_model_config, get_draft_load_config(self.worker.vllm_config)
 
     def _densify_routing_tables(self, eplb_model_state) -> None:
         """Renumber the kernel-facing routing tables into the densified id space.
@@ -321,8 +307,7 @@ class WorkerSentinel(GPUWorkerSentinel):
         The mapping comes from the manager, which owns the cumulative dead set
         used for elastic_info, so both stay on the same numbering.
         """
-        p2l = eplb_model_state.physical_to_logical_map
-        num_local_experts = p2l.shape[1] // get_ep_group().world_size
+        num_local_experts = _num_local_experts(eplb_model_state)
         orig_to_dense_rank = get_ep_all2all_manager().orig_to_dense_rank_table()
         for layer in eplb_model_state.model.moe_layers:
             routing_table = getattr(getattr(layer, "eplb_state", None), "expert_replica_routing_table", None)
