@@ -76,6 +76,18 @@ def densify_routing_tables(
         routing_table.copy_(dense_ids.to(routing_table.dtype))
 
 
+def _slot_tensor(layer: torch.nn.Module, attr: str, slot: int) -> torch.Tensor:
+    """The runtime storage of one per-slot tensor."""
+
+    per_slot = getattr(layer, f"{attr}_list", None)
+    if per_slot is not None:
+        return per_slot[slot]
+    tensor = getattr(layer, attr).data
+    if attr in {"fused_w1_scale", "fused_w2_scale"}:
+        tensor = tensor.view(layer.w13_weight.shape[0], -1)
+    return tensor[slot]
+
+
 def _reload_local_expert_slots(
     routed_layers: list,
     local_slots: dict[tuple[int, int], int],
@@ -96,8 +108,7 @@ def _reload_local_expert_slots(
         # (weight_name, shape, dtype) of the target per-expert tensors.
         slot_signature = []
         for weight_name in reload_definition.pipelines:
-            slot_list = getattr(routed_layer, f"{weight_name}_list", None)
-            tensor = slot_list[slot] if slot_list is not None else getattr(routed_layer, weight_name).data[slot]
+            tensor = _slot_tensor(routed_layer, weight_name, slot)
             slot_signature.append((weight_name, tensor.shape, tensor.dtype))
         slot_signature_to_layer_experts.setdefault((reload_definition, tuple(slot_signature)), []).append(
             (layer_idx, logical_id)
@@ -158,11 +169,7 @@ def _reload_expert_stack(
     first_slot = local_slots[layer_experts[0]]
     device_tensors: dict[str, torch.Tensor] = {}
     for weight_name in reload_definition.pipelines:
-        slot_list = getattr(first_layer, f"{weight_name}_list", None)
-        if slot_list is not None:
-            destination = slot_list[first_slot]
-        else:
-            destination = getattr(first_layer, weight_name).data[first_slot]
+        destination = _slot_tensor(first_layer, weight_name, first_slot)
         stacked = torch.stack([expert[weight_name] for expert in converted_experts])
         device_tensors[weight_name] = stacked.to(device=destination.device, dtype=destination.dtype)
     for weight_name in _MOE_WEIGHT_NAMES:
@@ -172,8 +179,7 @@ def _reload_expert_stack(
     for i, layer_expert in enumerate(layer_experts):
         layer, slot = routed_layers[layer_expert[0]], local_slots[layer_expert]
         for weight_name in device_tensors:
-            slot_list = getattr(layer, f"{weight_name}_list", None)
-            target = slot_list[slot] if slot_list is not None else getattr(layer, weight_name).data[slot]
+            target = _slot_tensor(layer, weight_name, slot)
             target.copy_(device_tensors[weight_name][i], non_blocking=True)
     torch.npu.synchronize()
     return len(layer_experts)

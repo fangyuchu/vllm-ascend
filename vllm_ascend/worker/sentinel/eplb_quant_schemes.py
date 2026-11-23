@@ -19,6 +19,7 @@ from vllm_ascend.quantization.methods.w4a8.w4a8 import AscendW4A8DynamicFusedMoE
 from vllm_ascend.quantization.methods.w8a8.w8a8_dynamic import (
     AscendW8A8DynamicFusedMoEMethod,
     flatten_expert_dims,
+    scale_from_float_to_int64,
 )
 from vllm_ascend.utils import (
     ACL_FORMAT_FRACTAL_NZ,
@@ -167,6 +168,14 @@ _W8A8_DYNAMIC_DEFINITION = _QuantReloadDefinition(
         ),
     },
 )
+_W8A8_FUSED_DEFINITION = _QuantReloadDefinition(
+    AscendW8A8DynamicFusedMoEMethod,
+    {
+        **_W8A8_DYNAMIC_DEFINITION.pipelines,
+        "fused_w1_scale": _WeightBuilder(_gate_up("weight_scale"), scale_from_float_to_int64),
+        "fused_w2_scale": _WeightBuilder(_down_proj("weight_scale"), scale_from_float_to_int64),
+    },
+)
 _W4A8_ASCEND_DEFINITION = _QuantReloadDefinition(
     AscendW4A8DynamicFusedMoEMethod,
     {
@@ -196,6 +205,11 @@ _RELOAD_DEFINITIONS: tuple[_QuantReloadDefinition, ...] = (
 def _find_reload_definition(routed_layer: torch.nn.Module) -> _QuantReloadDefinition:
     """Pick the reload definition matching a routed-experts layer's quant method."""
     method = getattr(routed_layer.quant_method, "quant_method", routed_layer.quant_method)
+    if _W8A8_DYNAMIC_DEFINITION.matches(method) and (
+        getattr(routed_layer, "fused_w1_scale_list", None) is not None
+        or getattr(routed_layer, "fused_w1_scale", None) is not None
+    ):
+        return _W8A8_FUSED_DEFINITION
     for definition in _RELOAD_DEFINITIONS:
         if definition.matches(method):
             return definition

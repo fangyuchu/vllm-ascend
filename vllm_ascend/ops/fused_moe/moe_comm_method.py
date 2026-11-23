@@ -393,9 +393,7 @@ class FusedMC2CommImpl(MoECommMethod):
         # setup_moe_comm_method), which is where global_bs / ep_world_size live.
         # Assert it so mypy resolves those attributes off the base dispatcher.
         assert isinstance(self.token_dispatcher, TokenDispatcherWithMC2)
-        mc2_group = get_mc2_group()
-        group = mc2_group.device_group
-        ft_enabled = getattr(self.token_dispatcher, "_ft_enabled", False)
+        group = get_mc2_group().device_group
         # The sym buffer is allocated by get_symm_buffer_for_mega_moe, a
         # collective handshake over the EP (mc2) group. Its shape params —
         # especially num_max_tokens_per_rank — MUST be identical on every EP
@@ -481,7 +479,7 @@ class FusedMC2CommImpl(MoECommMethod):
             dispatch_quant_mode=dispatch_quant_mode,
             dispatch_quant_out_dtype=dispatch_quant_out_dtype,
         )
-        if ft_enabled:
+        if self.token_dispatcher.fault_tolerance_enabled:
             try:
                 get_ep_all2all_manager().bind_mega_moe_buffer(symm_buffer)
             except Exception:

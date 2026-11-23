@@ -67,6 +67,7 @@ class TestMoECommMethod(TestBase):
         comm_impl.token_dispatcher.max_num_tokens_per_rank = 128
         comm_impl.token_dispatcher.ep_world_size = 8
         comm_impl.token_dispatcher.ep_rank_id = 0
+        comm_impl.token_dispatcher.fault_tolerance_enabled = False
         comm_impl.get_symm_buffer_for_mega_moe = MagicMock(return_value="symm_buffer")
         comm_impl.mega_moe_symm_buffer = None
         return comm_impl
@@ -78,15 +79,20 @@ class TestMoECommMethod(TestBase):
 
     @patch("vllm_ascend.ops.fused_moe.moe_comm_method.get_mc2_group")
     @patch("vllm_ascend.ops.fused_moe.moe_comm_method.logger.warning_once")
-    def test_mega_moe_symm_buffer_uses_mega_moe_max_tokens(self, mock_warning_once, mock_get_mc2_group):
+    @patch("vllm_ascend.ops.fused_moe.moe_comm_method.get_ep_all2all_manager")
+    def test_mega_moe_symm_buffer_uses_mega_moe_max_tokens(
+        self, mock_get_ep_all2all_manager, mock_warning_once, mock_get_mc2_group
+    ):
         self.mock_ascend_config.mega_moe_max_tokens = 512
         mock_mc2_group = MagicMock()
         mock_mc2_group.device_group = "mc2_group"
         mock_get_mc2_group.return_value = mock_mc2_group
         comm_impl = self._make_fused_mc2_comm_for_buffer_init()
 
-        comm_impl._init_mega_moe_symm_buffer(is_decode_only_node=False)
+        comm_impl.token_dispatcher.fault_tolerance_enabled = True
+        symm_buffer = comm_impl._init_mega_moe_symm_buffer(is_decode_only_node=False)
 
+        mock_get_ep_all2all_manager.return_value.bind_mega_moe_buffer.assert_called_once_with(symm_buffer)
         comm_impl.get_symm_buffer_for_mega_moe.assert_called_once()
         call_args = comm_impl.get_symm_buffer_for_mega_moe.call_args
         self.assertEqual(call_args.args[:4], ("mc2_group", 8, 128, 2))
