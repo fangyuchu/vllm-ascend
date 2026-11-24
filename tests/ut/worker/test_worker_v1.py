@@ -1680,6 +1680,7 @@ class TestNPUWorker(TestBase):
             worker.vllm_config.model_config.enable_sleep_mode = True
             worker.vllm_config.weight_transfer_config = None
             worker.vllm_config.kv_transfer_config = None
+            worker.worker_sentinel = None
 
             # Setup allocator mock
             mock_allocator = MagicMock()
@@ -1709,6 +1710,7 @@ class TestNPUWorker(TestBase):
             worker.vllm_config.model_config = MagicMock()
             worker.vllm_config.model_config.enable_sleep_mode = False
             worker.vllm_config.weight_transfer_config = None
+            worker.worker_sentinel = None
 
             # Test load_model
             worker.load_model()
@@ -1726,6 +1728,7 @@ class TestNPUWorker(TestBase):
             worker.vllm_config = MagicMock()
             worker.vllm_config.model_config.enable_sleep_mode = False
             worker.vllm_config.weight_transfer_config = None
+            worker.worker_sentinel = None
 
             with (
                 patch("vllm_ascend.model_executor.warmup.nz_warmup.join_nz_warm_thread") as join_nz,
