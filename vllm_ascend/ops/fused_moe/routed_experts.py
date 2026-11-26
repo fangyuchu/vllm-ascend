@@ -47,7 +47,12 @@ from vllm_ascend.ops.fused_moe.moe_utils import get_moe_num_logical_experts
 from vllm_ascend.ops.fused_moe.prepare_finalize import PrepareAndFinalizeWithAllGather
 from vllm_ascend.quantization.nz import NzCastSpec
 from vllm_ascend.quantization.quant_type import QuantType
-from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, _should_trans_nz, maybe_trans_nz, transpose_expert_weight_last_two_dims
+from vllm_ascend.utils import (
+    ACL_FORMAT_FRACTAL_NZ,
+    _should_trans_nz,
+    maybe_trans_nz,
+    transpose_expert_weight_last_two_dims,
+)
 
 
 class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
