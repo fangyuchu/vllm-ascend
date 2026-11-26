@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import threading
 from collections.abc import Callable
 from datetime import timedelta
 from typing import TYPE_CHECKING
@@ -59,7 +60,9 @@ def fault_barrier_wrapper(method: Callable):
     because a peer died), mark the worker as faulted, stop and restart its
     device, then re-raise the error. While the flag is set, wrapped calls fail
     immediately instead of touching the broken device; ``retry`` clears it once
-    the process groups have been rebuilt.
+    the process groups have been rebuilt. Only the first handler quarantines the
+    device; concurrent handlers wait for that quarantine and re-raise their own
+    error.
     """
 
     def wrapped(self, *args, **kwargs):
@@ -73,16 +76,22 @@ def fault_barrier_wrapper(method: Callable):
         except Exception as exc:
             rank = getattr(self, "rank", None)
             rank_desc = f"rank {rank}" if isinstance(rank, int) else "worker"
-            sentinel.worker_faulted = True
-            sentinel.fault_info = f"{type(exc).__name__}: {exc}"
-            logger.warning("[FT] Marking %s faulted after: %s", rank_desc, exc)
-            try:
-                sentinel.reset_device()
-            except Exception:
-                logger.exception("[FT] device reset failed on %s.", rank_desc)
-            # Drop the frames that pin device tensors of the broken stream.
-            exc.__traceback__ = None
-            raise RuntimeError(f"[FT] worker faulted: {sentinel.fault_info}")
+            # The lock is held through the quarantine; concurrent handlers
+            # block here and propagate only after the reset completes.
+            with sentinel._fault_lock:
+                if sentinel.worker_faulted:
+                    exc.__traceback__ = None
+                    raise exc
+                sentinel.worker_faulted = True
+                sentinel.fault_info = f"{type(exc).__name__}: {exc}"
+                logger.warning("[FT] Marking %s faulted after: %s", rank_desc, exc)
+                try:
+                    sentinel.reset_device()
+                except Exception:
+                    logger.exception("[FT] device reset failed on %s.", rank_desc)
+                # Drop the frames that pin device tensors of the broken stream.
+                exc.__traceback__ = None
+                raise RuntimeError(f"[FT] worker faulted: {sentinel.fault_info}")
 
     return wrapped
 
@@ -96,12 +105,9 @@ class WorkerSentinel(GPUWorkerSentinel):
     """
 
     def __init__(self, worker: "Worker", device: torch.device):
-        # Two constraints: PCP is not supported yet, and fault tolerance needs
-        # the v2 model runner.
+        # PCP is not supported yet.
         if worker.parallel_config.prefill_context_parallel_size > 1:
             raise ValueError("[FT] fault tolerance on Ascend NPU does not support PCP yet.")
-        if not worker.vllm_config.use_v2_model_runner:
-            raise ValueError("[FT] fault tolerance on Ascend NPU requires the v2 model runner.")
         global _sentinel
         self.device = device
         self.worker = worker
@@ -109,6 +115,7 @@ class WorkerSentinel(GPUWorkerSentinel):
         # wrapped methods fail fast instead of using the device.
         self.worker_faulted = False
         self.fault_info: str | None = None
+        self._fault_lock = threading.Lock()
         _sentinel = self
 
     def query_mask(self, ft_request: FaultToleranceRequest) -> dict:
@@ -275,7 +282,7 @@ class WorkerSentinel(GPUWorkerSentinel):
         # The model's expert map is indexed by physical expert id and no id
         # changes here; the logical-id map must not overwrite it.
         if dead_rank_experts:
-            reload_experts_from_disk(model, model_config, load_config, dead_rank_experts)
+            reload_experts_from_disk(model, model_state.model.moe_layers, model_config, load_config, dead_rank_experts)
         refresh_model_routing_tables(model_state)
         densify_routing_tables(
             model_state.model.moe_layers,
