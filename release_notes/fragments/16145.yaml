@@ -1,0 +1,26 @@
+pr: 16145
+entries:
+  - category: feature
+    text: >-
+      Added Ascend NPU support for the upstream fault-tolerance framework via
+      `--enable-fault-tolerance` (off by default). A device fault now surfaces
+      through the engine's fault-tolerance status instead of hanging the
+      surviving ranks or crashing the worker; an external orchestrator drives
+      recovery through the upstream commands.
+  - category: feature
+    text: >-
+      Added retry recovery for transient faults: a coordinated retry resets the
+      faulted worker's device, rebuilds the DP process groups, and resumes
+      serving without restarting the cluster.
+  - category: feature
+    text: >-
+      Added scale-down recovery: a permanently dead DP rank can be removed from
+      the group and its experts redistributed onto the surviving ranks, so the
+      deployment keeps serving without a full restart. Only supported MC2 kernel.
+  - category: config
+    text: >-
+      Added `additional_config.ft_communication_abort_timeout` for
+      `--enable-fault-tolerance` runs. It sets the NPU operator timeout and
+      exports `HCCL_EXEC_TIMEOUT=T` / `HCCL_EVENT_TIMEOUT=T+1`, overriding
+      values already present in the environment, so a hung collective aborts
+      instead of hanging.
