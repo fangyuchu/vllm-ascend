@@ -31,6 +31,7 @@ from vllm.sequence import IntermediateTensors
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.models.common.ops.sequence_parallel import sp_padding_mask, sp_shard
 from vllm_ascend.models.deepseek_v4.model import (
+    AscendDeepseekV4ForCausalLM,
     DeepseekV2MixtureOfExperts,
     DeepseekV4DecoderLayer,
     DeepseekV4MoE,
@@ -64,7 +65,6 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
 
         config = vllm_config.speculative_config.draft_model_config.hf_config
         self.config = config
-        self.use_v2_model_runner = vllm_config.use_v2_model_runner
         quant_config = vllm_config.quant_config
 
         self.e_proj = ReplicatedLinear(
@@ -162,9 +162,7 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         # hidden_states = self.hc_head(hidden_states, self.hc_head_fn,
         #                              self.hc_head_scale, self.hc_head_base)
 
-        if self.use_v2_model_runner:
-            return hidden_states.flatten(1)
-        return hidden_states
+        return hidden_states.flatten(1)
 
     def hc_head(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
         shape, dtype = x.size(), x.dtype
@@ -238,11 +236,15 @@ class DeepSeekMultiTokenPredictor(nn.Module):
 
 @support_torch_compile
 class DeepSeekV4MTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
+    # Quantization lookup and FT reload use the target's checkpoint-name mapping.
+    hf_to_vllm_mapper = AscendDeepseekV4ForCausalLM.hf_to_vllm_mapper
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
         self.quant_config = vllm_config.quant_config
-        self.model = DeepSeekMultiTokenPredictor(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "mtp"))
+        # Keep the parent prefix: the quant description uses "model.mtp.N" keys.
+        self.model = DeepSeekMultiTokenPredictor(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model.mtp"))
         # Set MoE hyperparameters
         self.set_moe_parameters()
 

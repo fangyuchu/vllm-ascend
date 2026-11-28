@@ -35,7 +35,12 @@ from vllm_ascend.ops.fused_moe.moe_utils import (
     cumsum_group_list,
 )
 from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts  # noqa: F401
-from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, dispose_tensor, maybe_trans_nz
+from vllm_ascend.utils import (
+    ACL_FORMAT_FRACTAL_NZ,
+    dispose_tensor,
+    maybe_trans_nz,
+    transpose_expert_weight_last_two_dims,
+)
 
 from ..base import (
     AscendLinearScheme,
@@ -55,6 +60,11 @@ def scale_from_float_to_int64(scale):
         np.frombuffer(scale.cpu().to(torch.float32).numpy().tobytes(), dtype=np.int32).astype(np.int64)
     ).to(scale.device)
     return scale
+
+
+def flatten_expert_dims(tensor: torch.Tensor) -> torch.Tensor:
+    """Flatten each expert's weights into a single dim, keeping the expert axis."""
+    return tensor.view(tensor.shape[0], -1)
 
 
 @register_scheme("W8A8_DYNAMIC", "linear")
@@ -155,11 +165,7 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
 
     def __init__(self):
         vllm_config = get_current_vllm_config()
-        ascend_config = get_ascend_config()
-        self.dynamic_eplb = False if vllm_config.use_v2_model_runner else ascend_config.eplb_config.dynamic_eplb
-        self.use_expert_weight_list = self.dynamic_eplb or (
-            vllm_config.use_v2_model_runner is True and vllm_config.parallel_config.enable_eplb is True
-        )
+        self.use_expert_weight_list = vllm_config.parallel_config.enable_eplb is True
         self.in_dtype = vllm_config.model_config.dtype
         try:
             device_group = get_mc2_group().device_group
@@ -222,7 +228,6 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 topk_ids=topk_ids,
                 layer=layer,
                 quant_type=self.quant_type,
-                dynamic_eplb=self.use_expert_weight_list,
                 expert_map=layer.ascend_expert_map,
                 global_redundant_expert_num=layer.global_redundant_expert_num,
                 mc2_mask=layer.ascend_mc2_mask,
@@ -277,17 +282,17 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         return weights
 
     def process_weights_after_loading(self, layer):
-        layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
-        layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
+        layer.w13_weight.data = transpose_expert_weight_last_two_dims(layer.w13_weight.data)
+        layer.w2_weight.data = transpose_expert_weight_last_two_dims(layer.w2_weight.data)
         # TODO(zzzzwwjj): Currently, `torch_npu.npu_grouped_matmul_swiglu_quant`
         # can only support weight nz.
         if self.quant_type == QuantType.W8A8:
             layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ)
             layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)
-        layer.w13_weight_scale.data = layer.w13_weight_scale.data.view(layer.w13_weight_scale.data.shape[0], -1)
+        layer.w13_weight_scale.data = flatten_expert_dims(layer.w13_weight_scale.data)
         layer.w13_weight_scale_fp32 = layer.w13_weight_scale.data.to(torch.float32)
         layer.w13_weight_offset.data = layer.w13_weight_offset.data.view(layer.w13_weight_offset.data.shape[0], -1)
-        layer.w2_weight_scale.data = layer.w2_weight_scale.data.view(layer.w2_weight_scale.data.shape[0], -1)
+        layer.w2_weight_scale.data = flatten_expert_dims(layer.w2_weight_scale.data)
         layer.w2_weight_offset.data = layer.w2_weight_offset.data.view(layer.w2_weight_offset.data.shape[0], -1)
 
         if get_ascend_config().enable_fused_mc2 == 1:
@@ -436,11 +441,10 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         w1, w1_scale, _, _ = self._get_mlp_weights(layer)
         activation = mlp_compute_input.activation
         fusion = mlp_compute_input.fusion
-        dynamic_eplb = mlp_compute_input.dynamic_eplb
         is_swigluoai_uninterleave = activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE
         is_mc2 = _EXTRA_CTX.moe_comm_type == MoECommType.MC2
 
-        if _custom_gmm_swiglu_enabled(fusion, dynamic_eplb, activation):
+        if _custom_gmm_swiglu_enabled(fusion, self.use_expert_weight_list, activation):
             # eplb branch
             hidden_states, swiglu_out_scale, _ = torch.ops._C_ascend.grouped_matmul_swiglu_quant_weight_nz_tensor_list(
                 x=hidden_states,

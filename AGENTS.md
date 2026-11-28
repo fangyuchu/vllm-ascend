@@ -25,6 +25,7 @@ Read linked documentation when it applies to the current task, using the relevan
     - [Model Runner Changes](#model-runner-changes)
 - [Release Notes](#release-notes)
 - [Commit Messages and Pull Requests](#commit-messages-and-pull-requests)
+    - [Duplicate-work checks](#duplicate-work-checks)
     - [Commit Message Format](#commit-message-format)
 - [Quick Start for Contributors](#quick-start-for-contributors)
 - [References](#references)
@@ -259,6 +260,19 @@ For release management workflows (release checklist issues, critical bug triage,
 
 ## Commit Messages and Pull Requests
 
+### Duplicate-work checks
+
+Before proposing a PR, run these checks:
+
+```bash
+gh issue view <issue_number> --repo vllm-project/vllm-ascend --comments
+gh pr list --repo vllm-project/vllm-ascend --state open --search "<issue_number> in:body"
+gh pr list --repo vllm-project/vllm-ascend --state open --search "<short area keywords>"
+```
+
+- If an open PR already addresses the same fix, do not open another.
+- If your approach is materially different, explain the difference in the issue.
+
 ### Commit Message Format
 
 Follow the [Conventional Commits](https://www.conventionalcommits.org/) format and **must include a sign-off**:
@@ -268,6 +282,8 @@ git commit -s -m "<type>: <summary>" -m "<body - explaining what changed and why
 ```
 
 **Valid Types**: `feat`, `fix`, `perf`, `refactor`, `test`, `docs`, `chore`
+
+Follow the [commit message content guidelines](docs/source/developer_guide/contribution/index.md#commit-message-content) for the problem, fix, and validation.
 
 ### Pull Request Title Format
 

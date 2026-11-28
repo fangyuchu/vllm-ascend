@@ -11,6 +11,7 @@ import torch
 import torch_npu
 from vllm.config import ParallelConfig
 from vllm.v1.attention.backend import AttentionCGSupport, MultipleOf
+from vllm.v1.attention.ops import pcp
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MLAAttentionSpec, SparseCacheRole
 
 from vllm_ascend.attention import indexer as indexer_module
@@ -19,6 +20,8 @@ from vllm_ascend.attention.indexer import (
     AscendSFAIndexerCache,
     AscendSFAIndexerMetadata,
     AscendSFAIndexerMetadataBuilder,
+    QLIMetadataBuffers,
+    QLIMetadataConfig,
 )
 from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec
 from vllm_ascend.device.device_op import A5DeviceAdaptor
@@ -432,6 +435,71 @@ def test_sfa_indexer_metadata_builder_builds_pcp_dcp_slots(
     )
 
 
+@pytest.mark.parametrize(
+    "decode_tokens,actual_tokens,sharded_layout,shard_decode",
+    [(0, 4, True, False), (1, 4, True, False), (1, 4, True, True), (4, 3, False, False)],
+    ids=["prefill", "mixed", "sharded-decode", "replicated-draft-padding"],
+)
+def test_c4_pcp_gather_preserves_packed_bytes(monkeypatch, decode_tokens, actual_tokens, sharded_layout, shard_decode):
+    indexer = AscendSFAIndexerBackend.__new__(AscendSFAIndexerBackend)
+    indexer.use_pcp = True
+    indexer.enable_sparse_li_c4 = True
+    indexer._is_pcp_decode_sharded = shard_decode
+    # The CPU surrogate retains packed FP4's one-byte storage; the NPU test
+    # additionally checks the real dynamic MX quantization output.
+    key = torch.arange(256, dtype=torch.uint8).reshape(4, 64)
+    scale_bytes = torch.tensor([0, 1, 127, 255] * 4, dtype=torch.uint8).reshape(4, 2, 2)
+    scale = scale_bytes.view(torch.float8_e8m0fnu)
+    slots = torch.arange(8 if sharded_layout else 4)
+    metadata = SimpleNamespace(
+        slot_mapping=slots,
+        num_decode_tokens=decode_tokens,
+        num_actual_tokens=actual_tokens,
+        uses_pcp_sharded_layout=sharded_layout,
+    )
+
+    def all_gather(tensor, dim):
+        assert tensor.dtype == torch.uint8
+        assert dim == 0
+        return torch.cat((tensor, tensor.bitwise_xor(128)), dim=0)
+
+    gather = Mock(side_effect=all_gather)
+    monkeypatch.setattr(pcp, "get_pcp_group", lambda: SimpleNamespace(world_size=2, all_gather=gather))
+    actual_key, actual_scale, actual_slots = indexer._gather_cache_inputs(key, scale, metadata)
+    replicated = 0 if shard_decode else decode_tokens
+    if sharded_layout:
+        expected_key = torch.cat((key, key[replicated:].bitwise_xor(128)))
+        expected_scale = torch.cat((scale_bytes, scale_bytes[replicated:].bitwise_xor(128)))
+        expected_slots = torch.cat((slots[:4], slots[4 + replicated :]))
+        assert gather.call_count == 2
+    else:
+        expected_key, expected_scale, expected_slots = (
+            key[:actual_tokens],
+            scale_bytes[:actual_tokens],
+            slots[:actual_tokens],
+        )
+        gather.assert_not_called()
+    assert actual_key.dtype == key.dtype
+    assert actual_scale.dtype == scale.dtype
+    assert torch.equal(actual_key.view(torch.uint8), expected_key)
+    assert torch.equal(actual_scale.view(torch.uint8), expected_scale)
+    assert torch.equal(actual_slots, expected_slots)
+
+
+def test_c4_without_pcp_preserves_inputs(monkeypatch):
+    indexer = AscendSFAIndexerBackend.__new__(AscendSFAIndexerBackend)
+    indexer.use_pcp = False
+    indexer.enable_sparse_li_c4 = True
+    key = torch.zeros(2, 64, dtype=torch.uint8)
+    scale = torch.zeros(2, 2, 2, dtype=torch.uint8).view(torch.float8_e8m0fnu)
+    slots = torch.arange(2)
+    gather = Mock(side_effect=AssertionError("Non-PCP input must not enter the gather path"))
+    monkeypatch.setattr(indexer_module, "_gather_prefill_cache_inputs", gather)
+    result = indexer._gather_cache_inputs(key, scale, SimpleNamespace(slot_mapping=slots))
+    assert all(actual is original for actual, original in zip(result, (key, scale, slots)))
+    gather.assert_not_called()
+
+
 def test_c4_cache_write_preserves_packed_bytes(monkeypatch):
     indexer = AscendSFAIndexerBackend.__new__(AscendSFAIndexerBackend)
     indexer.enable_sparse_li_c4 = True
@@ -696,6 +764,45 @@ def test_indexer_owner_tracks_runtime_cache_requirement(monkeypatch, mtp):
         if enabled:
             assert specs["cache_owner"] == replace(spec, block_stride_alignment=MultipleOf(_KERNEL_BLOCK_SIZE))
             assert owner.cache_spec == spec
+
+
+@pytest.mark.parametrize("quant_mode", [1, 5])
+def test_builder_prepares_qli_after_lengths_and_refreshes_each_step(monkeypatch, quant_mode):
+    builder = _make_builder()
+    config = QLIMetadataConfig(32, 128, quant_mode)
+    builder._qli_metadata_buffers = QLIMetadataBuffers(config, 4)
+    op = Mock(side_effect=lambda **kw: kw["seqused_k"].clone())
+    monkeypatch.setattr(indexer_module.DeviceOperator, "get_indexer_metadata_op", lambda: op)
+    monkeypatch.setattr(indexer_module, "get_cos_and_sin_mla", lambda *a, **kw: (torch.zeros(5, 1, 1, 8),) * 2)
+    common = _make_common_metadata()
+    first = builder.build(0, common)
+    assert first.qli_inputs is not None
+    assert first.qli_inputs.config.quant_mode == quant_mode
+    torch.testing.assert_close(first.qli_inputs.query_start_loc, common.query_start_loc.to(torch.int32))
+    common.seq_lens.add_(1)
+    second = builder.build(0, common)
+    assert second.qli_inputs.metadata.data_ptr() == first.qli_inputs.metadata.data_ptr()
+    torch.testing.assert_close(first.qli_inputs.metadata, common.seq_lens[:2].to(torch.int32))
+    assert op.call_count == 2
+
+
+@pytest.mark.parametrize("topk", [1024, 2048])
+def test_a5_builder_metadata_contract_from_cache_spec(topk):
+    spec = AscendSFAIndexerCacheSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float8_e4m3fn,
+        cache_sparse_li_c8=True,
+    )
+    config = A5DeviceAdaptor.get_indexer_metadata_config(
+        spec, SimpleNamespace(index_n_heads=32, index_head_dim=128, index_topk=topk)
+    )
+    assert config == QLIMetadataConfig(32, 128, 1, topk=topk)
+    assert (
+        A5DeviceAdaptor.get_indexer_metadata_config(replace(spec, cache_sparse_li_c8=False), SimpleNamespace()) is None
+    )
+    assert A5DeviceAdaptor.get_indexer_metadata_config(replace(spec, dtype=torch.bfloat16), SimpleNamespace()) is None
 
 
 @pytest.mark.parametrize("world", [2, 8])

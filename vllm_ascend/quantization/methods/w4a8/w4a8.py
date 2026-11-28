@@ -24,7 +24,6 @@ from vllm.config import get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
-from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, use_cann_megamoe
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEWeights, build_fused_experts_input
@@ -36,6 +35,7 @@ from vllm_ascend.utils import (
     COMPRESSED_TENSORS_METHOD,
     dispose_tensor,
     maybe_trans_nz,
+    transpose_expert_weight_last_two_dims,
 )
 
 from ..base import AscendLinearScheme, AscendMoEScheme, PreparedLinearInput, QuantType
@@ -139,10 +139,7 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         self.tp_size = (
             1 if vllm_config.parallel_config.enable_expert_parallel else get_tensor_model_parallel_world_size()
         )
-        self.dynamic_eplb = False if vllm_config.use_v2_model_runner else get_ascend_config().eplb_config.dynamic_eplb
-        self.use_expert_weight_list = self.dynamic_eplb or (
-            vllm_config.use_v2_model_runner is True and vllm_config.parallel_config.enable_eplb is True
-        )
+        self.use_expert_weight_list = vllm_config.parallel_config.enable_eplb is True
         if self.quant_method == ASCEND_QUANTIZATION_METHOD and self.tp_size > _MODELSLIM_SCALE_BIAS_PARTITIONS:
             raise ValueError(f"The current weight does not support moe part tp>{_MODELSLIM_SCALE_BIAS_PARTITIONS}.")
 
@@ -229,7 +226,6 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
                 topk_ids=topk_ids,
                 layer=layer,
                 quant_type=self.quant_type,
-                dynamic_eplb=self.use_expert_weight_list,
                 expert_map=layer.ascend_expert_map,
                 global_redundant_expert_num=layer.global_redundant_expert_num,
                 mc2_mask=layer.ascend_mc2_mask,
@@ -275,9 +271,23 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         return weights
 
     @staticmethod
-    def maybe_squeeze_per_channel_weight_scale(scale: torch.Tensor) -> torch.Tensor:
+    def reduce_scale_bias_modelslim(scale_bias: torch.Tensor) -> torch.Tensor:
+        """Sum modelslim's per-group scale_bias into one value per output channel."""
+        return scale_bias.transpose(-2, -1).contiguous().sum(-2)
+
+    @staticmethod
+    def _process_scale(scale: torch.Tensor) -> torch.Tensor:
+        """Convert a checkpoint scale into the transposed int64 bit pattern npu_grouped_matmul reads (CPU)."""
+        scale_np = scale.transpose(-2, -1).to(torch.float32).contiguous().cpu().numpy()
+        scale_np.dtype = np.uint32
+        return torch.from_numpy(scale_np.astype(np.int64))
+
+    @staticmethod
+    def w13_scale_to_runtime(scale: torch.Tensor) -> torch.Tensor:
+        """Convert w13's per-channel scale into flat int64 bits with the group dim squeezed (CPU)."""
+        scale = AscendW4A8DynamicFusedMoEMethod._process_scale(scale)
         if scale.dim() > 1 and scale.shape[1] == 1:
-            return scale.squeeze(1)
+            scale = scale.squeeze(1)
         return scale
 
     def _pack_to_int32(self, weight: torch.Tensor):
@@ -287,13 +297,6 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
             f"the last dim of weight needs to be divided by {packed_bytes_per_int32} but got shape {weight.shape}"
         )
         return weight.view(torch.int32).contiguous()
-
-    def _process_scale(self, scale):
-        scale = scale.transpose(1, 2).contiguous()
-        scale_np = scale.cpu().numpy()
-        scale_np.dtype = np.uint32
-        scale_uint64_tensor = torch.from_numpy(scale_np.astype(np.int64)).npu()
-        return scale_uint64_tensor
 
     def _pack_int4_to_int8(self, weight: torch.Tensor) -> torch.Tensor:
         shape = weight.shape
@@ -353,8 +356,8 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
             layer.w2_weight.data = self._pack_to_int32(layer.w2_weight.data)
 
     def process_weights_after_loading_compressed_tensors(self, layer):
-        layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
-        layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
+        layer.w13_weight.data = transpose_expert_weight_last_two_dims(layer.w13_weight.data)
+        layer.w2_weight.data = transpose_expert_weight_last_two_dims(layer.w2_weight.data)
 
         def update_bias_compressed_tensors(weight: torch.Tensor, scale: torch.Tensor):
             group_num, k, n = weight.shape
@@ -370,10 +373,9 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         w2_scale_bias = torch.nn.Parameter(w2_bias, requires_grad=False)
         layer.register_parameter("w2_scale_bias", w2_scale_bias)
 
-        layer.w13_weight_scale.data = self._process_scale(layer.w13_weight_scale.data.to(torch.float32))
-        layer.w2_weight_scale.data = self._process_scale(layer.w2_weight_scale.data.to(torch.float32))
-        # To use torch_npu.npu_grouped_matmul, keep w2_weigh_scale unsqueezed
-        layer.w13_weight_scale.data = self.maybe_squeeze_per_channel_weight_scale(layer.w13_weight_scale.data)
+        # Keep w2's scale unsqueezed for npu_grouped_matmul.
+        layer.w13_weight_scale.data = self.w13_scale_to_runtime(layer.w13_weight_scale.data).npu()
+        layer.w2_weight_scale.data = self._process_scale(layer.w2_weight_scale.data).npu()
 
         # Packs 2 int4 into 1 int8 on-the-fly to mirror the modelslim path
         layer.w13_weight.data = self._pack_int4_to_int8(layer.w13_weight.data)
@@ -418,6 +420,8 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
     def get_fused_mc2_weights(self, layer):
         """Normalized weight payload for the FUSED_MC2 comm path."""
         use_mega_moe = _EXTRA_CTX.use_mega_moe
+        shared_fusion = getattr(layer, "ascend_megamoe_shared_fusion", None) if use_mega_moe else None
+        shared = shared_fusion.weights if shared_fusion is not None else None
 
         if self.use_expert_weight_list:
             if use_mega_moe:
@@ -428,6 +432,10 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
                     w2_scale=[t.reshape(-1) for t in layer.w2_weight_scale_list],
                     w1_scale_bias=[t.reshape(-1) for t in layer.w13_scale_bias_list],
                     w2_scale_bias=[t.reshape(-1) for t in layer.w2_scale_bias_list],
+                    shared_w1=shared.w1 if shared is not None else None,
+                    shared_w2=shared.w2 if shared is not None else None,
+                    shared_w1_scale=shared.w1_scale if shared is not None else None,
+                    shared_w2_scale=shared.w2_scale if shared is not None else None,
                 )
             else:
                 return MoEWeights(
@@ -446,6 +454,10 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
                 w2_scale=layer.cann_mega_moe_w2_weight_scale_list,
                 w1_scale_bias=layer.cann_mega_moe_w13_scale_bias_list,
                 w2_scale_bias=layer.cann_mega_moe_w2_scale_bias_list,
+                shared_w1=shared.w1 if shared is not None else None,
+                shared_w2=shared.w2 if shared is not None else None,
+                shared_w1_scale=shared.w1_scale if shared is not None else None,
+                shared_w2_scale=shared.w2_scale if shared is not None else None,
             )
         return MoEWeights(
             w1=[layer.w13_weight],
@@ -569,15 +581,15 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         )[0]
 
     def process_weights_after_loading_modelslim(self, layer):
-        layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
-        layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
+        layer.w13_weight.data = transpose_expert_weight_last_two_dims(layer.w13_weight.data)
+        layer.w2_weight.data = transpose_expert_weight_last_two_dims(layer.w2_weight.data)
 
-        layer.w13_weight_scale.data = self._process_scale(layer.w13_weight_scale.data)
-        layer.w2_weight_scale.data = self._process_scale(layer.w2_weight_scale.data)
+        # Keep w2's scale unsqueezed for npu_grouped_matmul.
+        layer.w13_weight_scale.data = self.w13_scale_to_runtime(layer.w13_weight_scale.data).npu()
+        layer.w2_weight_scale.data = self._process_scale(layer.w2_weight_scale.data).npu()
 
-        layer.w13_scale_bias.data = layer.w13_scale_bias.data.transpose(1, 2).contiguous().sum(axis=1)
-        layer.w2_scale_bias.data = layer.w2_scale_bias.data.transpose(1, 2).contiguous().sum(axis=1)
-        layer.w13_weight_scale.data = self.maybe_squeeze_per_channel_weight_scale(layer.w13_weight_scale.data)
+        layer.w13_scale_bias.data = self.reduce_scale_bias_modelslim(layer.w13_scale_bias.data)
+        layer.w2_scale_bias.data = self.reduce_scale_bias_modelslim(layer.w2_scale_bias.data)
 
 
 @register_scheme("W4A8_DYNAMIC", "linear")
